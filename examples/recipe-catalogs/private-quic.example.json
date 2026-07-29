@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "recipes": [
+    {
+      "name": "vendor-quic-stream-send",
+      "library_glob": "/data/app/*/lib/arm64/libvendor_quic.so",
+      "build_id": "00112233445566778899aabbccddeeff00112233",
+      "symbol": "vendor_quic_stream_send",
+      "family": "vendor-quic",
+      "layer": "plaintext",
+      "role": "quic-stream-send",
+      "confidence": "exact",
+      "priority": 95,
+      "abi": "ssize_t vendor_quic_stream_send(conn, stream_id, data, length)",
+      "recipe": {
+        "direction": "write",
+        "capture_on": "return",
+        "buffer_arg": 3,
+        "length_source": "return",
+        "context_arg": 1,
+        "stream_arg": 2,
+        "max_bytes": 131072
+      },
+      "notes": "Example only: replace the path, Build ID, symbol, and ABI with marker-validated target evidence."
+    }
+  ]
+}

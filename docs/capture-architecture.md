@@ -75,7 +75,7 @@ profile:
 | TLS plaintext | `SSL_read`, `SSL_write`, configured offsets or symbols | decrypted TLS stream chunks | reusable for a matching TLS ABI |
 | TLS keys | TLS key-schedule/master-secret hooks | NSS-style key material where supported | TLS-build dependent |
 | QUIC metadata | `SSL_provide_quic_data` | TLS handshake CRYPTO level/length | not HTTP/3 application plaintext |
-| generic app data | profile symbol/offset uprobes and optional uretprobes | direct, indirect, fixed, memory-length, return-length, libc++ string, iovec, msghdr, and asynchronous paired buffers | known ABI or Build-ID-pinned |
+| generic app data | profile symbol/offset uprobes and optional uretprobes | direct, indirect, fixed, memory-length, return-length, libc++ string, iovec, msghdr, arguments 1–12, and asynchronous paired buffers | known ABI or Build-ID-pinned |
 | JNI discovery | ART `RegisterNatives` implementation/wrappers | method name, JNI signature, runtime function and module offset | reusable across apps on the same ART Build ID |
 
 The JNI locator statically finds `JNINativeInterface[215]`; it does not depend
@@ -125,7 +125,8 @@ gQUIC.
 | Stable public C ABI | OpenSSL, GnuTLS, mbedTLS, wolfSSL, NSPR, quiche | Usually; symbol plus known argument recipe |
 | Exported iovec ABI | `readv`, `writev` | Automatically scaffolded with bounded flattening |
 | Standard 64-bit msghdr ABI | `sendmsg`, `recvmsg` | Automatically scaffolded; configurable header offsets |
-| Other aggregate ABI | ngtcp2-specific vectors, chained buffers, C++ containers | Needs an ABI-specific layout recipe |
+| Public QUIC stream ABI | quiche, lsquic, current ngtcp2 versioned writev | Automatically scaffolded; connection/stream and accepted length retained |
+| Other aggregate ABI | older/private QUIC vectors, chained buffers, C++ containers | Needs an ABI-specific layout recipe |
 | Dynamically registered JNI | Android Cronet `J.N.*` methods | Discover registration, then validate arguments |
 | Stripped internal native function | private Cronet or SDK callback | String/xref/static analysis plus marker test |
 | Pure Java/Kotlin or ART JIT code | Java serializers, OkHttp interceptors | Native uprobes are not stable; prefer JNI/native/crypto/socket boundary |
@@ -164,9 +165,10 @@ The current implementation status is:
 | generic contiguous custom binary buffers | implemented through application profiles |
 | generic `readv`/`writev` flattened buffers | implemented and verifier/marker-validated |
 | standard 64-bit `sendmsg`/`recvmsg` flattened buffers | implemented and verifier/marker-validated on Linux and Android |
+| public quiche/lsquic/current ngtcp2 stream-send ABI recipes | implemented; 12-argument ngtcp2-shaped fixture verifier/marker-validated |
 | dynamic JNI native inventory and ranking | implemented |
 | QUIC handshake metadata | implemented |
-| generic Cronet HTTP/3 or arbitrary QUIC STREAM plaintext | not yet implemented |
+| generic private Cronet HTTP/3 or arbitrary stripped QUIC STREAM plaintext | not yet implemented |
 | chained buffers, stack-private vectors, Java heap objects | needs dedicated layout/conversion adapters |
 | HTTP/2 HPACK transaction reconstruction | needs reconstruction plugin |
 | HTTP/3 QPACK transaction reconstruction | needs QUIC stream capture plus reconstruction plugin |
@@ -176,8 +178,9 @@ The current implementation status is:
 For Doubao, the verified Cronet semantic hooks sit above transport selection,
 so they remain useful when the same request moves from HTTP/2/TLS to
 HTTP/3/QUIC. For an unrelated QUIC stack, use an exported stream ABI such as
-quiche/lsquic when present, add a version-pinned stream profile, or locate the
-application serializer callback. Merely hooking BoringSSL is insufficient.
+quiche/lsquic/current ngtcp2 versioned API when present, add a
+version-pinned private-stream profile, or locate the application serializer
+callback. Merely hooking BoringSSL is insufficient.
 
 ## Automated location loop
 
@@ -194,7 +197,9 @@ process/ELF inventory
 ```
 
 `profile inspect` implements the first three static steps and can scaffold a
-cold-start JNI profile. `--event-format=json` plus `profile learn-jni`
+cold-start JNI profile. A strict `--recipe-catalog` adds Build-ID-constrained
+private symbols or offsets without recompiling the inspector and rejects
+non-executable offsets. `--event-format=json` plus `profile learn-jni`
 implements the dynamic reduction step. The final ABI and marker checks remain
 mandatory because eBPF sees registers and bytes, not source-level types.
 
@@ -219,9 +224,10 @@ not full HPACK/QPACK transaction decoding.
 A mitmproxy-like operator experience requires four more interfaces above the
 capture planes:
 
-1. **Boundary adapters** for contiguous buffers, iovec, and standard 64-bit
-   msghdr (implemented), then QUIC-stack-specific vectors, JNI conversions,
-   common C++ containers, and crypto/serializer APIs.
+1. **Boundary adapters** for contiguous buffers, iovec, standard 64-bit
+   msghdr, and known public QUIC stream ABIs (implemented), then private QUIC
+   vectors, JNI conversions, common C++ containers, and crypto/serializer
+   APIs.
 2. **A normalized stream envelope** carrying package, PID/TID, module Build
    ID, hook identity, connection/request/stream identity, direction,
    monotonic timestamp, original length, chunk offset, and loss/truncation

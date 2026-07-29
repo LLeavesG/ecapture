@@ -46,6 +46,24 @@ The learner never emits a data hook directly from a JNI object signature:
 output identifies which native method and JNI conversion boundary should be
 validated next.
 
+For a private exported ABI or a previously validated internal offset, pass an
+external recipe catalog to the same inspector:
+
+```sh
+ecapture profile inspect \
+  --pid 3423 \
+  --recipe-catalog private-network-abi.json \
+  --output profile-report.json \
+  --scaffold profile-discovery.json
+```
+
+A symbol recipe may optionally be Build-ID constrained. An offset recipe must
+include the exact Build ID; the inspector also rejects offsets outside an
+executable `PT_LOAD` segment. Catalog fields are strictly decoded and the
+embedded hook is validated with the same profile rules before any ELF is
+inspected. See
+[`examples/recipe-catalogs/private-quic.example.json`](../examples/recipe-catalogs/private-quic.example.json).
+
 Explicit CLI flags override profile values. This is useful when only one
 offset changed in a new app build:
 
@@ -117,9 +135,14 @@ can be active in one profile. A direct pointer/length API looks like this:
 `library` and `library_glob` select the hook target. An optional `build_id`
 rejects a library whose GNU ELF build ID differs from the profiled build;
 using it is strongly recommended for offset hooks. `symbol` can be replaced by
-an ELF `offset`. Arguments are numbered from 1 through 5. `buffer_offset` adds
-a byte offset to the selected buffer argument; `buffer_indirect` reads a
-pointer from that location. The optional `buffer_format: "libcxx_string"`
+an ELF `offset`. Arguments are numbered from 1 through 12. At a function-entry
+uprobe, amd64 arguments 1–6 and arm64 arguments 1–8 are in registers; the
+remaining supported arguments are read from their ABI-defined entry stack
+slots. A mid-function offset may already have moved or overwritten both
+register and stack values, so its profile must describe the state at that
+exact instruction. `buffer_offset` adds a byte offset to the selected buffer
+argument; `buffer_indirect` reads a pointer from that location. The optional
+`buffer_format: "libcxx_string"`
 decodes Android Chromium's 24-byte libc++ `std::string` layout, including its
 short-string optimization; its data pointer and length are derived from the
 object, so all `length_*` fields must be omitted. For the default
@@ -178,8 +201,13 @@ direct `struct iovec *`, and `vector_count_arg` selects the count:
 
 For `readv`, use `direction: "read"` and `capture_on: "return"`; the positive
 return value limits the final vector to bytes actually received. No
-`length_*`, buffer offset/indirection, or asynchronous state fields are valid
-for an iovec hook. The eBPF program inspects at most 16 vectors and emits at
+buffer offset/indirection or asynchronous state fields are valid for an iovec
+hook. By default, a return-captured iovec uses the positive function return as
+the accepted length. `length_source: "memory"` instead defers reading a signed
+1/2/4/8-byte scalar at `length_arg + length_offset` until the uretprobe. This
+models APIs such as ngtcp2, whose function return is encrypted packet length
+while `*pdatalen` reports accepted stream plaintext. The eBPF program inspects
+at most 16 vectors and emits at
 most eight 16 KiB chunks (128 KiB total). Every chunk shares one call
 timestamp and the iovec-array address, and uses an offset in the flattened
 logical stream. More vectors, an oversized stream, or an unreadable vector is
@@ -225,6 +253,20 @@ The marker-validated integration fixture is
 [`testdata/iovec_capture_profile.json`](../testdata/iovec_capture_profile.json);
 its [runtime evidence](evidence/iovec-capture-2026-07-29.md) includes verifier
 and reconstruction results.
+
+The inspector also has exact public-ABI recipes for:
+
+- `quiche_conn_stream_send`/`quiche_conn_stream_recv`;
+- `lsquic_stream_write`/`read` and `writev`/`readv`;
+- the current 12-argument
+  `ngtcp2_conn_writev_stream_versioned`, where connection is argument 1,
+  accepted plaintext is `*arg7`, stream ID is argument 9, and the
+  `ngtcp2_vec` pointer/count are arguments 10/11.
+
+ngtcp2 documents `ngtcp2_vec` as `struct iovec` compatible. Older
+unversioned ngtcp2 symbols are left as hints because their argument order has
+varied; their installed header and Build ID must be inspected before creating
+a profile.
 
 Asynchronous APIs can split buffer creation and completion across different
 functions or threads. Pair two hooks with the same `state_group`: a

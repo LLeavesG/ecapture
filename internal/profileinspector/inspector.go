@@ -103,8 +103,14 @@ type HookRecipe struct {
 	Direction      string `json:"direction"`
 	CaptureOn      string `json:"capture_on"`
 	BufferArg      uint32 `json:"buffer_arg"`
+	BufferOffset   uint64 `json:"buffer_offset,omitempty"`
+	BufferIndirect bool   `json:"buffer_indirect,omitempty"`
 	LengthSource   string `json:"length_source,omitempty"`
 	LengthArg      uint32 `json:"length_arg,omitempty"`
+	FixedLength    uint32 `json:"fixed_length,omitempty"`
+	LengthOffset   uint64 `json:"length_offset,omitempty"`
+	LengthSize     uint32 `json:"length_size,omitempty"`
+	LengthIndirect bool   `json:"length_indirect,omitempty"`
 	MaxBytes       uint32 `json:"max_bytes,omitempty"`
 	ContextArg     uint32 `json:"context_arg,omitempty"`
 	StreamArg      uint32 `json:"stream_arg,omitempty"`
@@ -182,13 +188,12 @@ var knownSymbolRecipes = map[string]symbolRecipe{
 		role:       "quic-stream-send",
 		confidence: ConfidenceExact,
 		priority:   94,
-		abi:        "ssize_t quiche_conn_stream_send(conn, stream_id, buf, buf_len, fin)",
+		abi:        "ssize_t quiche_conn_stream_send(conn, stream_id, buf, buf_len, fin, out_error_code)",
 		hook: &HookRecipe{
 			Direction:    "write",
-			CaptureOn:    "entry",
+			CaptureOn:    "return",
 			BufferArg:    3,
-			LengthSource: "argument",
-			LengthArg:    4,
+			LengthSource: "return",
 			MaxBytes:     131072,
 			ContextArg:   1,
 			StreamArg:    2,
@@ -201,7 +206,7 @@ var knownSymbolRecipes = map[string]symbolRecipe{
 		role:       "quic-stream-recv",
 		confidence: ConfidenceExact,
 		priority:   94,
-		abi:        "ssize_t quiche_conn_stream_recv(conn, stream_id, out, out_len, fin)",
+		abi:        "ssize_t quiche_conn_stream_recv(conn, stream_id, out, out_len, fin, out_error_code)",
 		hook: &HookRecipe{
 			Direction:    "read",
 			CaptureOn:    "return",
@@ -213,14 +218,37 @@ var knownSymbolRecipes = map[string]symbolRecipe{
 		},
 		notes: "Captures QUIC stream plaintext after packet unprotection.",
 	},
-	"lsquic_stream_write": contextualRecipe(directWriteRecipe(
-		"lsquic", "quic-stream-write", 92,
-		"ssize_t lsquic_stream_write(stream, const void *buf, size_t len)",
-	), 1),
+	"lsquic_stream_write": {
+		family:     "lsquic",
+		layer:      LayerPlaintext,
+		role:       "quic-stream-write",
+		confidence: ConfidenceExact,
+		priority:   92,
+		abi:        "ssize_t lsquic_stream_write(stream, const void *buf, size_t len)",
+		hook: &HookRecipe{
+			Direction:    "write",
+			CaptureOn:    "return",
+			BufferArg:    2,
+			LengthSource: "return",
+			MaxBytes:     131072,
+			ContextArg:   1,
+		},
+		notes: "Captures the bytes accepted into one QUIC stream before packet protection.",
+	},
 	"lsquic_stream_read": contextualRecipe(directReadRecipe(
 		"lsquic", "quic-stream-read", 92,
 		"ssize_t lsquic_stream_read(stream, void *buf, size_t len)",
 	), 1),
+	"lsquic_stream_writev": quicIOVecRecipe(
+		"lsquic", "quic-stream-writev", "write", 92,
+		"ssize_t lsquic_stream_writev(stream, const struct iovec *vec, int count)",
+		2, 3, 1, 0, "", 0, 0,
+	),
+	"lsquic_stream_readv": quicIOVecRecipe(
+		"lsquic", "quic-stream-readv", "read", 92,
+		"ssize_t lsquic_stream_readv(stream, const struct iovec *vec, int count)",
+		2, 3, 1, 0, "", 0, 0,
+	),
 	"send": transportWriteRecipe(
 		"libc", "socket-send", 40,
 		"ssize_t send(int fd, const void *buf, size_t len, int flags)",
@@ -268,8 +296,13 @@ var knownSymbolRecipes = map[string]symbolRecipe{
 		role:       "quic-stream-writev",
 		confidence: ConfidenceStrong,
 		priority:   76,
-		notes:      "Scatter/gather ABI requires an iovec-aware hook; no direct-buffer scaffold is emitted.",
+		notes:      "Older unversioned ngtcp2 ABIs vary; inspect the declaration before selecting high arguments.",
 	},
+	"ngtcp2_conn_writev_stream_versioned": quicIOVecRecipe(
+		"ngtcp2", "quic-stream-writev", "write", 93,
+		"ngtcp2_ssize ngtcp2_conn_writev_stream_versioned(conn, path, pkt_info_version, pi, dest, destlen, pdatalen, flags, stream_id, datav, datavcnt, ts)",
+		10, 11, 1, 9, "memory", 7, 8,
+	),
 	"ngtcp2_conn_read_pkt": {
 		family:     "ngtcp2",
 		layer:      LayerCrypto,
@@ -399,6 +432,38 @@ func iovecRecipe(
 	}
 }
 
+func quicIOVecRecipe(
+	family, role, direction string,
+	priority int,
+	abi string,
+	bufferArg, vectorCountArg, contextArg, streamArg uint32,
+	lengthSource string,
+	lengthArg, lengthSize uint32,
+) symbolRecipe {
+	return symbolRecipe{
+		family:     family,
+		layer:      LayerPlaintext,
+		role:       role,
+		confidence: ConfidenceExact,
+		priority:   priority,
+		abi:        abi,
+		hook: &HookRecipe{
+			Direction:      direction,
+			CaptureOn:      "return",
+			BufferArg:      bufferArg,
+			BufferFormat:   "iovec",
+			VectorCountArg: vectorCountArg,
+			LengthSource:   lengthSource,
+			LengthArg:      lengthArg,
+			LengthSize:     lengthSize,
+			MaxBytes:       131072,
+			ContextArg:     contextArg,
+			StreamArg:      streamArg,
+		},
+		notes: "Captures a bounded flattened QUIC stream vector after the library reports how many plaintext bytes it accepted.",
+	}
+}
+
 func msgHdrRecipe(
 	family, role, direction string,
 	priority int,
@@ -443,6 +508,17 @@ func transportReadRecipe(family, role string, priority int, abi string) symbolRe
 
 // Inspect inventories explicit libraries and executable ELF mappings from pid.
 func Inspect(pid uint64, libraries []string) (*Report, error) {
+	return InspectWithCatalog(pid, libraries, nil)
+}
+
+// InspectWithCatalog augments built-in public ABI recipes with a declarative,
+// Build-ID-constrained catalog. This lets an agent reuse validated private
+// symbols or offsets without recompiling eCapture.
+func InspectWithCatalog(
+	pid uint64,
+	libraries []string,
+	catalog *RecipeCatalog,
+) (*Report, error) {
 	report := &Report{Version: ReportVersion, PID: pid}
 	paths := append([]string(nil), libraries...)
 	if pid != 0 {
@@ -459,7 +535,7 @@ func Inspect(pid uint64, libraries []string) (*Report, error) {
 	}
 
 	for _, path := range paths {
-		report.Libraries = append(report.Libraries, InspectLibrary(path))
+		report.Libraries = append(report.Libraries, InspectLibraryWithCatalog(path, catalog))
 	}
 	return report, nil
 }
@@ -517,6 +593,10 @@ func uniqueSortedPaths(paths []string) []string {
 }
 
 func InspectLibrary(path string) LibraryReport {
+	return InspectLibraryWithCatalog(path, nil)
+}
+
+func InspectLibraryWithCatalog(path string, catalog *RecipeCatalog) LibraryReport {
 	report := LibraryReport{Path: path}
 	file, err := elf.Open(path)
 	if err != nil {
@@ -535,7 +615,12 @@ func InspectLibrary(path string) LibraryReport {
 	symbols, hasStaticSymbols := collectSymbols(file)
 	report.Stripped = !hasStaticSymbols
 	for _, current := range symbols {
-		recipe, found := candidateForSymbol(current.name)
+		recipe, found := candidateForSymbolInCatalog(
+			current.name,
+			path,
+			report.BuildID,
+			catalog,
+		)
 		if !found {
 			continue
 		}
@@ -554,9 +639,43 @@ func InspectLibrary(path string) LibraryReport {
 			Notes:          recipe.notes,
 		})
 	}
+	if catalog != nil {
+		for _, catalogRecipe := range catalog.Recipes {
+			if catalogRecipe.Symbol != "" ||
+				!catalogRecipe.matchesLibrary(path, report.BuildID) {
+				continue
+			}
+			offset := catalogRecipe.parsedOffset
+			if !isExecutableFileOffset(file, offset) {
+				report.Signals = append(report.Signals, Signal{
+					Family: catalogRecipe.Family,
+					Evidence: fmt.Sprintf(
+						"recipe catalog rejected non-executable offset %#x (%s)",
+						offset,
+						catalogRecipe.Name,
+					),
+				})
+				continue
+			}
+			recipe := catalogRecipe.symbolRecipe()
+			report.Candidates = append(report.Candidates, HookCandidate{
+				Family:       recipe.family,
+				Layer:        recipe.layer,
+				Role:         recipe.role,
+				Symbol:       catalogRecipe.Name,
+				SymbolSource: "recipe-catalog",
+				FileOffset:   hexUint64(offset),
+				Confidence:   recipe.confidence,
+				Priority:     recipe.priority,
+				ABI:          recipe.abi,
+				Recipe:       cloneHookRecipe(recipe.hook),
+				Notes:        recipe.notes,
+			})
+		}
+	}
 	report.Candidates = append(report.Candidates, inspectJNIFunctionTables(file)...)
 
-	report.Signals = scanSignals(file)
+	report.Signals = append(report.Signals, scanSignals(file)...)
 	families := make(map[string]struct{})
 	for _, candidate := range report.Candidates {
 		families[candidate.Family] = struct{}{}
@@ -578,6 +697,19 @@ func InspectLibrary(path string) LibraryReport {
 		return report.Candidates[i].Symbol < report.Candidates[j].Symbol
 	})
 	return report
+}
+
+func isExecutableFileOffset(file *elf.File, offset uint64) bool {
+	for _, program := range file.Progs {
+		if program.Type != elf.PT_LOAD || program.Flags&elf.PF_X == 0 ||
+			offset < program.Off {
+			continue
+		}
+		if offset-program.Off < program.Filesz {
+			return true
+		}
+	}
+	return false
 }
 
 type jniTableCandidate struct {
@@ -728,6 +860,23 @@ func collectSymbols(file *elf.File) ([]inspectedSymbol, bool) {
 }
 
 func candidateForSymbol(name string) (symbolRecipe, bool) {
+	return candidateForSymbolInCatalog(name, "", "", nil)
+}
+
+func candidateForSymbolInCatalog(
+	name string,
+	libraryPath string,
+	buildID string,
+	catalog *RecipeCatalog,
+) (symbolRecipe, bool) {
+	if catalog != nil {
+		for _, recipe := range catalog.Recipes {
+			if recipe.Symbol == name &&
+				recipe.matchesLibrary(libraryPath, buildID) {
+				return recipe.symbolRecipe(), true
+			}
+		}
+	}
 	if recipe, found := knownSymbolRecipes[name]; found {
 		return recipe, true
 	}

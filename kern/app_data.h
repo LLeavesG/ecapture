@@ -54,6 +54,7 @@ struct active_app_hook_t {
     u64 length;
     u64 context_id;
     u64 stream_id;
+    u64 result_length_address;
 };
 
 struct app_hook_key_t {
@@ -176,6 +177,7 @@ static __always_inline u64 app_hook_argument(struct pt_regs *ctx, u32 index) {
     volatile u64 argument3 = (u64)PT_REGS_PARM3(ctx);
     volatile u64 argument4 = (u64)PT_REGS_PARM4(ctx);
     volatile u64 argument5 = (u64)PT_REGS_PARM5(ctx);
+    volatile u64 argument6 = (u64)PT_REGS_PARM6(ctx);
     switch (index) {
     case 1:
         return argument1;
@@ -187,9 +189,119 @@ static __always_inline u64 app_hook_argument(struct pt_regs *ctx, u32 index) {
         return argument4;
     case 5:
         return argument5;
+    case 6:
+        return argument6;
+#if defined(bpf_target_arm64)
+    case 7:
+        return (u64)PT_REGS_PARM7(ctx);
+    case 8:
+        return (u64)PT_REGS_PARM8(ctx);
+    case 9: {
+        u64 value = 0;
+        bpf_probe_read_user(&value, sizeof(value), (void *)((u64)PT_REGS_SP(ctx)));
+        return value;
+    }
+    case 10: {
+        u64 value = 0;
+        bpf_probe_read_user(&value, sizeof(value), (void *)((u64)PT_REGS_SP(ctx) + 8));
+        return value;
+    }
+    case 11: {
+        u64 value = 0;
+        bpf_probe_read_user(&value, sizeof(value), (void *)((u64)PT_REGS_SP(ctx) + 16));
+        return value;
+    }
+    case 12: {
+        u64 value = 0;
+        bpf_probe_read_user(&value, sizeof(value), (void *)((u64)PT_REGS_SP(ctx) + 24));
+        return value;
+    }
+#elif defined(bpf_target_x86)
+    /*
+     * SysV amd64 puts a return address at entry SP, followed by arguments
+     * seven and later. Keep each user-memory offset compile-time constant.
+     */
+    case 7: {
+        u64 value = 0;
+        bpf_probe_read_user(&value, sizeof(value), (void *)((u64)PT_REGS_SP(ctx) + 8));
+        return value;
+    }
+    case 8: {
+        u64 value = 0;
+        bpf_probe_read_user(&value, sizeof(value), (void *)((u64)PT_REGS_SP(ctx) + 16));
+        return value;
+    }
+    case 9: {
+        u64 value = 0;
+        bpf_probe_read_user(&value, sizeof(value), (void *)((u64)PT_REGS_SP(ctx) + 24));
+        return value;
+    }
+    case 10: {
+        u64 value = 0;
+        bpf_probe_read_user(&value, sizeof(value), (void *)((u64)PT_REGS_SP(ctx) + 32));
+        return value;
+    }
+    case 11: {
+        u64 value = 0;
+        bpf_probe_read_user(&value, sizeof(value), (void *)((u64)PT_REGS_SP(ctx) + 40));
+        return value;
+    }
+    case 12: {
+        u64 value = 0;
+        bpf_probe_read_user(&value, sizeof(value), (void *)((u64)PT_REGS_SP(ctx) + 48));
+        return value;
+    }
+#endif
     default:
         return 0;
     }
+}
+
+static __always_inline u64 app_hook_deferred_length_address(
+    struct pt_regs *ctx, struct app_hook_config_t *config) {
+    u64 length_base = app_hook_argument(ctx, config->length_arg);
+    if (length_base == 0)
+        return 0;
+    if ((config->flags & APP_DATA_FLAG_LENGTH_INDIRECT) != 0) {
+        u64 indirect = 0;
+        if (bpf_probe_read_user(&indirect, sizeof(indirect),
+                                (void *)(length_base + config->length_offset)) != 0)
+            return 0;
+        return indirect;
+    }
+    return length_base + config->length_offset;
+}
+
+static __always_inline s64 app_hook_read_signed_length(u64 address, u32 size) {
+    if (address == 0)
+        return 0;
+    switch (size) {
+    case 1: {
+        s8 value = 0;
+        if (bpf_probe_read_user(&value, sizeof(value), (void *)address) == 0)
+            return value;
+        break;
+    }
+    case 2: {
+        s16 value = 0;
+        if (bpf_probe_read_user(&value, sizeof(value), (void *)address) == 0)
+            return value;
+        break;
+    }
+    case 4: {
+        s32 value = 0;
+        if (bpf_probe_read_user(&value, sizeof(value), (void *)address) == 0)
+            return value;
+        break;
+    }
+    case 8: {
+        s64 value = 0;
+        if (bpf_probe_read_user(&value, sizeof(value), (void *)address) == 0)
+            return value;
+        break;
+    }
+    }
+    return 0;
 }
 
 static __always_inline u64 app_hook_read_length(u64 address, u32 size) {
@@ -589,6 +701,10 @@ static __always_inline int app_hook_entry(struct pt_regs *ctx, u32 slot) {
             .length = vector_count,
             .context_id = context_id,
             .stream_id = stream_id,
+            .result_length_address =
+                (config->flags & APP_DATA_FLAG_LENGTH_MEMORY) != 0
+                    ? app_hook_deferred_length_address(ctx, config)
+                    : 0,
         };
         bpf_map_update_elem(&active_app_hooks, &key, &active, BPF_ANY);
         return 0;
@@ -651,7 +767,11 @@ static __always_inline int app_hook_return(struct pt_regs *ctx, u32 slot) {
     if (config != NULL) {
         if ((config->flags &
              (APP_DATA_FLAG_BUFFER_IOVEC | APP_DATA_FLAG_BUFFER_MSGHDR)) != 0) {
-            s64 result = (s64)PT_REGS_RC(ctx);
+            s64 result =
+                (config->flags & APP_DATA_FLAG_LENGTH_MEMORY) != 0
+                    ? app_hook_read_signed_length(active->result_length_address,
+                                                  config->length_size)
+                    : (s64)PT_REGS_RC(ctx);
             if (result > 0)
                 app_hook_emit_iovec(ctx, slot, config, active->buffer,
                                     active->length, (u64)result, true,

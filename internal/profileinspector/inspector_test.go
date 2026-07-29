@@ -95,6 +95,8 @@ func TestCandidateForKnownAndCronetSymbols(t *testing.T) {
 	}{
 		{"SSL_write", "openssl", "tls-write", true},
 		{"quiche_conn_stream_recv", "quiche", "quic-stream-recv", true},
+		{"lsquic_stream_writev", "lsquic", "quic-stream-writev", true},
+		{"ngtcp2_conn_writev_stream_versioned", "ngtcp2", "quic-stream-writev", true},
 		{"writev", "libc", "fd-writev", true},
 		{"sendmsg", "libc", "socket-sendmsg", true},
 		{"Java_org_chromium_net_impl_CronetUrlRequest_onReadCompleted", "cronet", "jni-entry", false},
@@ -124,6 +126,14 @@ func TestCandidateForKnownAndCronetSymbols(t *testing.T) {
 	if sendmsg.hook.BufferFormat != openssl.AppDataBufferMsgHdr ||
 		sendmsg.hook.BufferArg != 2 || sendmsg.hook.ContextArg != 1 {
 		t.Fatalf("sendmsg recipe = %#v", sendmsg.hook)
+	}
+	ngtcp2, _ := candidateForSymbol("ngtcp2_conn_writev_stream_versioned")
+	if ngtcp2.hook.BufferFormat != openssl.AppDataBufferIOVec ||
+		ngtcp2.hook.BufferArg != 10 || ngtcp2.hook.VectorCountArg != 11 ||
+		ngtcp2.hook.LengthSource != openssl.AppDataLengthMemory ||
+		ngtcp2.hook.LengthArg != 7 || ngtcp2.hook.ContextArg != 1 ||
+		ngtcp2.hook.StreamArg != 9 {
+		t.Fatalf("ngtcp2 recipe = %#v", ngtcp2.hook)
 	}
 }
 
@@ -271,6 +281,45 @@ func TestScaffoldProfilePreservesIOVecRecipe(t *testing.T) {
 		hook.VectorCountArg != 3 || hook.CaptureOn != openssl.AppDataCaptureReturn ||
 		hook.ContextArg != 1 {
 		t.Fatalf("scaffolded readv hook = %#v", hook)
+	}
+}
+
+func TestScaffoldProfilePreservesHighArgumentQUICRecipe(t *testing.T) {
+	recipe, found := candidateForSymbol("ngtcp2_conn_writev_stream_versioned")
+	if !found || recipe.hook == nil {
+		t.Fatal("ngtcp2 versioned writev recipe is unavailable")
+	}
+	report := &Report{
+		Version: ReportVersion,
+		PID:     88,
+		Libraries: []LibraryReport{{
+			Path:    "/usr/lib/libngtcp2.so",
+			BuildID: "11223344",
+			Candidates: []HookCandidate{{
+				Family:       recipe.family,
+				Layer:        recipe.layer,
+				Role:         recipe.role,
+				Symbol:       "ngtcp2_conn_writev_stream_versioned",
+				SymbolSource: "dynamic",
+				Confidence:   recipe.confidence,
+				Priority:     recipe.priority,
+				Recipe:       cloneHookRecipe(recipe.hook),
+			}},
+		}},
+	}
+	profile, err := ScaffoldProfile(report, ScaffoldOptions{MaxHooks: 1})
+	if err != nil {
+		t.Fatalf("ScaffoldProfile() error = %v", err)
+	}
+	if len(profile.DataHooks) != 1 {
+		t.Fatalf("data hooks = %#v", profile.DataHooks)
+	}
+	hook := profile.DataHooks[0]
+	if hook.BufferArg != 10 || hook.VectorCountArg != 11 ||
+		hook.LengthSource != openssl.AppDataLengthMemory ||
+		hook.LengthArg != 7 || hook.LengthSize != 8 ||
+		hook.ContextArg != 1 || hook.StreamArg != 9 {
+		t.Fatalf("scaffolded ngtcp2 hook = %#v", hook)
 	}
 }
 

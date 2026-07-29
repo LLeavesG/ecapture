@@ -73,7 +73,11 @@ const (
 
 	MaxApplicationHooks = 8
 	MaxApplicationData  = 8 * MaxDataSize
-	MaxJNIRegisterHooks = 4
+	// MaxApplicationArguments covers the full register argument set plus the
+	// first entry-stack arguments on the supported amd64 and arm64 ABIs. QUIC
+	// APIs such as ngtcp2 expose stream buffers beyond argument eight.
+	MaxApplicationArguments = 12
+	MaxJNIRegisterHooks     = 4
 )
 
 var (
@@ -444,17 +448,17 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 			return fmt.Errorf("application data hook %q has unsupported capture_on %q",
 				hook.Name, hook.CaptureOn)
 		}
-		if hook.BufferArg < 1 || hook.BufferArg > 5 {
-			return fmt.Errorf("application data hook %q buffer_arg must be between 1 and 5",
-				hook.Name)
+		if hook.BufferArg < 1 || hook.BufferArg > MaxApplicationArguments {
+			return fmt.Errorf("application data hook %q buffer_arg must be between 1 and %d",
+				hook.Name, MaxApplicationArguments)
 		}
-		if hook.ContextArg > 5 {
-			return fmt.Errorf("application data hook %q context_arg must be between 0 and 5",
-				hook.Name)
+		if hook.ContextArg > MaxApplicationArguments {
+			return fmt.Errorf("application data hook %q context_arg must be between 0 and %d",
+				hook.Name, MaxApplicationArguments)
 		}
-		if hook.StreamArg > 5 {
-			return fmt.Errorf("application data hook %q stream_arg must be between 0 and 5",
-				hook.Name)
+		if hook.StreamArg > MaxApplicationArguments {
+			return fmt.Errorf("application data hook %q stream_arg must be between 0 and %d",
+				hook.Name, MaxApplicationArguments)
 		}
 		hook.BufferFormat = strings.ToLower(strings.TrimSpace(hook.BufferFormat))
 		if hook.BufferFormat == "" {
@@ -490,9 +494,9 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 				return fmt.Errorf("application data hook %q state_action requires state_group",
 					hook.Name)
 			}
-			if hook.StateKeyArg < 1 || hook.StateKeyArg > 5 {
-				return fmt.Errorf("application data hook %q state_key_arg must be between 1 and 5",
-					hook.Name)
+			if hook.StateKeyArg < 1 || hook.StateKeyArg > MaxApplicationArguments {
+				return fmt.Errorf("application data hook %q state_key_arg must be between 1 and %d",
+					hook.Name, MaxApplicationArguments)
 			}
 			if hook.CaptureOn != AppDataCaptureEntry {
 				return fmt.Errorf("application data hook %q state_action requires capture_on=entry",
@@ -525,17 +529,57 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 
 		hook.LengthSource = strings.ToLower(strings.TrimSpace(hook.LengthSource))
 		if hook.BufferFormat == AppDataBufferIOVec {
-			if hook.VectorCountArg < 1 || hook.VectorCountArg > 5 {
-				return fmt.Errorf("application data hook %q buffer_format=%s requires vector_count_arg between 1 and 5",
-					hook.Name, AppDataBufferIOVec)
+			if hook.VectorCountArg < 1 || hook.VectorCountArg > MaxApplicationArguments {
+				return fmt.Errorf("application data hook %q buffer_format=%s requires vector_count_arg between 1 and %d",
+					hook.Name, AppDataBufferIOVec, MaxApplicationArguments)
 			}
 			if hook.BufferOffset != 0 || hook.BufferIndirect {
 				return fmt.Errorf("application data hook %q buffer_format=%s requires a direct iovec pointer",
 					hook.Name, AppDataBufferIOVec)
 			}
-			if hook.LengthSource != "" || hook.LengthArg != 0 || hook.FixedLength != 0 ||
-				hook.LengthOffset != 0 || hook.LengthSize != 0 || hook.LengthIndirect {
-				return fmt.Errorf("application data hook %q buffer_format=%s derives lengths from vector entries and the optional function return value",
+			switch hook.LengthSource {
+			case "":
+				if hook.LengthArg != 0 || hook.FixedLength != 0 ||
+					hook.LengthOffset != 0 || hook.LengthSize != 0 ||
+					hook.LengthIndirect {
+					return fmt.Errorf("application data hook %q buffer_format=%s derives lengths from vector entries and the optional function return value",
+						hook.Name, AppDataBufferIOVec)
+				}
+			case AppDataLengthReturn:
+				if hook.CaptureOn != AppDataCaptureReturn {
+					return fmt.Errorf("application data hook %q buffer_format=%s length_source=return requires capture_on=return",
+						hook.Name, AppDataBufferIOVec)
+				}
+				if hook.LengthArg != 0 || hook.FixedLength != 0 ||
+					hook.LengthOffset != 0 || hook.LengthSize != 0 ||
+					hook.LengthIndirect {
+					return fmt.Errorf("application data hook %q buffer_format=%s length_source=return does not use length fields",
+						hook.Name, AppDataBufferIOVec)
+				}
+			case AppDataLengthMemory:
+				if hook.CaptureOn != AppDataCaptureReturn {
+					return fmt.Errorf("application data hook %q buffer_format=%s length_source=memory requires capture_on=return",
+						hook.Name, AppDataBufferIOVec)
+				}
+				if hook.LengthArg < 1 || hook.LengthArg > MaxApplicationArguments {
+					return fmt.Errorf("application data hook %q buffer_format=%s length_source=memory requires length_arg between 1 and %d",
+						hook.Name, AppDataBufferIOVec, MaxApplicationArguments)
+				}
+				if hook.FixedLength != 0 {
+					return fmt.Errorf("application data hook %q buffer_format=%s length_source=memory does not use fixed_length",
+						hook.Name, AppDataBufferIOVec)
+				}
+				if hook.LengthSize == 0 {
+					hook.LengthSize = 8
+				}
+				switch hook.LengthSize {
+				case 1, 2, 4, 8:
+				default:
+					return fmt.Errorf("application data hook %q has unsupported memory length_size %d",
+						hook.Name, hook.LengthSize)
+				}
+			default:
+				return fmt.Errorf("application data hook %q buffer_format=%s supports only empty, return, or memory length_source",
 					hook.Name, AppDataBufferIOVec)
 			}
 			if hook.MaxBytes > MaxApplicationData {
@@ -602,18 +646,18 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 				return fmt.Errorf("application data hook %q fixed_length requires length_source=fixed",
 					hook.Name)
 			}
-			if hook.LengthArg < 1 || hook.LengthArg > 5 {
-				return fmt.Errorf("application data hook %q length_arg must be between 1 and 5",
-					hook.Name)
+			if hook.LengthArg < 1 || hook.LengthArg > MaxApplicationArguments {
+				return fmt.Errorf("application data hook %q length_arg must be between 1 and %d",
+					hook.Name, MaxApplicationArguments)
 			}
 		case AppDataLengthMemory:
 			if hook.FixedLength != 0 {
 				return fmt.Errorf("application data hook %q fixed_length requires length_source=fixed",
 					hook.Name)
 			}
-			if hook.LengthArg > 5 {
-				return fmt.Errorf("application data hook %q memory length_arg must be between 0 and 5",
-					hook.Name)
+			if hook.LengthArg > MaxApplicationArguments {
+				return fmt.Errorf("application data hook %q memory length_arg must be between 0 and %d",
+					hook.Name, MaxApplicationArguments)
 			}
 			if hook.LengthSize == 0 {
 				hook.LengthSize = 8

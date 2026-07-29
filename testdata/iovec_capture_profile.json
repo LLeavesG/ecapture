@@ -76,6 +76,22 @@
       "buffer_format": "msghdr",
       "context_arg": 1,
       "max_bytes": 131072
+    },
+    {
+      "name": "fixture-higharg-quic-writev",
+      "library": "/tmp/ecapture-iovec-helper",
+      "symbol": "ecapture_test_higharg_iovec",
+      "direction": "write",
+      "capture_on": "return",
+      "buffer_arg": 10,
+      "buffer_format": "iovec",
+      "vector_count_arg": 11,
+      "length_source": "memory",
+      "length_arg": 7,
+      "length_size": 8,
+      "context_arg": 1,
+      "stream_arg": 9,
+      "max_bytes": 131072
     }
   ],
   "metadata": {

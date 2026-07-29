@@ -32,6 +32,7 @@ var (
 	profileScaffoldName     string
 	profileScaffoldPackage  string
 	profileScaffoldMaxHooks int
+	profileRecipeCatalog    string
 	profileLearnJNIInput    string
 	profileLearnJNIOutput   string
 	profileLearnJNIMinScore int
@@ -54,7 +55,8 @@ a diagnostic application profile containing raw packet capture and at most
 --max-hooks direct-buffer candidates.`,
 	Example: `ecapture profile inspect --pid 3423 --output report.json
 ecapture profile inspect --pid 3423 --scaffold app-discovery.json
-ecapture profile inspect --library /data/local/tmp/libcronet.so`,
+ecapture profile inspect --library /data/local/tmp/libcronet.so
+ecapture profile inspect --library libprivate.so --recipe-catalog private-abi.json`,
 	Args: cobra.NoArgs,
 	RunE: runProfileInspect,
 }
@@ -113,6 +115,12 @@ func init() {
 		8,
 		"maximum number of ranked direct-buffer hooks in the generated profile.",
 	)
+	profileInspectCmd.Flags().StringVar(
+		&profileRecipeCatalog,
+		"recipe-catalog",
+		"",
+		"external Build-ID-constrained symbol/offset ABI recipe catalog.",
+	)
 	profileLearnJNICmd.Flags().StringVar(
 		&profileLearnJNIInput,
 		"input",
@@ -156,7 +164,19 @@ func runProfileInspect(command *cobra.Command, _ []string) error {
 			return fmt.Errorf("--output and --scaffold must name different files")
 		}
 	}
-	report, err := profileinspector.Inspect(globalConf.Pid, profileInspectLibraries)
+	var catalog *profileinspector.RecipeCatalog
+	var err error
+	if profileRecipeCatalog != "" {
+		catalog, err = profileinspector.LoadRecipeCatalog(profileRecipeCatalog)
+		if err != nil {
+			return err
+		}
+	}
+	report, err := profileinspector.InspectWithCatalog(
+		globalConf.Pid,
+		profileInspectLibraries,
+		catalog,
+	)
 	if err != nil {
 		return err
 	}

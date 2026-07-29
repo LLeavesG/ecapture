@@ -36,6 +36,24 @@ accessible process. Root can still be required to read another process's maps.
 
 Never turn a `hint` into a production hook without the later phases.
 
+If an ABI was already recovered for this or another version, put it in a
+recipe catalog instead of modifying the inspector:
+
+```sh
+ecapture profile inspect \
+  --library /data/local/tmp/libprivate.so \
+  --recipe-catalog private-abi.json \
+  --output private-report.json \
+  --scaffold private-discovery.json \
+  --pid "$TARGET_PID"
+```
+
+Use a symbol recipe when the exported ABI is stable. For an internal offset,
+the catalog requires `build_id`, and the inspector verifies that the file
+offset lies in an executable ELF segment before scaffolding it. A Build-ID
+match means “apply this known ABI to this exact binary”; it does not replace
+the marker test.
+
 ## Phase 2: select the highest stable boundary
 
 Prefer candidates in this order:
@@ -115,9 +133,12 @@ method with `GetStringUTFChars`, `GetByteArrayElements`,
 native buffer boundary in disassembly. This is why `learn-jni` ranks and guides
 but deliberately does not manufacture a data hook.
 
-On AArch64, arguments 1 through 5 in an application profile correspond to
-`x0` through `x4`. A probe in the middle of a function sees the registers at
-that instruction, not necessarily the original function arguments.
+At a function-entry uprobe, AArch64 profile arguments 1 through 8 correspond
+to `x0` through `x7`; arguments 9 through 12 are read from the standard entry
+stack slots. On SysV amd64, arguments 1 through 6 use the normal argument
+registers and 7 through 12 use entry-stack slots after the return address. A
+probe in the middle of a function sees the registers and stack at that exact
+instruction, not necessarily the original function arguments.
 
 Useful Cronet anchors include request adapter creation, HTTP method/header
 setters, upload `readData`/`onReadSucceeded`, response
@@ -159,6 +180,16 @@ ngtcp2 vectors, chained buffers, and C++ collections are not interchangeable
 with either platform adapter. Prefer a public stream ABI with accessible
 pointer/count arguments, a version-pinned mid-function point where they are
 materialized in registers, or a dedicated layout adapter.
+
+For a scatter/gather API that returns packet length but writes accepted
+plaintext length through an output pointer, use an iovec return hook with
+`length_source: "memory"`. The scalar address is resolved from `length_arg` at
+entry and read after return. Current
+`ngtcp2_conn_writev_stream_versioned` uses connection argument 1,
+`ngtcp2_ssize *pdatalen` argument 7, stream ID argument 9, and
+`ngtcp2_vec *`/count arguments 10/11. The inspector scaffolds that exact
+public symbol; it keeps older unversioned variants as hints until their header
+ABI is confirmed.
 
 Use a state pair when pointer creation and completion are split:
 
@@ -244,6 +275,8 @@ is not a completed profile.
 | Public C ABI recipe | automatic when the inspector knows it | marker test |
 | Standard `readv`/`writev` iovec ABI | automatic | flattened marker and return-length test |
 | Standard 64-bit `sendmsg`/`recvmsg` msghdr ABI | automatic | flattened marker, header-layout, and return-length test |
+| Public quiche/lsquic/current ngtcp2 stream ABI | automatic | marker, connection/stream ID, and accepted-length test |
+| Validated private symbol/offset recipe catalog | automatic for matching Build ID | repeat marker and negative Build-ID test |
 | Stack-specific vectors/chained buffers | candidate-assisted | exact aggregate layout or materialized-register ABI |
 | Stripped C++/private SDK ABI | candidate-assisted | disassembly and register/memory layout |
 | JNI object conversion | candidate-assisted | correlate the relevant `JNIEnv` conversion call |

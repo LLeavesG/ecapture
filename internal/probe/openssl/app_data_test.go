@@ -115,6 +115,48 @@ func TestApplicationDataHookIOVecBPFConfig(t *testing.T) {
 	}
 }
 
+func TestApplicationDataHookHighArgumentIOVecResultMemory(t *testing.T) {
+	profile := &ApplicationProfile{
+		Version: ApplicationProfileVersion,
+		Name:    "ngtcp2-writev-stream",
+		Match:   ApplicationMatch{UID: 10001},
+		Capture: ApplicationCapture{Strategies: []string{StrategyAppData}},
+		DataHooks: []ApplicationDataHook{{
+			Name:           "ngtcp2-stream-write",
+			Library:        "/data/app/libngtcp2.so",
+			Symbol:         "ngtcp2_conn_writev_stream_versioned",
+			Direction:      AppDataDirectionWrite,
+			CaptureOn:      AppDataCaptureReturn,
+			BufferArg:      10,
+			BufferFormat:   AppDataBufferIOVec,
+			VectorCountArg: 11,
+			LengthSource:   AppDataLengthMemory,
+			LengthArg:      7,
+			ContextArg:     1,
+			StreamArg:      9,
+			MaxBytes:       MaxApplicationData,
+		}},
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	hook := profile.DataHooks[0]
+	if hook.LengthSize != 8 {
+		t.Fatalf("deferred result length size = %d, want 8", hook.LengthSize)
+	}
+	got := hook.bpfConfig()
+	wantFlags := uint32(appDataFlagBufferIOVec |
+		appDataFlagLengthMemory |
+		appDataFlagCaptureReturn)
+	if got.Flags != wantFlags || got.BufferArg != 10 ||
+		got.VectorCountArg != 11 || got.LengthArg != 7 ||
+		got.ContextArg != 1 || got.StreamArg != 9 ||
+		got.LengthSize != 8 {
+		t.Fatalf("unexpected high-argument iovec BPF config: %#v", got)
+	}
+}
+
 func TestApplicationDataHookMsgHdrBPFConfig(t *testing.T) {
 	profile := &ApplicationProfile{
 		Version: ApplicationProfileVersion,
@@ -300,9 +342,9 @@ func TestApplicationDataHookValidationErrors(t *testing.T) {
 	}{
 		{"missing library", func(h *ApplicationDataHook) { h.Library = "" }},
 		{"two targets", func(h *ApplicationDataHook) { h.Offset = 0x10 }},
-		{"bad buffer arg", func(h *ApplicationDataHook) { h.BufferArg = 6 }},
-		{"bad context arg", func(h *ApplicationDataHook) { h.ContextArg = 6 }},
-		{"bad stream arg", func(h *ApplicationDataHook) { h.StreamArg = 6 }},
+		{"bad buffer arg", func(h *ApplicationDataHook) { h.BufferArg = 13 }},
+		{"bad context arg", func(h *ApplicationDataHook) { h.ContextArg = 13 }},
+		{"bad stream arg", func(h *ApplicationDataHook) { h.StreamArg = 13 }},
 		{"return length at entry", func(h *ApplicationDataHook) {
 			h.LengthSource = AppDataLengthReturn
 		}},
@@ -339,6 +381,11 @@ func TestApplicationDataHookValidationErrors(t *testing.T) {
 		{"iovec with explicit length", func(h *ApplicationDataHook) {
 			h.BufferFormat = AppDataBufferIOVec
 			h.VectorCountArg = 3
+		}},
+		{"iovec result memory at entry", func(h *ApplicationDataHook) {
+			h.BufferFormat = AppDataBufferIOVec
+			h.VectorCountArg = 3
+			h.LengthSource = AppDataLengthMemory
 		}},
 		{"iovec with indirect buffer", func(h *ApplicationDataHook) {
 			h.BufferFormat = AppDataBufferIOVec

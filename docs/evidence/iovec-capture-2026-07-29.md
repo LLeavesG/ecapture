@@ -133,3 +133,46 @@ Linux and Android 64-bit ABIs, bounded vector flattening, and return-length
 handling. It does not prove a QUIC library's private vector type, chained
 buffers, HTTP/3 QPACK, or application semantics; those remain separate
 adapters and decoders.
+
+## Twelve-argument QUIC-shaped ABI follow-up
+
+The fixture was extended again with
+`ecapture_test_higharg_iovec`, which mirrors the current public
+`ngtcp2_conn_writev_stream_versioned` argument positions without linking or
+contacting a QUIC implementation:
+
+- connection identity: argument 1, value `0x12345000`;
+- accepted plaintext output pointer: argument 7;
+- stream ID: argument 9, value `0x0102030405060708`;
+- vector pointer/count: arguments 10/11;
+- function return: 1200, deliberately different from accepted plaintext;
+- vector total: 48 bytes, accepted plaintext: 36 bytes.
+
+The 36-byte prefix was
+`ECAPTURE-HIGHARG-QUIC-STREAM-MARKER\n`; the final 12-byte
+`IGNORED-TAIL` vector had to be excluded. This verifies that the uretprobe
+used `*arg7`, not packet-length return value or total vector capacity, while
+preserving high stack argument values.
+
+On Linux 6.8 arm64, eight probes emitted 15 chunks and reconstructed the four
+earlier calls plus the high-argument call as five complete, zero incomplete:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| 15 structured events | `a2f676083fb0e6e82dc7b2ce95d8325a645b0139113ab6513a30c66f9936280c` |
+| five reconstructed calls | `d72cc48cd5d41fc2648c8373aa46c93dbf41875417d7266c5fc885821bee1f16` |
+| dynamic marker helper | `094a9c58beced7f10072959f3a70fa5c8767c43b727b46fec8998d376569833b` |
+
+The same source and profile then passed the Android 16 arm64 non-CO-RE
+verifier and runtime with the same reconstructed payload and identities:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| 15 structured events | `894f66de77f83da7ed450194ea029873ae59eab0e2991ef1bd873b666cc8539c` |
+| five reconstructed calls | `fbc3255349311fe56fd48ef0f7f78116e8fd0d7cc29df912b81c0d8d8b56a607` |
+| tested Android-tagged eCapture binary | `a4ca4be9e7624fc90e5137f140234734d55a4fac7d89c9a6e325dd0932a680d2` |
+| static marker helper | `f95afc5012883298ad1012ac13f16c8fab0be819ee268b3cefcbbf99ba80b6b6` |
+
+Both arm64 and amd64 CO-RE objects were also compiled from the same
+high-argument reader. The amd64 entry-stack path has compile coverage here;
+an amd64 runtime marker test remains desirable.

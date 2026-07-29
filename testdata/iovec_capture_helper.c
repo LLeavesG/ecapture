@@ -24,6 +24,7 @@
  */
 
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -46,6 +47,30 @@ EXPORTED ssize_t ecapture_test_sendmsg(int fd, const struct msghdr *message, int
 
 EXPORTED ssize_t ecapture_test_recvmsg(int fd, struct msghdr *message, int flags) {
     return recvmsg(fd, message, flags);
+}
+
+/*
+ * Mirrors ngtcp2_conn_writev_stream_versioned's 12-argument shape without
+ * linking any QUIC implementation. The accepted plaintext length is written
+ * through argument seven; stream/vector/count live at arguments 9/10/11.
+ */
+EXPORTED ssize_t ecapture_test_higharg_iovec(
+    void *context, void *path, int packet_info_version, void *packet_info,
+    void *destination, size_t destination_length, ssize_t *accepted_length,
+    uint32_t flags, int64_t stream_id, const struct iovec *vectors,
+    size_t vector_count, uint64_t timestamp) {
+    (void)context;
+    (void)path;
+    (void)packet_info_version;
+    (void)packet_info;
+    (void)destination;
+    (void)flags;
+    (void)stream_id;
+    (void)vectors;
+    (void)vector_count;
+    (void)timestamp;
+    *accepted_length = 36;
+    return (ssize_t)destination_length;
 }
 
 int main(void) {
@@ -127,6 +152,25 @@ int main(void) {
     };
     if (ecapture_test_recvmsg(message_fds[1], &incoming, 0) < 0)
         return 8;
+
+    static const char high_part_1[] = "ECAPTURE-";
+    static const char high_part_2[] = "HIGHARG-QUIC-";
+    static const char high_part_3[] = "STREAM-MARKER\n";
+    static const char high_ignored_tail[] = "IGNORED-TAIL";
+    struct iovec high_vectors[] = {
+        {(void *)high_part_1, sizeof(high_part_1) - 1},
+        {(void *)high_part_2, sizeof(high_part_2) - 1},
+        {(void *)high_part_3, sizeof(high_part_3) - 1},
+        {(void *)high_ignored_tail, sizeof(high_ignored_tail) - 1},
+    };
+    ssize_t accepted_length = -1;
+    if (ecapture_test_higharg_iovec(
+            (void *)(uintptr_t)0x12345000, NULL, 1, NULL, NULL, 1200,
+            &accepted_length, 0, 0x102030405060708LL, high_vectors,
+            sizeof(high_vectors) / sizeof(high_vectors[0]), 123456789ULL) < 0)
+        return 9;
+    if (accepted_length != 36)
+        return 10;
 
     close(pipe_fds[0]);
     close(pipe_fds[1]);
