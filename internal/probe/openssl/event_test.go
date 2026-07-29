@@ -46,9 +46,15 @@ func TestEvent_DecodeFromBytes(t *testing.T) {
 	copy(comm[:], []byte("curl"))
 	err = binary.Write(buf, binary.LittleEndian, comm)
 
-	err = binary.Write(buf, binary.LittleEndian, uint32(3))  // Fd
-	err = binary.Write(buf, binary.LittleEndian, int32(771)) // Version (TLS 1.2)
-	err = binary.Write(buf, binary.LittleEndian, uint32(0))  // BioType
+	err = binary.Write(buf, binary.LittleEndian, uint32(3))          // Fd
+	err = binary.Write(buf, binary.LittleEndian, int32(771))         // Version (TLS 1.2)
+	err = binary.Write(buf, binary.LittleEndian, uint32(0))          // BioType
+	err = binary.Write(buf, binary.LittleEndian, uint64(0x12345678)) // SSLAddr
+	err = binary.Write(buf, binary.LittleEndian, uint64(0x87654321)) // BIOAddr
+	err = binary.Write(buf, binary.LittleEndian, uint32(16))         // OriginalLen
+	err = binary.Write(buf, binary.LittleEndian, uint32(16))         // CapturedLen
+	err = binary.Write(buf, binary.LittleEndian, uint32(0))          // ChunkOffset
+	err = binary.Write(buf, binary.LittleEndian, uint32(0))          // Flags
 	if err != nil {
 		t.Fatalf("binary.Write failed: %v", err)
 		return
@@ -85,6 +91,16 @@ func TestEvent_DecodeFromBytes(t *testing.T) {
 	if event.Version != 771 {
 		t.Errorf("Version = %d, want 771", event.Version)
 		return
+	}
+	if event.SSLAddr != 0x12345678 {
+		t.Errorf("SSLAddr = %#x, want %#x", event.SSLAddr, uint64(0x12345678))
+	}
+	if event.BIOAddr != 0x87654321 {
+		t.Errorf("BIOAddr = %#x, want %#x", event.BIOAddr, uint64(0x87654321))
+	}
+	if event.OriginalLen != 16 || event.CapturedLen != 16 || event.ChunkOffset != 0 {
+		t.Errorf("call metadata = original:%d captured:%d offset:%d, want 16/16/0",
+			event.OriginalLen, event.CapturedLen, event.ChunkOffset)
 	}
 
 	dataStr := string(event.GetData())
@@ -153,6 +169,75 @@ func TestEvent_StringHex(t *testing.T) {
 	// Check for hex representation of "test"
 	if !strings.Contains(hex, "74657374") {
 		t.Errorf("StringHex() should contain hex of 'test', got: %s", hex)
+	}
+}
+
+func TestEvent_MultiChunkMetadata(t *testing.T) {
+	event := &Event{
+		DataType:    DataTypeRead,
+		Timestamp:   123,
+		Pid:         42,
+		DataLen:     17,
+		SSLAddr:     0xabc,
+		BIOAddr:     0xdef,
+		OriginalLen: MaxDataSize + 17,
+		CapturedLen: MaxDataSize + 17,
+		ChunkOffset: MaxDataSize,
+	}
+
+	if err := event.Validate(); err != nil {
+		t.Fatalf("Validate() returned unexpected error: %v", err)
+	}
+	if !event.IsLastChunk() {
+		t.Fatal("last segment should be recognized as the final chunk")
+	}
+	if got, want := event.StreamID(), "42_ssl_abc_0"; got != want {
+		t.Fatalf("StreamID() = %q, want %q", got, want)
+	}
+
+	first := *event
+	first.DataLen = MaxDataSize
+	first.ChunkOffset = 0
+	if first.IsLastChunk() {
+		t.Fatal("first segment should not be recognized as the final chunk")
+	}
+	if first.UUID() == event.UUID() {
+		t.Fatal("chunks from the same SSL call must have unique UUIDs")
+	}
+}
+
+func TestEvent_TruncationMetadata(t *testing.T) {
+	event := &Event{
+		DataType:    DataTypeWrite,
+		DataLen:     MaxDataSize,
+		OriginalLen: MaxCaptureCallSize + 1,
+		CapturedLen: MaxCaptureCallSize,
+		ChunkOffset: MaxCaptureCallSize - MaxDataSize,
+		Flags:       EventFlagTruncated,
+	}
+	if err := event.Validate(); err != nil {
+		t.Fatalf("Validate() returned unexpected error: %v", err)
+	}
+	if !event.IsTruncated() {
+		t.Fatal("IsTruncated() = false, want true")
+	}
+
+	event.Flags = 0
+	if err := event.Validate(); err == nil {
+		t.Fatal("Validate() should reject missing truncation metadata")
+	}
+}
+
+func TestEvent_RejectsInvalidChunkRange(t *testing.T) {
+	event := &Event{
+		DataType:    DataTypeRead,
+		DataLen:     2,
+		OriginalLen: 10,
+		CapturedLen: 10,
+		ChunkOffset: 9,
+	}
+	if err := event.Validate(); err == nil {
+		t.Fatal("Validate() should reject a chunk that exceeds CapturedLen")
 	}
 }
 

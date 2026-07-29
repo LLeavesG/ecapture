@@ -349,6 +349,27 @@ func (p *Probe) setupManagerText() error {
 		},
 	}
 
+	hasQuicAPI, symbolErr := elfHasDynamicSymbol(opensslPath, "SSL_provide_quic_data")
+	if symbolErr != nil {
+		p.Logger().Debug().
+			Err(symbolErr).
+			Str("symbol", "SSL_provide_quic_data").
+			Msg("Unable to inspect optional QUIC symbol")
+	} else if hasQuicAPI {
+		maps = append(maps, &manager.Map{Name: "quic_events"})
+		p.mapNameToDecoder["quic_events"] = &quicEventDecoder{}
+		probes = append(probes, &manager.Probe{
+			Section:          "uprobe/SSL_provide_quic_data",
+			EbpfFuncName:     "probe_SSL_provide_quic_data",
+			AttachToFuncName: "SSL_provide_quic_data",
+			BinaryPath:       opensslPath,
+			UID:              "uprobe_ssl_provide_quic_data",
+		})
+		p.Logger().Info().
+			Str("symbol", "SSL_provide_quic_data").
+			Msg("QUIC handshake detection enabled; HTTP/3 application data bypasses SSL_read/SSL_write")
+	}
+
 	p.bpfManager = &manager.Manager{
 		Probes: probes,
 		Maps:   maps,
@@ -735,6 +756,24 @@ func (d *tlsEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, error)
 
 func (d *tlsEventDecoder) GetDecoder(_ *ebpf.Map) (domain.Event, bool) {
 	return &Event{}, true
+}
+
+// quicEventDecoder implements domain.EventDecoder for QUIC handshake metadata.
+type quicEventDecoder struct{}
+
+func (d *quicEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, error) {
+	event := &QuicEvent{}
+	if err := event.DecodeFromBytes(data); err != nil {
+		return nil, err
+	}
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	return event, nil
+}
+
+func (d *quicEventDecoder) GetDecoder(_ *ebpf.Map) (domain.Event, bool) {
+	return &QuicEvent{}, true
 }
 
 // masterSecretEventDecoder implements domain.EventDecoder for master secret events

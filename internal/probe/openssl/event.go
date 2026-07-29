@@ -33,9 +33,15 @@ const (
 
 	// MaxDataSize is the maximum TLS data size from eBPF
 	// Increased to 16KB, fix: https://github.com/gojue/ecapture/issues/740
-	MaxDataSize   = 1024 * 16
-	ChunkSize     = 32
-	ChunkSizeHalf = ChunkSize / 2
+	MaxDataSize        = 1024 * 16
+	MaxDataSegments    = 16
+	MaxCaptureCallSize = MaxDataSize * MaxDataSegments
+	ChunkSize          = 32
+	ChunkSizeHalf      = ChunkSize / 2
+
+	// EventFlagTruncated means OriginalLen exceeded the bounded per-call
+	// capture ceiling and CapturedLen bytes were emitted.
+	EventFlagTruncated = 1
 )
 
 type AttachType int64
@@ -94,22 +100,34 @@ struct ssl_data_event_t {
     u32 fd;
     s32 version;
     u32 bio_type;
+    u64 ssl_addr;
+    u64 bio_addr;
+    u32 original_len;
+    u32 captured_len;
+    u32 chunk_offset;
+    u32 flags;
 };
 */
 // Event represents an OpenSSL TLS data event from eBPF.
 type Event struct {
-	DataType  int64             `json:"dataType"`
-	Timestamp uint64            `json:"timestamp"` // Nanosecond timestamp
-	Pid       uint32            `json:"pid"`       // Process ID
-	Tid       uint32            `json:"tid"`       // Thread ID
-	Data      [MaxDataSize]byte `json:"data"`      // TLS data payload
-	DataLen   int32             `json:"dataLen"`   // Length of actual data
-	Comm      [TaskCommLen]byte `json:"comm"`      // Process name
-	Fd        uint32            `json:"fd"`
-	Version   int32             `json:"version"` // TLS version (e.g., 771 for TLS 1.2)
-	Tuple     string
-	BioType   uint32
-	Sock      uint64
+	DataType    int64             `json:"dataType"`
+	Timestamp   uint64            `json:"timestamp"` // BPF monotonic nanoseconds; also identifies one SSL call.
+	Pid         uint32            `json:"pid"`       // Process ID
+	Tid         uint32            `json:"tid"`       // Thread ID
+	Data        [MaxDataSize]byte `json:"data"`      // One payload chunk, at most 16KB.
+	DataLen     int32             `json:"dataLen"`   // Length of this chunk.
+	Comm        [TaskCommLen]byte `json:"comm"`      // Process name
+	Fd          uint32            `json:"fd"`
+	Version     int32             `json:"version"` // TLS version (e.g., 771 for TLS 1.2)
+	BioType     uint32            `json:"bioType"`
+	SSLAddr     uint64            `json:"sslAddr"`     // Stable SSL* identity for stream correlation.
+	BIOAddr     uint64            `json:"bioAddr"`     // Directional rbio/wbio identity, including custom BIOs.
+	OriginalLen uint32            `json:"originalLen"` // Bytes returned by the SSL call.
+	CapturedLen uint32            `json:"capturedLen"` // Bytes emitted across all chunks for the call.
+	ChunkOffset uint32            `json:"chunkOffset"` // Offset of this event within the call.
+	Flags       uint32            `json:"flags"`
+	Tuple       string            `json:"tuple,omitempty"`
+	Sock        uint64            `json:"sock,omitempty"`
 }
 
 // DecodeFromBytes deserializes the event from raw eBPF data.
@@ -146,6 +164,24 @@ func (e *Event) DecodeFromBytes(data []byte) error {
 	if err := binary.Read(buf, binary.LittleEndian, &e.BioType); err != nil {
 		return errors.NewEventDecodeError("openssl.BioType", err)
 	}
+	if err := binary.Read(buf, binary.LittleEndian, &e.SSLAddr); err != nil {
+		return errors.NewEventDecodeError("openssl.SSLAddr", err)
+	}
+	if err := binary.Read(buf, binary.LittleEndian, &e.BIOAddr); err != nil {
+		return errors.NewEventDecodeError("openssl.BIOAddr", err)
+	}
+	if err := binary.Read(buf, binary.LittleEndian, &e.OriginalLen); err != nil {
+		return errors.NewEventDecodeError("openssl.OriginalLen", err)
+	}
+	if err := binary.Read(buf, binary.LittleEndian, &e.CapturedLen); err != nil {
+		return errors.NewEventDecodeError("openssl.CapturedLen", err)
+	}
+	if err := binary.Read(buf, binary.LittleEndian, &e.ChunkOffset); err != nil {
+		return errors.NewEventDecodeError("openssl.ChunkOffset", err)
+	}
+	if err := binary.Read(buf, binary.LittleEndian, &e.Flags); err != nil {
+		return errors.NewEventDecodeError("openssl.Flags", err)
+	}
 
 	return nil
 }
@@ -162,28 +198,18 @@ func (e *Event) String() string {
 		direction = "READ"
 	}
 
-	// 2. 获取时间偏移量
-	offsetNs, err := getClockOffset()
-	if err != nil {
-		panic(err)
-	}
-	// 3. 计算绝对时间戳（纳秒）
-	absoluteTimeNs := int64(e.Timestamp) + offsetNs
-
-	// 4. 将纳秒转换为 Go 的 time.Time 对象
-	// time.Unix(sec, nsec)
-	eventTime := time.Unix(0, absoluteTimeNs)
-
 	dataStr := string(e.GetData())
 
-	return fmt.Sprintf("[%s] PID:%d TID:%d Comm:%s FD:%d %s (%d bytes):\n%s",
-		eventTime.Format("2006-01-02 15:04:05.000"),
+	return fmt.Sprintf("[%s] PID:%d TID:%d Comm:%s FD:%d SSL:0x%x BIO:0x%x %s (%s):\n%s",
+		e.eventTime().Format("2006-01-02 15:04:05.000"),
 		e.Pid,
 		e.Tid,
 		e.GetComm(),
 		e.Fd,
+		e.SSLAddr,
+		e.BIOAddr,
 		direction,
-		e.DataLen,
+		e.captureSummary(),
 		dataStr,
 	)
 }
@@ -195,18 +221,18 @@ func (e *Event) StringHex() string {
 		direction = "READ"
 	}
 
-	ts := time.Unix(int64(e.Timestamp), 0)
-
 	hexData := dumpByteSlice(e.GetData(), "")
 
-	return fmt.Sprintf("[%s] PID:%d TID:%d Comm:%s FD:%d %s (%d bytes, hex):\n%s",
-		ts.Format("2006-01-02 15:04:05.000"),
+	return fmt.Sprintf("[%s] PID:%d TID:%d Comm:%s FD:%d SSL:0x%x BIO:0x%x %s (%s, hex):\n%s",
+		e.eventTime().Format("2006-01-02 15:04:05.000"),
 		e.Pid,
 		e.Tid,
 		e.GetComm(),
 		e.Fd,
+		e.SSLAddr,
+		e.BIOAddr,
 		direction,
-		e.DataLen,
+		e.captureSummary(),
 		hexData,
 	)
 }
@@ -226,7 +252,8 @@ func (e *Event) BaseInfo() string {
 		connInfo = fmt.Sprintf("UNKNOWN_%d", e.DataType)
 	}
 	v := TlsVersion{Version: e.Version}
-	s := fmt.Sprintf("PID:%d, Comm:%s, TID:%d, Version:%s, %s", e.Pid, commStr(e.Comm[:]), e.Tid, v.String(), connInfo)
+	s := fmt.Sprintf("PID:%d, Comm:%s, TID:%d, SSL:0x%x, BIO:0x%x, Version:%s, %s",
+		e.Pid, commStr(e.Comm[:]), e.Tid, e.SSLAddr, e.BIOAddr, v.String(), connInfo)
 	return s
 }
 
@@ -243,7 +270,7 @@ func (e *Event) Type() domain.EventType {
 
 // UUID returns a unique identifier for this event.
 func (e *Event) UUID() string {
-	return fmt.Sprintf("%d_%d_%d", e.Pid, e.Tid, e.Timestamp)
+	return fmt.Sprintf("%d_%x_%d_%d", e.Pid, e.SSLAddr, e.Timestamp, e.ChunkOffset)
 }
 
 // Validate checks if the event data is valid.
@@ -256,7 +283,81 @@ func (e *Event) Validate() error {
 		return errors.New(errors.ErrCodeEventValidation,
 			fmt.Sprintf("invalid data type: %d", e.DataType))
 	}
+	if e.OriginalLen == 0 && e.CapturedLen == 0 {
+		// Keep programmatically-created legacy events usable in tests and API
+		// integrations. New eBPF events always provide both fields.
+		return nil
+	}
+	if e.CapturedLen == 0 || e.CapturedLen > MaxCaptureCallSize {
+		return errors.New(errors.ErrCodeEventValidation,
+			fmt.Sprintf("invalid captured call length: %d", e.CapturedLen))
+	}
+	if e.OriginalLen < e.CapturedLen {
+		return errors.New(errors.ErrCodeEventValidation,
+			fmt.Sprintf("original length %d is smaller than captured length %d",
+				e.OriginalLen, e.CapturedLen))
+	}
+	chunkEnd := uint64(e.ChunkOffset) + uint64(e.DataLen)
+	if chunkEnd > uint64(e.CapturedLen) {
+		return errors.New(errors.ErrCodeEventValidation,
+			fmt.Sprintf("chunk range %d..%d exceeds captured length %d",
+				e.ChunkOffset, chunkEnd, e.CapturedLen))
+	}
+	if e.OriginalLen > e.CapturedLen && !e.IsTruncated() {
+		return errors.New(errors.ErrCodeEventValidation,
+			"truncated capture is missing the truncated flag")
+	}
 	return nil
+}
+
+// StreamID identifies one directional TLS plaintext stream. SSLAddr remains
+// stable when a custom BIO has no meaningful file descriptor.
+func (e *Event) StreamID() string {
+	switch {
+	case e.SSLAddr != 0:
+		return fmt.Sprintf("%d_ssl_%x_%d", e.Pid, e.SSLAddr, e.DataType)
+	case e.BIOAddr != 0:
+		return fmt.Sprintf("%d_bio_%x_%d", e.Pid, e.BIOAddr, e.DataType)
+	default:
+		return fmt.Sprintf("%d_fd_%d_%d", e.Pid, e.Fd, e.DataType)
+	}
+}
+
+// IsTruncated reports whether the SSL call exceeded the bounded capture size.
+func (e *Event) IsTruncated() bool {
+	return e.Flags&EventFlagTruncated != 0
+}
+
+// IsLastChunk reports whether this event completes the captured portion of its
+// SSL_read/SSL_write call.
+func (e *Event) IsLastChunk() bool {
+	if e.CapturedLen == 0 || e.DataLen < 0 {
+		return true
+	}
+	return uint64(e.ChunkOffset)+uint64(e.DataLen) >= uint64(e.CapturedLen)
+}
+
+func (e *Event) captureSummary() string {
+	originalLen := e.OriginalLen
+	capturedLen := e.CapturedLen
+	if originalLen == 0 && capturedLen == 0 {
+		originalLen = uint32(max(e.DataLen, 0))
+		capturedLen = originalLen
+	}
+	suffix := ""
+	if e.IsTruncated() {
+		suffix = ", truncated"
+	}
+	return fmt.Sprintf("chunk=%d+%d call=%d/%d bytes%s",
+		e.ChunkOffset, e.DataLen, capturedLen, originalLen, suffix)
+}
+
+func (e *Event) eventTime() time.Time {
+	offsetNs, err := getClockOffset()
+	if err != nil {
+		return time.Unix(0, int64(e.Timestamp))
+	}
+	return time.Unix(0, int64(e.Timestamp)+offsetNs)
 }
 
 // GetPid returns the process ID.
