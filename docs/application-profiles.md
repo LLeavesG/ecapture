@@ -114,3 +114,11 @@ encrypted unless matching secrets or application plaintext are captured.
 `SSL_provide_quic_data` exposes QUIC handshake activity, not HTTP/3 request
 payloads. Application hooks emit plaintext as eCapture events; they do not
 rewrite encrypted packets inside the PCAPNG.
+
+Legacy gQUIC does not use the TLS 1.3 `SSL_provide_quic_data` path. When
+`raw_packets` is enabled, eCapture still preserves its UDP datagrams and
+annotates visible TLS and gQUIC Client Hello packets with their server name.
+Later application datagrams remain encrypted and are identified as the same
+flow by their source/destination tuple in the PCAPNG. A proxy or UDP/443
+fallback can change an application's transport to TCP/TLS, so captures made
+with and without such instrumentation are not necessarily protocol-equivalent.

@@ -114,8 +114,23 @@ func (e *PacketEvent) Validate() error {
 
 // String returns a human-readable representation of the event.
 func (e *PacketEvent) String() string {
-	return fmt.Sprintf("Packet captured: len=%d bytes, timestamp=%d, interface=%d, pid=%d, uid=%d, direction=%s, cookie=%d, flags=%#x",
+	result := fmt.Sprintf("Packet captured: len=%d bytes, timestamp=%d, interface=%d, pid=%d, uid=%d, direction=%s, cookie=%d, flags=%#x",
 		e.PacketLen, e.Timestamp, e.InterfaceIndex, e.Pid, e.Uid, e.DirectionString(), e.SocketCookie, e.Flags)
+	metadata := parsePacketMetadata(e.PacketData, e.Flags)
+	if metadata.srcIP != "" && metadata.dstIP != "" {
+		result += fmt.Sprintf(", flow=%s:%d->%s:%d",
+			metadata.srcIP, metadata.srcPort, metadata.dstIP, metadata.dstPort)
+	}
+	if metadata.transport != "" {
+		result += ", transport=" + metadata.transport
+	}
+	if metadata.application != "" {
+		result += ", protocol=" + metadata.application
+	}
+	if metadata.serverName != "" {
+		result += ", server_name=" + metadata.serverName
+	}
+	return result
 }
 
 // StringHex returns a hexadecimal representation of the event.
@@ -207,22 +222,32 @@ func (e *PacketEvent) DirectionString() string {
 	return "ingress"
 }
 
-// Connection tuple information - these would need to be parsed from packet data
-// For now, return empty values as TC captures raw packets
 func (e *PacketEvent) GetSrcIP() string {
-	return ""
+	return parsePacketMetadata(e.PacketData, e.Flags).srcIP
 }
 
 func (e *PacketEvent) GetDstIP() string {
-	return ""
+	return parsePacketMetadata(e.PacketData, e.Flags).dstIP
 }
 
 func (e *PacketEvent) GetSrcPort() uint16 {
-	return 0
+	return parsePacketMetadata(e.PacketData, e.Flags).srcPort
 }
 
 func (e *PacketEvent) GetDstPort() uint16 {
-	return 0
+	return parsePacketMetadata(e.PacketData, e.Flags).dstPort
+}
+
+func (e *PacketEvent) GetTransportProtocol() string {
+	return parsePacketMetadata(e.PacketData, e.Flags).transport
+}
+
+func (e *PacketEvent) GetApplicationProtocol() string {
+	return parsePacketMetadata(e.PacketData, e.Flags).application
+}
+
+func (e *PacketEvent) GetServerName() string {
+	return parsePacketMetadata(e.PacketData, e.Flags).serverName
 }
 
 // Decode implements domain.EventDecoder interface for packet events.
