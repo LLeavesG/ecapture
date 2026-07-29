@@ -73,6 +73,7 @@ const (
 // ListenPort1 or ListenPort2 are the default ports for the http server.
 const (
 	configUpdateAddr = ""
+	skipEnvDetection = "ecapture.cc/skip-env-detection"
 )
 
 // CLIConfig extends BaseConfig with CLI-specific fields
@@ -128,6 +129,9 @@ docker run --rm --privileged=true --net=host -v ${HOST_PATH}:${CONTAINER_PATH} g
 	// Run: func(cmd *cobra.Command, args []string) { },
 
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if cmd.Annotations[skipEnvDetection] == "true" {
+			return nil
+		}
 		if err := detectEnv(); err != nil {
 			return err
 		}
@@ -167,6 +171,7 @@ func init() {
 	rootCmd.PersistentFlags().Uint64VarP(&globalConf.Uid, "uid", "u", defaultUid, "if uid is 0 then we target all users")
 	rootCmd.PersistentFlags().StringVarP(&globalConf.LoggerAddr, "logaddr", "l", "", "send logs to this server. -l /tmp/ecapture.log or -l ws://127.0.0.1:8090/ecapture or -l tcp://127.0.0.1:8080")
 	rootCmd.PersistentFlags().StringVar(&globalConf.EventCollectorAddr, "eventaddr", "", "the server address that receives the captured event. --eventaddr ws://127.0.0.1:8090/ecapture or tcp://127.0.0.1:8090, default: same as logaddr")
+	rootCmd.PersistentFlags().StringVar(&globalConf.EventFormat, "event-format", config.EventFormatPlain, "captured event encoding: plain, json, or json-pretty")
 	rootCmd.PersistentFlags().StringVar(&globalConf.EcaptureQ, "ecaptureq", "", "listening server, waiting for clients to connect before sending events and logs; false: send directly to the remote server.")
 	rootCmd.PersistentFlags().StringVar(&globalConf.Listen, "listen", configUpdateAddr, "Listens on a port, receives HTTP requests, and is used to update the runtime configuration. default: disabled. e.g. --listen 127.0.0.1:28256")
 	rootCmd.PersistentFlags().Uint64VarP(&globalConf.TruncateSize, "tsize", "t", defaultTruncateSize, "the truncate size in text mode, default: 0 (B), no truncate")
@@ -248,6 +253,15 @@ func initLogger(addr string, isDebug bool, isRorate bool) (zerolog.Logger, error
 func runProbe(probeType factory.ProbeType, probeConfig domain.Configuration) error {
 	var logger zerolog.Logger
 	var err error
+
+	// Root output flags are shared by every probe. Keep them separate from
+	// probe-specific profile settings so --eventaddr and structured discovery
+	// output work consistently across commands.
+	probeConfig.SetLoggerAddr(globalConf.LoggerAddr)
+	probeConfig.SetEventCollectorAddr(globalConf.EventCollectorAddr)
+	if setter, ok := probeConfig.(interface{ SetEventFormat(string) }); ok {
+		setter.SetEventFormat(globalConf.EventFormat)
+	}
 
 	if globalConf.EcaptureQ != "" {
 		parsedURL, err := url.Parse(globalConf.EcaptureQ)

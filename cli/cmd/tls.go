@@ -59,7 +59,7 @@ func init() {
 	opensslCmd.PersistentFlags().StringVarP(&opensslConfig.PcapFile, "pcapfile", "w", "save.pcapng", "write the raw packets to file as pcapng format.")
 	opensslCmd.PersistentFlags().StringVarP(&opensslConfig.Ifname, "ifname", "i", "", "(TC Classifier) Interface name on which the probe will be attached.")
 	opensslCmd.PersistentFlags().StringSliceVar(&opensslConfig.Ifnames, "interfaces", nil, "comma-separated interfaces for raw packet capture.")
-	opensslCmd.PersistentFlags().StringSliceVar(&opensslConfig.CaptureStrategies, "strategy", nil, "capture strategies: raw_packets,tls_plaintext,tls_keys,quic_metadata,application_data.")
+	opensslCmd.PersistentFlags().StringSliceVar(&opensslConfig.CaptureStrategies, "strategy", nil, "capture strategies: raw_packets,tls_plaintext,tls_keys,quic_metadata,application_data,jni_discovery.")
 	opensslCmd.PersistentFlags().BoolVar(&opensslConfig.StrictAttribution, "strict-attribution", false, "drop raw packets that cannot be attributed to the selected PID/UID.")
 	opensslCmd.PersistentFlags().StringVar(&opensslConfig.UnknownFlowPolicy, "unknown-flows", "include", "unknown-flow policy: include, mark, or drop.")
 	opensslCmd.PersistentFlags().StringArrayVar(&opensslConfig.StructOffsetSpecs, "struct-offset", nil, "override a TLS structure offset, e.g. ssl_st_rbio=0x18 (repeatable).")

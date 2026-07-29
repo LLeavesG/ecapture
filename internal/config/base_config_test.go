@@ -64,6 +64,14 @@ func TestBaseConfigValidate(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "invalid event format",
+			config: &BaseConfig{
+				PerCpuMapSize: DefaultMapSizePerCpu,
+				EventFormat:   "yaml",
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -113,6 +121,11 @@ func TestBaseConfigGettersSetters(t *testing.T) {
 	cfg.SetTruncateSize(1024)
 	if cfg.GetTruncateSize() != 1024 {
 		t.Errorf("expected TruncateSize=1024, got %d", cfg.GetTruncateSize())
+	}
+
+	cfg.SetEventFormat(EventFormatJSON)
+	if cfg.GetEventFormat() != EventFormatJSON {
+		t.Errorf("expected EventFormat=%s, got %s", EventFormatJSON, cfg.GetEventFormat())
 	}
 }
 

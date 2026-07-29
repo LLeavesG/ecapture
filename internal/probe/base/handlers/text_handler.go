@@ -17,14 +17,15 @@ package handlers
 import (
 	"github.com/gojue/ecapture/internal/domain"
 	"github.com/gojue/ecapture/internal/errors"
+	"github.com/gojue/ecapture/internal/output/encoders"
 	"github.com/gojue/ecapture/internal/output/writers"
 )
 
 // TextHandler handles events by writing their encoded output to a destination.
 // It delegates formatting to the event itself via String() or StringHex() methods.
 type TextHandler struct {
-	writer writers.OutputWriter
-	useHex bool
+	writer  writers.OutputWriter
+	encoder encoders.Encoder
 }
 
 func (h *TextHandler) Writer() writers.OutputWriter {
@@ -38,9 +39,25 @@ func NewTextHandler(writer writers.OutputWriter, useHex bool) *TextHandler {
 		writer = writers.NewStdoutWriter()
 	}
 	return &TextHandler{
-		writer: writer,
-		useHex: useHex,
+		writer:  writer,
+		encoder: encoders.NewPlainEncoder(useHex),
 	}
+}
+
+// NewEncodedTextHandler creates an event handler with an explicit encoder.
+// The historical name is retained because this handler still owns the
+// line-oriented event output channel, even when the selected encoding is JSON.
+func NewEncodedTextHandler(
+	writer writers.OutputWriter,
+	encoder encoders.Encoder,
+) *TextHandler {
+	if writer == nil {
+		writer = writers.NewStdoutWriter()
+	}
+	if encoder == nil {
+		encoder = encoders.NewPlainEncoder(false)
+	}
+	return &TextHandler{writer: writer, encoder: encoder}
 }
 
 // Handle processes an event and writes its formatted output.
@@ -50,36 +67,23 @@ func (h *TextHandler) Handle(event domain.Event) error {
 		return errors.New(errors.ErrCodeEventValidation, "event cannot be nil")
 	}
 
-	// Let the event format itself based on hex mode
-	var output string
-	if h.useHex {
-		// Try StringHex() method first for hex mode
-		type hexStringer interface {
-			StringHex() string
-		}
-		if hs, ok := event.(hexStringer); ok {
-			output = hs.StringHex()
-		} else {
-			// Fallback to regular String() if StringHex() not available
-			output = event.String()
-		}
-	} else {
-		// Regular text mode
-		output = event.String()
+	output, err := h.encoder.Encode(event)
+	if err != nil {
+		return errors.Wrap(errors.ErrCodeEventDispatch, "failed to encode event output", err)
 	}
 
 	// Skip empty output (event not ready or filtered out)
-	if output == "" {
+	if len(output) == 0 {
 		return nil
 	}
 
 	// Ensure output ends with newline for readability
 	if output[len(output)-1] != '\n' {
-		output += "\n"
+		output = append(output, '\n')
 	}
 
 	// Write to output destination
-	_, err := h.writer.Write([]byte(output))
+	_, err = h.writer.Write(output)
 	if err != nil {
 		return errors.Wrap(errors.ErrCodeEventDispatch, "failed to write event output", err)
 	}

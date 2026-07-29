@@ -17,6 +17,8 @@ package openssl
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	manager "github.com/gojue/ebpfmanager"
@@ -44,6 +46,8 @@ func TestApplicationDataHookValidationAndBPFConfig(t *testing.T) {
 			LengthSize:     4,
 			LengthIndirect: true,
 			MaxBytes:       32768,
+			ContextArg:     1,
+			StreamArg:      4,
 		}},
 	}
 	if err := profile.Validate(); err != nil {
@@ -58,8 +62,8 @@ func TestApplicationDataHookValidationAndBPFConfig(t *testing.T) {
 	}
 
 	got := hook.bpfConfig()
-	if size := binary.Size(got); size != 48 {
-		t.Fatalf("applicationDataBPFConfig size = %d, want 48", size)
+	if size := binary.Size(got); size != 64 {
+		t.Fatalf("applicationDataBPFConfig size = %d, want 64", size)
 	}
 	wantFlags := uint32(appDataFlagBufferIndirect |
 		appDataFlagLengthMemory |
@@ -68,8 +72,46 @@ func TestApplicationDataHookValidationAndBPFConfig(t *testing.T) {
 	if got.Flags != wantFlags {
 		t.Fatalf("BPF flags = %#x, want %#x", got.Flags, wantFlags)
 	}
-	if got.Direction != DataTypeWrite || got.BufferArg != 2 || got.LengthSize != 4 {
+	if got.Direction != DataTypeWrite || got.BufferArg != 2 || got.LengthSize != 4 ||
+		got.ContextArg != 1 || got.StreamArg != 4 {
 		t.Fatalf("unexpected BPF config: %#v", got)
+	}
+}
+
+func TestApplicationDataHookIOVecBPFConfig(t *testing.T) {
+	profile := &ApplicationProfile{
+		Version: ApplicationProfileVersion,
+		Name:    "writev-capture",
+		Match:   ApplicationMatch{UID: 10001},
+		Capture: ApplicationCapture{Strategies: []string{StrategyAppData}},
+		DataHooks: []ApplicationDataHook{{
+			Name:           "socket-writev",
+			Library:        "/apex/com.android.runtime/lib64/bionic/libc.so",
+			Symbol:         "writev",
+			Direction:      AppDataDirectionWrite,
+			CaptureOn:      AppDataCaptureEntry,
+			BufferArg:      2,
+			BufferFormat:   AppDataBufferIOVec,
+			VectorCountArg: 3,
+			ContextArg:     1,
+			MaxBytes:       MaxApplicationData,
+		}},
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	hook := profile.DataHooks[0]
+	if hook.LengthSource != "" || hook.VectorCountArg != 3 {
+		t.Fatalf("iovec hook was normalized incorrectly: %#v", hook)
+	}
+	got := hook.bpfConfig()
+	if size := binary.Size(got); size != 64 {
+		t.Fatalf("applicationDataBPFConfig size = %d, want 64", size)
+	}
+	if got.Flags != appDataFlagBufferIOVec || got.BufferArg != 2 ||
+		got.VectorCountArg != 3 || got.ContextArg != 1 {
+		t.Fatalf("unexpected iovec BPF config: %#v", got)
 	}
 }
 
@@ -224,6 +266,8 @@ func TestApplicationDataHookValidationErrors(t *testing.T) {
 		{"missing library", func(h *ApplicationDataHook) { h.Library = "" }},
 		{"two targets", func(h *ApplicationDataHook) { h.Offset = 0x10 }},
 		{"bad buffer arg", func(h *ApplicationDataHook) { h.BufferArg = 6 }},
+		{"bad context arg", func(h *ApplicationDataHook) { h.ContextArg = 6 }},
+		{"bad stream arg", func(h *ApplicationDataHook) { h.StreamArg = 6 }},
 		{"return length at entry", func(h *ApplicationDataHook) {
 			h.LengthSource = AppDataLengthReturn
 		}},
@@ -251,6 +295,25 @@ func TestApplicationDataHookValidationErrors(t *testing.T) {
 		{"libcxx string with explicit length", func(h *ApplicationDataHook) {
 			h.BufferFormat = AppDataBufferLibCXX
 			h.LengthSource = AppDataLengthArgument
+		}},
+		{"iovec missing vector count", func(h *ApplicationDataHook) {
+			h.BufferFormat = AppDataBufferIOVec
+			h.LengthSource = ""
+			h.LengthArg = 0
+		}},
+		{"iovec with explicit length", func(h *ApplicationDataHook) {
+			h.BufferFormat = AppDataBufferIOVec
+			h.VectorCountArg = 3
+		}},
+		{"iovec with indirect buffer", func(h *ApplicationDataHook) {
+			h.BufferFormat = AppDataBufferIOVec
+			h.VectorCountArg = 3
+			h.LengthSource = ""
+			h.LengthArg = 0
+			h.BufferIndirect = true
+		}},
+		{"raw buffer with vector count", func(h *ApplicationDataHook) {
+			h.VectorCountArg = 3
 		}},
 		{"state group without action", func(h *ApplicationDataHook) {
 			h.StateGroup = "upload"
@@ -326,6 +389,8 @@ func TestApplicationDataEventDecode(t *testing.T) {
 	values := []any{
 		uint64(123456),
 		uint64(0xabcdef),
+		uint64(0x1234),
+		uint64(7),
 		uint32(42),
 		uint32(43),
 		uint32(1),
@@ -361,5 +426,34 @@ func TestApplicationDataEventDecode(t *testing.T) {
 	}
 	if event.PerfMonoNs() != 123456 || event.IsTruncated() {
 		t.Fatalf("unexpected event metadata: %#v", event)
+	}
+	if event.ContextID != 0x1234 || event.StreamID != 7 ||
+		!strings.Contains(event.String(), "Context:0x1234 Stream:7") {
+		t.Fatalf("correlation metadata was not preserved: %#v", event)
+	}
+}
+
+func TestApplicationDataEventMarshalJSONIsCompact(t *testing.T) {
+	event := &ApplicationDataEvent{
+		Timestamp:   1,
+		ContextID:   0x1234,
+		StreamID:    7,
+		Pid:         42,
+		HookID:      1,
+		Direction:   DataTypeWrite,
+		OriginalLen: 7,
+		CapturedLen: 7,
+		DataLen:     7,
+		HookName:    "quic-send",
+	}
+	copy(event.Data[:], "payload")
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if len(data) > 1000 || !bytes.Contains(data, []byte(`"eventType":"application_data"`)) ||
+		!bytes.Contains(data, []byte(`"data":"cGF5bG9hZA=="`)) ||
+		!bytes.Contains(data, []byte(`"streamId":7`)) {
+		t.Fatalf("unexpected structured event: %s", data)
 	}
 }

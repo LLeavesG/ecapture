@@ -27,6 +27,7 @@ const gnuBuildIDNoteType = 3
 func normalizeBuildID(value string) (string, error) {
 	value = strings.ToLower(strings.TrimSpace(value))
 	value = strings.TrimPrefix(value, "0x")
+	value = strings.ReplaceAll(value, ":", "")
 	if value == "" {
 		return "", nil
 	}

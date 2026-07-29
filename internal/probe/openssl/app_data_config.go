@@ -24,21 +24,26 @@ const (
 	appDataFlagBufferLibCXX
 	appDataFlagStateSave
 	appDataFlagStateLoad
+	appDataFlagBufferIOVec
 )
 
 // applicationDataBPFConfig must stay byte-for-byte compatible with
 // struct app_hook_config_t in kern/app_data.h.
 type applicationDataBPFConfig struct {
-	BufferArg    uint32
-	LengthArg    uint32
-	Direction    uint32
-	Flags        uint32
-	BufferOffset uint64
-	LengthOffset uint64
-	LengthSize   uint32
-	MaxBytes     uint32
-	StateID      uint32
-	StateKeyArg  uint32
+	BufferArg      uint32
+	LengthArg      uint32
+	Direction      uint32
+	Flags          uint32
+	BufferOffset   uint64
+	LengthOffset   uint64
+	LengthSize     uint32
+	MaxBytes       uint32
+	StateID        uint32
+	StateKeyArg    uint32
+	ContextArg     uint32
+	StreamArg      uint32
+	VectorCountArg uint32
+	Reserved       uint32
 }
 
 func (h ApplicationDataHook) bpfConfig() applicationDataBPFConfig {
@@ -48,6 +53,9 @@ func (h ApplicationDataHook) bpfConfig() applicationDataBPFConfig {
 	}
 	if h.BufferFormat == AppDataBufferLibCXX {
 		flags |= appDataFlagBufferLibCXX
+	}
+	if h.BufferFormat == AppDataBufferIOVec {
+		flags |= appDataFlagBufferIOVec
 	}
 	switch h.StateAction {
 	case AppDataStateSave:
@@ -75,16 +83,19 @@ func (h ApplicationDataHook) bpfConfig() applicationDataBPFConfig {
 		direction = DataTypeWrite
 	}
 	return applicationDataBPFConfig{
-		BufferArg:    h.BufferArg,
-		LengthArg:    h.bpfLengthArg(),
-		Direction:    direction,
-		Flags:        flags,
-		BufferOffset: uint64(h.BufferOffset),
-		LengthOffset: uint64(h.LengthOffset),
-		LengthSize:   h.LengthSize,
-		MaxBytes:     h.MaxBytes,
-		StateID:      h.stateID,
-		StateKeyArg:  h.StateKeyArg,
+		BufferArg:      h.BufferArg,
+		LengthArg:      h.bpfLengthArg(),
+		Direction:      direction,
+		Flags:          flags,
+		BufferOffset:   uint64(h.BufferOffset),
+		LengthOffset:   uint64(h.LengthOffset),
+		LengthSize:     h.LengthSize,
+		MaxBytes:       h.MaxBytes,
+		StateID:        h.stateID,
+		StateKeyArg:    h.StateKeyArg,
+		ContextArg:     h.ContextArg,
+		StreamArg:      h.StreamArg,
+		VectorCountArg: h.VectorCountArg,
 	}
 }
 

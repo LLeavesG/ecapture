@@ -233,6 +233,8 @@ https://github.com/user-attachments/assets/c8b7a84d-58eb-4fdb-9843-f775c97bdbfb
 - [**性能基准测试**](docs/performance-benchmarks.md) — 性能开销测量方法与预期特征
 - [**发布验证**](docs/release-verification.md) — 如何验证发布产物的完整性
 - [**应用抓包画像**](docs/application-profiles.md) — 按应用配置策略、Hook、网卡和运行时 TLS 偏移
+- [**全流量抓包架构**](docs/capture-architecture.md) — 报文、明文边界与协议重建三层方案
+- [**画像定位手册**](docs/profile-location-guide.md) — 自动盘点与 Agent 辅助偏移验证流程
 
 # 贡献
 

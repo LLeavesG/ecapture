@@ -17,6 +17,7 @@ package openssl
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -128,6 +129,60 @@ type Event struct {
 	Flags       uint32            `json:"flags"`
 	Tuple       string            `json:"tuple,omitempty"`
 	Sock        uint64            `json:"sock,omitempty"`
+}
+
+// MarshalJSON keeps JSONL event output suitable for stream reconstruction by
+// emitting the valid chunk as base64 instead of a fixed-size byte array.
+func (e Event) MarshalJSON() ([]byte, error) {
+	direction := "WRITE"
+	if e.DataType == DataTypeRead {
+		direction = "READ"
+	}
+	return json.Marshal(struct {
+		EventType    string `json:"eventType"`
+		DataType     int64  `json:"dataType"`
+		Direction    string `json:"direction"`
+		Timestamp    uint64 `json:"timestamp"`
+		Pid          uint32 `json:"pid"`
+		Tid          uint32 `json:"tid"`
+		Comm         string `json:"comm"`
+		Fd           uint32 `json:"fd"`
+		Version      int32  `json:"version"`
+		BioType      uint32 `json:"bioType"`
+		SSLAddr      uint64 `json:"sslAddr"`
+		BIOAddr      uint64 `json:"bioAddr"`
+		OriginalLen  uint32 `json:"originalLen"`
+		CapturedLen  uint32 `json:"capturedLen"`
+		ChunkOffset  uint32 `json:"chunkOffset"`
+		Flags        uint32 `json:"flags"`
+		Tuple        string `json:"tuple,omitempty"`
+		Sock         uint64 `json:"sock,omitempty"`
+		DataLen      int32  `json:"dataLen"`
+		DataEncoding string `json:"dataEncoding"`
+		Data         []byte `json:"data"`
+	}{
+		EventType:    "tls_plaintext",
+		DataType:     e.DataType,
+		Direction:    direction,
+		Timestamp:    e.Timestamp,
+		Pid:          e.Pid,
+		Tid:          e.Tid,
+		Comm:         e.GetComm(),
+		Fd:           e.Fd,
+		Version:      e.Version,
+		BioType:      e.BioType,
+		SSLAddr:      e.SSLAddr,
+		BIOAddr:      e.BIOAddr,
+		OriginalLen:  e.OriginalLen,
+		CapturedLen:  e.CapturedLen,
+		ChunkOffset:  e.ChunkOffset,
+		Flags:        e.Flags,
+		Tuple:        e.Tuple,
+		Sock:         e.Sock,
+		DataLen:      e.DataLen,
+		DataEncoding: "base64",
+		Data:         e.GetData(),
+	})
 }
 
 // DecodeFromBytes deserializes the event from raw eBPF data.

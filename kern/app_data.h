@@ -26,7 +26,10 @@
 #define APP_DATA_FLAG_BUFFER_LIBCXX_STRING 0x40
 #define APP_DATA_FLAG_STATE_SAVE 0x80
 #define APP_DATA_FLAG_STATE_LOAD 0x100
+#define APP_DATA_FLAG_BUFFER_IOVEC 0x200
 #define APP_DATA_EVENT_TRUNCATED 0x01
+#define APP_DATA_MAX_IOVECS 16
+#define APP_DATA_MAX_IOVEC_SEGMENTS 8
 
 struct app_hook_config_t {
     u32 buffer_arg;
@@ -39,11 +42,17 @@ struct app_hook_config_t {
     u32 max_bytes;
     u32 state_id;
     u32 state_key_arg;
+    u32 context_arg;
+    u32 stream_arg;
+    u32 vector_count_arg;
+    u32 reserved;
 };
 
 struct active_app_hook_t {
     u64 buffer;
     u64 length;
+    u64 context_id;
+    u64 stream_id;
 };
 
 struct app_hook_key_t {
@@ -64,9 +73,37 @@ struct app_hook_state_t {
     u64 maximum_length;
 };
 
+struct app_iovec_t {
+    u64 base;
+    u64 length;
+};
+
+/*
+ * readv/writev expose one logical byte stream through discontiguous buffers.
+ * This scratch state lets all emitted events use global offsets and identical
+ * call metadata, so userspace can reconstruct the flattened stream exactly.
+ */
+struct app_iovec_state_t {
+    u64 iovec_address;
+    u64 measured_len;
+    u64 return_len;
+    u64 emit_consumed;
+    u64 timestamp_ns;
+    u32 vector_count;
+    u32 maximum;
+    u32 captured_len;
+    u32 emitted_len;
+    u32 segment_count;
+    u32 flags;
+    u32 uses_return_len;
+    u32 measurement_failed;
+};
+
 struct app_data_event_t {
     u64 timestamp_ns;
     u64 buffer_addr;
+    u64 context_id;
+    u64 stream_id;
     u32 pid;
     u32 tid;
     u32 hook_id;
@@ -112,6 +149,13 @@ struct {
     __type(value, struct app_data_event_t);
     __uint(max_entries, 1);
 } app_data_buffer_heap SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, u32);
+    __type(value, struct app_iovec_state_t);
+    __uint(max_entries, 1);
+} app_iovec_state_heap SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
@@ -262,7 +306,8 @@ static __always_inline int app_hook_resolve(struct pt_regs *ctx, struct app_hook
 
 static __always_inline int app_hook_emit(struct pt_regs *ctx, u32 slot,
                                          struct app_hook_config_t *config,
-                                         u64 buffer, u64 length) {
+                                         u64 buffer, u64 length,
+                                         u64 context_id, u64 stream_id) {
     if (buffer == 0 || length == 0)
         return 0;
     u32 zero = 0;
@@ -273,6 +318,8 @@ static __always_inline int app_hook_emit(struct pt_regs *ctx, u32 slot,
     u64 pid_tgid = bpf_get_current_pid_tgid();
     event->timestamp_ns = bpf_ktime_get_ns();
     event->buffer_addr = buffer;
+    event->context_id = context_id;
+    event->stream_id = stream_id;
     event->pid = pid_tgid >> 32;
     event->tid = pid_tgid;
     event->hook_id = slot;
@@ -303,6 +350,206 @@ static __always_inline int app_hook_emit(struct pt_regs *ctx, u32 slot,
     return 0;
 }
 
+static __noinline void app_hook_measure_iovec(struct app_iovec_state_t *state,
+                                              u32 index) {
+    if (state == NULL || state->measurement_failed != 0 ||
+        index >= state->vector_count || index >= APP_DATA_MAX_IOVECS)
+        return;
+
+    struct app_iovec_t vector = {};
+    u64 address = state->iovec_address + (u64)index * sizeof(vector);
+    if (bpf_probe_read_user(&vector, sizeof(vector), (void *)address) != 0) {
+        state->measurement_failed = 1;
+        state->flags |= APP_DATA_EVENT_TRUNCATED;
+        return;
+    }
+
+    u64 available = vector.length;
+    if (state->uses_return_len != 0) {
+        if (state->measured_len >= state->return_len)
+            return;
+        u64 remaining = state->return_len - state->measured_len;
+        if (available > remaining)
+            available = remaining;
+    }
+    if (~0ULL - state->measured_len < available)
+        state->measured_len = ~0ULL;
+    else
+        state->measured_len += available;
+}
+
+#define APP_IOVEC_MEASURE(state, index) app_hook_measure_iovec(state, index)
+
+#define APP_IOVEC_EMIT_CHUNK(ctx, event, state, vector, vector_offset)                    \
+    do {                                                                                 \
+        if ((state)->segment_count < APP_DATA_MAX_IOVEC_SEGMENTS &&                      \
+            (state)->emitted_len < (state)->captured_len &&                              \
+            (vector_offset) < (vector).length) {                                         \
+            u64 _vector_remaining = (vector).length - (vector_offset);                   \
+            u32 _capture_remaining = (state)->captured_len - (state)->emitted_len;        \
+            u32 _chunk = _capture_remaining;                                              \
+            if ((u64)_chunk > _vector_remaining)                                          \
+                _chunk = (u32)_vector_remaining;                                          \
+            if (_chunk > MAX_DATA_SIZE_OPENSSL)                                           \
+                _chunk = MAX_DATA_SIZE_OPENSSL;                                           \
+            if (_chunk > 0) {                                                             \
+                (event)->data_len = _chunk;                                                \
+                (event)->chunk_offset = (state)->emitted_len;                              \
+                if (bpf_probe_read_user(&(event)->data, _chunk,                            \
+                                        (void *)((vector).base + (vector_offset))) == 0)   \
+                    bpf_perf_event_output(ctx, &app_data_events, BPF_F_CURRENT_CPU, event, \
+                                          sizeof(struct app_data_event_t));                \
+                (vector_offset) += _chunk;                                                 \
+                (state)->emitted_len += _chunk;                                            \
+                (state)->segment_count++;                                                  \
+            }                                                                             \
+        }                                                                                 \
+    } while (0)
+
+static __noinline void app_hook_emit_iovec_vector(struct pt_regs *ctx,
+                                                  struct app_data_event_t *event,
+                                                  struct app_iovec_state_t *state,
+                                                  u32 index) {
+    if (state == NULL || event == NULL || index >= state->vector_count ||
+        index >= APP_DATA_MAX_IOVECS || state->emitted_len >= state->captured_len)
+        return;
+
+    struct app_iovec_t vector = {};
+    u64 address = state->iovec_address + (u64)index * sizeof(vector);
+    if (bpf_probe_read_user(&vector, sizeof(vector), (void *)address) != 0)
+        return;
+
+    if (state->uses_return_len != 0) {
+        if (state->emit_consumed >= state->return_len)
+            return;
+        u64 remaining = state->return_len - state->emit_consumed;
+        if (vector.length > remaining)
+            vector.length = remaining;
+    }
+    if (~0ULL - state->emit_consumed < vector.length)
+        state->emit_consumed = ~0ULL;
+    else
+        state->emit_consumed += vector.length;
+    if (vector.base == 0 || vector.length == 0)
+        return;
+
+    u64 vector_offset = 0;
+    APP_IOVEC_EMIT_CHUNK(ctx, event, state, vector, vector_offset);
+    APP_IOVEC_EMIT_CHUNK(ctx, event, state, vector, vector_offset);
+    APP_IOVEC_EMIT_CHUNK(ctx, event, state, vector, vector_offset);
+    APP_IOVEC_EMIT_CHUNK(ctx, event, state, vector, vector_offset);
+    APP_IOVEC_EMIT_CHUNK(ctx, event, state, vector, vector_offset);
+    APP_IOVEC_EMIT_CHUNK(ctx, event, state, vector, vector_offset);
+    APP_IOVEC_EMIT_CHUNK(ctx, event, state, vector, vector_offset);
+    APP_IOVEC_EMIT_CHUNK(ctx, event, state, vector, vector_offset);
+}
+
+#define APP_IOVEC_EMIT_VECTOR(ctx, event, state, index) \
+    app_hook_emit_iovec_vector(ctx, event, state, index)
+
+static __always_inline int app_hook_emit_iovec(struct pt_regs *ctx, u32 slot,
+                                               struct app_hook_config_t *config,
+                                               u64 iovec_address, u64 vector_count,
+                                               u64 return_len, bool uses_return_len,
+                                               u64 context_id, u64 stream_id) {
+    if (iovec_address == 0 || vector_count == 0 ||
+        (uses_return_len && return_len == 0))
+        return 0;
+
+    u32 zero = 0;
+    struct app_iovec_state_t *state = bpf_map_lookup_elem(&app_iovec_state_heap, &zero);
+    struct app_data_event_t *event = bpf_map_lookup_elem(&app_data_buffer_heap, &zero);
+    if (state == NULL || event == NULL)
+        return 0;
+
+    __builtin_memset(state, 0, sizeof(*state));
+    state->iovec_address = iovec_address;
+    state->return_len = return_len;
+    state->vector_count =
+        vector_count > 0xffffffffULL ? 0xffffffffU : (u32)vector_count;
+    state->uses_return_len = uses_return_len ? 1 : 0;
+    state->maximum = MAX_DATA_SIZE_OPENSSL * APP_DATA_MAX_IOVEC_SEGMENTS;
+    if (config->max_bytes != 0 && config->max_bytes < state->maximum)
+        state->maximum = config->max_bytes;
+
+    APP_IOVEC_MEASURE(state, 0);
+    APP_IOVEC_MEASURE(state, 1);
+    APP_IOVEC_MEASURE(state, 2);
+    APP_IOVEC_MEASURE(state, 3);
+    APP_IOVEC_MEASURE(state, 4);
+    APP_IOVEC_MEASURE(state, 5);
+    APP_IOVEC_MEASURE(state, 6);
+    APP_IOVEC_MEASURE(state, 7);
+    APP_IOVEC_MEASURE(state, 8);
+    APP_IOVEC_MEASURE(state, 9);
+    APP_IOVEC_MEASURE(state, 10);
+    APP_IOVEC_MEASURE(state, 11);
+    APP_IOVEC_MEASURE(state, 12);
+    APP_IOVEC_MEASURE(state, 13);
+    APP_IOVEC_MEASURE(state, 14);
+    APP_IOVEC_MEASURE(state, 15);
+
+    u64 original = state->measured_len;
+    if (uses_return_len) {
+        original = return_len;
+        if (state->measured_len < return_len)
+            state->flags |= APP_DATA_EVENT_TRUNCATED;
+    } else if (vector_count > APP_DATA_MAX_IOVECS) {
+        original = 0xffffffffULL;
+        state->flags |= APP_DATA_EVENT_TRUNCATED;
+    }
+    if (original > 0xffffffffULL) {
+        original = 0xffffffffULL;
+        state->flags |= APP_DATA_EVENT_TRUNCATED;
+    }
+
+    u64 captured = state->measured_len;
+    if (uses_return_len && captured > return_len)
+        captured = return_len;
+    if (captured > state->maximum)
+        captured = state->maximum;
+    if (captured > original)
+        captured = original;
+    state->captured_len = (u32)captured;
+    if (original > captured)
+        state->flags |= APP_DATA_EVENT_TRUNCATED;
+    if (state->captured_len == 0)
+        return 0;
+
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    state->timestamp_ns = bpf_ktime_get_ns();
+    event->timestamp_ns = state->timestamp_ns;
+    event->buffer_addr = iovec_address;
+    event->context_id = context_id;
+    event->stream_id = stream_id;
+    event->pid = pid_tgid >> 32;
+    event->tid = pid_tgid;
+    event->hook_id = slot;
+    event->direction = config->direction;
+    event->flags = state->flags;
+    event->original_len = (u32)original;
+    event->captured_len = state->captured_len;
+    bpf_get_current_comm(&event->comm, sizeof(event->comm));
+
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 0);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 1);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 2);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 3);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 4);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 5);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 6);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 7);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 8);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 9);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 10);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 11);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 12);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 13);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 14);
+    APP_IOVEC_EMIT_VECTOR(ctx, event, state, 15);
+    return 0;
+}
+
 static __always_inline int app_hook_entry(struct pt_regs *ctx, u32 slot) {
     if (!passes_filter(ctx))
         return 0;
@@ -311,6 +558,30 @@ static __always_inline int app_hook_entry(struct pt_regs *ctx, u32 slot) {
         return 0;
     u64 buffer = 0;
     u64 length = 0;
+    u64 context_id = app_hook_argument(ctx, config->context_arg);
+    u64 stream_id = app_hook_argument(ctx, config->stream_arg);
+    if ((config->flags & APP_DATA_FLAG_BUFFER_IOVEC) != 0) {
+        u64 iovec_address = app_hook_argument(ctx, config->buffer_arg);
+        u64 vector_count = app_hook_argument(ctx, config->vector_count_arg);
+        if ((config->flags & APP_DATA_FLAG_CAPTURE_RETURN) == 0)
+            return app_hook_emit_iovec(ctx, slot, config, iovec_address,
+                                      vector_count, 0, false,
+                                      context_id, stream_id);
+        if (iovec_address == 0 || vector_count == 0)
+            return 0;
+        struct app_hook_key_t key = {
+            .pid_tgid = bpf_get_current_pid_tgid(),
+            .slot = slot,
+        };
+        struct active_app_hook_t active = {
+            .buffer = iovec_address,
+            .length = vector_count,
+            .context_id = context_id,
+            .stream_id = stream_id,
+        };
+        bpf_map_update_elem(&active_app_hooks, &key, &active, BPF_ANY);
+        return 0;
+    }
     if (app_hook_resolve(ctx, config, &buffer, &length) != 0)
         return 0;
     if ((config->flags & (APP_DATA_FLAG_STATE_SAVE | APP_DATA_FLAG_STATE_LOAD)) != 0) {
@@ -339,7 +610,7 @@ static __always_inline int app_hook_entry(struct pt_regs *ctx, u32 slot) {
         bpf_map_delete_elem(&app_hook_states, &state_key);
     }
     if ((config->flags & APP_DATA_FLAG_CAPTURE_RETURN) == 0)
-        return app_hook_emit(ctx, slot, config, buffer, length);
+        return app_hook_emit(ctx, slot, config, buffer, length, context_id, stream_id);
 
     struct app_hook_key_t key = {
         .pid_tgid = bpf_get_current_pid_tgid(),
@@ -348,6 +619,8 @@ static __always_inline int app_hook_entry(struct pt_regs *ctx, u32 slot) {
     struct active_app_hook_t active = {
         .buffer = buffer,
         .length = length,
+        .context_id = context_id,
+        .stream_id = stream_id,
     };
     bpf_map_update_elem(&active_app_hooks, &key, &active, BPF_ANY);
     return 0;
@@ -365,12 +638,22 @@ static __always_inline int app_hook_return(struct pt_regs *ctx, u32 slot) {
         return 0;
     struct app_hook_config_t *config = bpf_map_lookup_elem(&app_hook_configs, &slot);
     if (config != NULL) {
+        if ((config->flags & APP_DATA_FLAG_BUFFER_IOVEC) != 0) {
+            s64 result = (s64)PT_REGS_RC(ctx);
+            if (result > 0)
+                app_hook_emit_iovec(ctx, slot, config, active->buffer,
+                                    active->length, (u64)result, true,
+                                    active->context_id, active->stream_id);
+            bpf_map_delete_elem(&active_app_hooks, &key);
+            return 0;
+        }
         u64 length = active->length;
         if ((config->flags & APP_DATA_FLAG_LENGTH_RETURN) != 0) {
             s64 result = (s64)PT_REGS_RC(ctx);
             length = result > 0 ? (u64)result : 0;
         }
-        app_hook_emit(ctx, slot, config, active->buffer, length);
+        app_hook_emit(ctx, slot, config, active->buffer, length,
+                      active->context_id, active->stream_id);
     }
     bpf_map_delete_elem(&active_app_hooks, &key);
     return 0;

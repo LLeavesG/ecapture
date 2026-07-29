@@ -1,0 +1,89 @@
+// Copyright 2026 CFC4N <cfc4n.cs@gmail.com>. All Rights Reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+/*
+ * Safe integration fixture for application-data iovec hooks.
+ *
+ * Build:
+ *   cc -O0 -g -rdynamic -o /tmp/ecapture-iovec-helper \
+ *      testdata/iovec_capture_helper.c
+ *
+ * The initial delay gives eCapture time to attach to the exported wrapper
+ * functions. Both calls operate only on fixed, non-sensitive marker strings.
+ */
+
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+#define EXPORTED __attribute__((noinline, visibility("default")))
+
+EXPORTED ssize_t ecapture_test_writev(int fd, const struct iovec *iov, int iovcnt) {
+    return writev(fd, iov, iovcnt);
+}
+
+EXPORTED ssize_t ecapture_test_readv(int fd, const struct iovec *iov, int iovcnt) {
+    return readv(fd, iov, iovcnt);
+}
+
+int main(void) {
+    static const char write_part_1[] = "ECAPTURE-";
+    static const char write_part_2[] = "IOVEC-WRITE-";
+    static const char write_part_3[] = "MARKER\n";
+    struct iovec write_vectors[] = {
+        {(void *)write_part_1, sizeof(write_part_1) - 1},
+        {(void *)write_part_2, sizeof(write_part_2) - 1},
+        {(void *)write_part_3, sizeof(write_part_3) - 1},
+    };
+
+    int null_fd = open("/dev/null", O_WRONLY);
+    int pipe_fds[2];
+    if (null_fd < 0 || pipe(pipe_fds) != 0)
+        return 1;
+
+    printf("ready pid=%ld\n", (long)getpid());
+    fflush(stdout);
+    sleep(8);
+
+    if (ecapture_test_writev(
+            null_fd,
+            write_vectors,
+            (int)(sizeof(write_vectors) / sizeof(write_vectors[0]))) < 0)
+        return 2;
+
+    static const char read_marker[] = "ECAPTURE-IOVEC-READ-MARKER\n";
+    if (write(pipe_fds[1], read_marker, sizeof(read_marker) - 1) < 0)
+        return 3;
+    char read_part_1[9] = {};
+    char read_part_2[12] = {};
+    char read_part_3[32] = {};
+    struct iovec read_vectors[] = {
+        {read_part_1, sizeof(read_part_1)},
+        {read_part_2, sizeof(read_part_2)},
+        {read_part_3, sizeof(read_part_3)},
+    };
+    if (ecapture_test_readv(
+            pipe_fds[0],
+            read_vectors,
+            (int)(sizeof(read_vectors) / sizeof(read_vectors[0]))) < 0)
+        return 4;
+
+    close(pipe_fds[0]);
+    close(pipe_fds[1]);
+    close(null_fd);
+    sleep(2);
+    return 0;
+}

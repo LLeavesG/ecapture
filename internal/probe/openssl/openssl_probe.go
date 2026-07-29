@@ -788,6 +788,13 @@ func (p *Probe) setupManager() error {
 		p.bpfManager.Probes = probes
 		p.bpfManager.Maps = maps
 	}
+	if err == nil && p.config.HasJNIDiscoveryStrategy() {
+		probes, maps := p.appendJNIDiscoveryProbes(
+			p.bpfManager.Probes, p.bpfManager.Maps,
+		)
+		p.bpfManager.Probes = probes
+		p.bpfManager.Maps = maps
+	}
 	if handlers.IsModePcapng(p.config.CaptureMode) {
 		if err == nil && p.config.PcapFilter != "" {
 			p.Logger().Info().Str("filter", p.config.PcapFilter).Msg("Applying BPF filter to TC probes")
@@ -840,7 +847,9 @@ func (p *Probe) setupManagerAll() error {
 		mergeCurrent()
 	}
 
-	if len(probes) == 0 && !p.config.HasApplicationDataStrategy() {
+	if len(probes) == 0 &&
+		!p.config.HasApplicationDataStrategy() &&
+		!p.config.HasJNIDiscoveryStrategy() {
 		return errors.NewConfigurationError("all mode has no enabled capture strategies", nil)
 	}
 	p.bpfManager = &manager.Manager{Probes: probes, Maps: maps}
@@ -886,6 +895,7 @@ func (p *Probe) appendApplicationDataProbes(
 		&manager.Map{Name: "active_app_hooks"},
 		&manager.Map{Name: "app_hook_states"},
 		&manager.Map{Name: "app_data_buffer_heap"},
+		&manager.Map{Name: "app_iovec_state_heap"},
 	)
 	p.mapNameToDecoder["app_data_events"] = &applicationDataEventDecoder{
 		hookNames: hookNames,
@@ -900,6 +910,48 @@ func applyApplicationDataHookTarget(probe *manager.Probe, hook ApplicationDataHo
 		return
 	}
 	probe.AttachToFuncName = hook.Symbol
+}
+
+func (p *Probe) appendJNIDiscoveryProbes(
+	probes []*manager.Probe, maps []*manager.Map,
+) ([]*manager.Probe, []*manager.Map) {
+	jni := p.config.JNIDiscovery
+	if jni == nil {
+		return probes, maps
+	}
+	for hookID, offset := range jni.RegisterNativesOffsets {
+		for segment := 0; segment < JNIDiscoverySegments; segment++ {
+			probes = append(probes, &manager.Probe{
+				Section:          fmt.Sprintf("uprobe/jni_register_natives_%d", segment),
+				EbpfFuncName:     fmt.Sprintf("probe_jni_register_natives_%d", segment),
+				AttachToFuncName: offsetHookPlaceholder,
+				BinaryPath:       jni.ResolvedLibrary(),
+				UAddress:         uint64(offset),
+				UID: fmt.Sprintf(
+					"uprobe_jni_register_natives_%d_%d",
+					hookID,
+					segment,
+				),
+			})
+		}
+		if p.Logger() != nil {
+			p.Logger().Info().
+				Int("hook_id", hookID).
+				Str("library", jni.ResolvedLibrary()).
+				Uint64("offset", uint64(offset)).
+				Int("method_limit", JNIDiscoveryMaxMethods).
+				Msg("Configured JNI RegisterNatives discovery hook")
+		}
+	}
+	maps = appendUniqueManagerMaps(maps,
+		&manager.Map{Name: "jni_register_events"},
+		&manager.Map{Name: "jni_register_buffer_heap"},
+	)
+	p.mapNameToDecoder["jni_register_events"] = &jniDiscoveryDecoder{
+		resolver:               newProcessModuleResolver(),
+		registerNativesOffsets: offsetValues(jni.RegisterNativesOffsets),
+	}
+	return probes, maps
 }
 
 func (p *Probe) configureApplicationDataHooks() error {
@@ -1123,6 +1175,67 @@ func (d *applicationDataEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.E
 
 func (d *applicationDataEventDecoder) GetDecoder(_ *ebpf.Map) (domain.Event, bool) {
 	return &ApplicationDataEvent{}, true
+}
+
+// jniDiscoveryDecoder enriches RegisterNatives events with stable
+// module-relative offsets. A cache miss reloads /proc/PID/maps so libraries
+// loaded after process start are still resolved.
+type jniDiscoveryDecoder struct {
+	resolver               *processModuleResolver
+	registerNativesOffsets []uint64
+}
+
+func (d *jniDiscoveryDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, error) {
+	event := &JNIDiscoveryEvent{}
+	if err := event.DecodeFromBytes(data); err != nil {
+		return nil, err
+	}
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	if d.resolver == nil {
+		d.resolver = newProcessModuleResolver()
+	}
+	if path, offset, err := d.resolver.resolve(event.Pid, event.FunctionAddr); err == nil {
+		event.ModulePath = path
+		event.ModuleOffset = offset
+	} else {
+		event.ModuleResolutionError = err.Error()
+	}
+	if path, offset, err := d.resolver.resolve(event.Pid, event.RegisterNativesAddr); err == nil {
+		event.RegisterModulePath = path
+		event.RegisterModuleOffset = offset
+		event.HookID = registerNativesHookID(d.registerNativesOffsets, offset)
+	} else if event.ModuleResolutionError == "" {
+		event.ModuleResolutionError = err.Error()
+	}
+	return event, nil
+}
+
+func offsetValues(values []OffsetValue) []uint64 {
+	offsets := make([]uint64, len(values))
+	for index, value := range values {
+		offsets[index] = uint64(value)
+	}
+	return offsets
+}
+
+func registerNativesHookID(offsets []uint64, observed uint64) uint32 {
+	for index, offset := range offsets {
+		if observed == offset {
+			return uint32(index)
+		}
+		// Some uprobe implementations expose the instruction immediately
+		// following the trap. Accept one ARM64 instruction of skew.
+		if observed == offset+4 || offset == observed+4 {
+			return uint32(index)
+		}
+	}
+	return 0
+}
+
+func (d *jniDiscoveryDecoder) GetDecoder(_ *ebpf.Map) (domain.Event, bool) {
+	return &JNIDiscoveryEvent{}, true
 }
 
 // masterSecretEventDecoder implements domain.EventDecoder for master secret events

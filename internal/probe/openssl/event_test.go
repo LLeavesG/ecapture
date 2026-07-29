@@ -17,12 +17,34 @@ package openssl
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gojue/ecapture/internal/domain"
 )
+
+func TestEventMarshalJSONIsCompact(t *testing.T) {
+	event := &Event{
+		DataType:    DataTypeWrite,
+		Timestamp:   1,
+		Pid:         42,
+		DataLen:     7,
+		OriginalLen: 7,
+		CapturedLen: 7,
+		SSLAddr:     0x1234,
+	}
+	copy(event.Data[:], "payload")
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if len(data) > 1000 || !bytes.Contains(data, []byte(`"eventType":"tls_plaintext"`)) ||
+		!bytes.Contains(data, []byte(`"data":"cGF5bG9hZA=="`)) {
+		t.Fatalf("unexpected structured event: %s", data)
+	}
+}
 
 func makeWebSocketFrame(payload []byte, masked bool) []byte {
 	first := byte(0x82) // FIN + binary frame

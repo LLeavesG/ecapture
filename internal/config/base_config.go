@@ -38,6 +38,12 @@ const (
 	ByteCodeFileNonCore = 2
 )
 
+const (
+	EventFormatPlain      = "plain"
+	EventFormatJSON       = "json"
+	EventFormatJSONPretty = "json-pretty"
+)
+
 // DefaultMapSizePerCpu is the default eBPF map size per CPU (8MB).
 const DefaultMapSizePerCpu = 8 * 1024 * 1024
 
@@ -53,6 +59,7 @@ type BaseConfig struct {
 	TruncateSize       uint64    `json:"truncate_size"`
 	LoggerAddr         string    `json:"logger_addr"`
 	EventCollectorAddr string    `json:"event_collector_addr"`
+	EventFormat        string    `json:"event_format"`
 	EcaptureQ          string    `json:"ecapture_q"`
 	Listen             string    `json:"listen"`
 	AddrType           uint8     `json:"addr_type"`
@@ -78,6 +85,7 @@ func NewBaseConfig() *BaseConfig {
 		TruncateSize:       0,
 		LoggerAddr:         "",
 		EventCollectorAddr: "",
+		EventFormat:        EventFormatPlain,
 		EcaptureQ:          "",
 		Listen:             "localhost:28256",
 		AddrType:           0,
@@ -94,6 +102,12 @@ func (c *BaseConfig) Validate() error {
 	}
 	if c.ByteCodeFileMode > ByteCodeFileNonCore {
 		return fmt.Errorf("invalid byte_code_file_mode: %d", c.ByteCodeFileMode)
+	}
+	switch c.EventFormat {
+	case "", EventFormatPlain, EventFormatJSON, EventFormatJSONPretty:
+	default:
+		return fmt.Errorf("invalid event_format %q: use plain, json, or json-pretty",
+			c.EventFormat)
 	}
 	return nil
 }
@@ -214,6 +228,19 @@ func (c *BaseConfig) GetEventCollectorAddr() string {
 // SetEventCollectorAddr sets the event collector address.
 func (c *BaseConfig) SetEventCollectorAddr(addr string) {
 	c.EventCollectorAddr = addr
+}
+
+// GetEventFormat returns the event serialization format.
+func (c *BaseConfig) GetEventFormat() string {
+	if c.EventFormat == "" {
+		return EventFormatPlain
+	}
+	return c.EventFormat
+}
+
+// SetEventFormat selects plain text or structured JSON event output.
+func (c *BaseConfig) SetEventFormat(format string) {
+	c.EventFormat = format
 }
 
 // GetEcaptureQ returns the eCaptureQ address.

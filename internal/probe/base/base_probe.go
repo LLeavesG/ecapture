@@ -34,6 +34,7 @@ import (
 	"github.com/gojue/ecapture/internal/domain"
 	"github.com/gojue/ecapture/internal/errors"
 	"github.com/gojue/ecapture/internal/logger"
+	"github.com/gojue/ecapture/internal/output/encoders"
 )
 
 const (
@@ -121,12 +122,20 @@ func (p *BaseProbe) Initialize(ctx context.Context, cfg domain.Configuration) er
 		}
 	}
 	p.Logger().Info().Str("writer", textWriter.Name()).Str("LoggerAddr", cfg.GetLoggerAddr()).Msg("Text output writer created")
-	textHandler := handlers.NewTextHandler(textWriter, p.config.GetHex())
+	eventEncoder := encoders.Encoder(encoders.NewPlainEncoder(p.config.GetHex()))
+	if provider, ok := p.config.(interface{ GetEventFormat() string }); ok {
+		switch provider.GetEventFormat() {
+		case "json":
+			eventEncoder = encoders.NewJsonEncoder(false)
+		case "json-pretty":
+			eventEncoder = encoders.NewJsonEncoder(true)
+		}
+	}
+	textHandler := handlers.NewEncodedTextHandler(textWriter, eventEncoder)
 	if err := dispatcher.Register(textHandler); err != nil {
 		_ = textWriter.Close()
 		return fmt.Errorf("failed to register text handler: %w", err)
 	}
-	p.closers = append(p.closers, textHandler)
 
 	// Create dispatcher
 	p.dispatcher = dispatcher

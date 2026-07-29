@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"github.com/gojue/ecapture/internal/domain"
+	"github.com/gojue/ecapture/internal/output/encoders"
 )
 
 // mockWriter wraps bytes.Buffer to implement OutputWriter
@@ -182,6 +183,24 @@ func TestTextHandler_Handle_Read(t *testing.T) {
 	}
 }
 
+func TestEncodedTextHandlerJSON(t *testing.T) {
+	writer := newMockWriter()
+	handler := NewEncodedTextHandler(writer, encoders.NewJsonEncoder(false))
+	event := &jsonMockEvent{
+		Pid:  42,
+		Data: []byte("payload"),
+	}
+	if err := handler.Handle(event); err != nil {
+		t.Fatalf("Handle() error = %v", err)
+	}
+	output := writer.String()
+	if !strings.HasSuffix(output, "\n") ||
+		!strings.Contains(output, `"pid":42`) ||
+		!strings.Contains(output, `"data":"cGF5bG9hZA=="`) {
+		t.Fatalf("unexpected JSON event output: %q", output)
+	}
+}
+
 func TestTextHandler_Handle_NilEvent(t *testing.T) {
 	writer := newMockWriter()
 	handler := NewTextHandler(writer, false)
@@ -202,6 +221,23 @@ func (m *mockNonTLSEvent) StringHex() string                 { return "" }
 func (m *mockNonTLSEvent) Clone() domain.Event               { return &mockNonTLSEvent{} }
 func (m *mockNonTLSEvent) Type() domain.EventType            { return domain.EventTypeOutput }
 func (m *mockNonTLSEvent) UUID() string                      { return "" }
+
+type jsonMockEvent struct {
+	Pid  uint32 `json:"pid"`
+	Data []byte `json:"data"`
+}
+
+func (m *jsonMockEvent) DecodeFromBytes(data []byte) error { return nil }
+func (m *jsonMockEvent) Validate() error                   { return nil }
+func (m *jsonMockEvent) String() string                    { return string(m.Data) }
+func (m *jsonMockEvent) StringHex() string                 { return fmt.Sprintf("%x", m.Data) }
+func (m *jsonMockEvent) Clone() domain.Event {
+	clone := *m
+	clone.Data = append([]byte(nil), m.Data...)
+	return &clone
+}
+func (m *jsonMockEvent) Type() domain.EventType { return domain.EventTypeOutput }
+func (m *jsonMockEvent) UUID() string           { return "json-mock" }
 
 func TestTextHandler_Handle_InvalidEventType(t *testing.T) {
 	writer := newMockWriter()

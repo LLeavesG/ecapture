@@ -17,6 +17,7 @@ package openssl
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -31,6 +32,8 @@ const AppDataEventFlagTruncated = 1
 type ApplicationDataEvent struct {
 	Timestamp   uint64            `json:"timestamp"`
 	BufferAddr  uint64            `json:"bufferAddr"`
+	ContextID   uint64            `json:"contextId"`
+	StreamID    uint64            `json:"streamId"`
 	Pid         uint32            `json:"pid"`
 	Tid         uint32            `json:"tid"`
 	HookID      uint32            `json:"hookId"`
@@ -45,6 +48,51 @@ type ApplicationDataEvent struct {
 	HookName    string            `json:"hookName,omitempty"`
 }
 
+// MarshalJSON emits only the valid payload slice. Encoding a fixed 16 KiB
+// array would turn every byte into a JSON number and make structured capture
+// impractical; []byte is represented compactly as base64 by encoding/json.
+func (e ApplicationDataEvent) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		EventType    string `json:"eventType"`
+		Timestamp    uint64 `json:"timestamp"`
+		BufferAddr   uint64 `json:"bufferAddr"`
+		ContextID    uint64 `json:"contextId,omitempty"`
+		StreamID     uint64 `json:"streamId,omitempty"`
+		Pid          uint32 `json:"pid"`
+		Tid          uint32 `json:"tid"`
+		HookID       uint32 `json:"hookId"`
+		HookName     string `json:"hookName,omitempty"`
+		Direction    string `json:"direction"`
+		Flags        uint32 `json:"flags"`
+		OriginalLen  uint32 `json:"originalLen"`
+		CapturedLen  uint32 `json:"capturedLen"`
+		ChunkOffset  uint32 `json:"chunkOffset"`
+		DataLen      uint32 `json:"dataLen"`
+		Comm         string `json:"comm"`
+		DataEncoding string `json:"dataEncoding"`
+		Data         []byte `json:"data"`
+	}{
+		EventType:    "application_data",
+		Timestamp:    e.Timestamp,
+		BufferAddr:   e.BufferAddr,
+		ContextID:    e.ContextID,
+		StreamID:     e.StreamID,
+		Pid:          e.Pid,
+		Tid:          e.Tid,
+		HookID:       e.HookID,
+		HookName:     e.HookName,
+		Direction:    e.directionName(),
+		Flags:        e.Flags,
+		OriginalLen:  e.OriginalLen,
+		CapturedLen:  e.CapturedLen,
+		ChunkOffset:  e.ChunkOffset,
+		DataLen:      e.DataLen,
+		Comm:         commToString(e.Comm[:]),
+		DataEncoding: "base64",
+		Data:         e.GetData(),
+	})
+}
+
 func (e *ApplicationDataEvent) DecodeFromBytes(data []byte) error {
 	buf := bytes.NewReader(data)
 	fields := []struct {
@@ -53,6 +101,8 @@ func (e *ApplicationDataEvent) DecodeFromBytes(data []byte) error {
 	}{
 		{"Timestamp", &e.Timestamp},
 		{"BufferAddr", &e.BufferAddr},
+		{"ContextID", &e.ContextID},
+		{"StreamID", &e.StreamID},
 		{"Pid", &e.Pid},
 		{"Tid", &e.Tid},
 		{"HookID", &e.HookID},
@@ -78,7 +128,7 @@ func (e *ApplicationDataEvent) PerfMonoNs() uint64 {
 }
 
 func (e *ApplicationDataEvent) String() string {
-	return fmt.Sprintf("[%s] PID:%d TID:%d Comm:%s APP-HOOK:%s[%d] Buffer:0x%x %s (%s):\n%s",
+	return fmt.Sprintf("[%s] PID:%d TID:%d Comm:%s APP-HOOK:%s[%d] Buffer:0x%x%s %s (%s):\n%s",
 		e.eventTime().Format("2006-01-02 15:04:05.000"),
 		e.Pid,
 		e.Tid,
@@ -86,6 +136,7 @@ func (e *ApplicationDataEvent) String() string {
 		e.displayHookName(),
 		e.HookID,
 		e.BufferAddr,
+		e.correlationSummary(),
 		e.directionName(),
 		e.captureSummary(),
 		string(e.GetData()),
@@ -93,7 +144,7 @@ func (e *ApplicationDataEvent) String() string {
 }
 
 func (e *ApplicationDataEvent) StringHex() string {
-	return fmt.Sprintf("[%s] PID:%d TID:%d Comm:%s APP-HOOK:%s[%d] Buffer:0x%x %s (%s, hex):\n%s",
+	return fmt.Sprintf("[%s] PID:%d TID:%d Comm:%s APP-HOOK:%s[%d] Buffer:0x%x%s %s (%s, hex):\n%s",
 		e.eventTime().Format("2006-01-02 15:04:05.000"),
 		e.Pid,
 		e.Tid,
@@ -101,6 +152,7 @@ func (e *ApplicationDataEvent) StringHex() string {
 		e.displayHookName(),
 		e.HookID,
 		e.BufferAddr,
+		e.correlationSummary(),
 		e.directionName(),
 		e.captureSummary(),
 		dumpByteSlice(e.GetData(), ""),
@@ -117,8 +169,8 @@ func (e *ApplicationDataEvent) Type() domain.EventType {
 }
 
 func (e *ApplicationDataEvent) UUID() string {
-	return fmt.Sprintf("%d_app_%d_%x_%d_%d",
-		e.Pid, e.HookID, e.BufferAddr, e.Timestamp, e.ChunkOffset)
+	return fmt.Sprintf("%d_app_%d_%x_%x_%d_%d",
+		e.Pid, e.HookID, e.ContextID, e.StreamID, e.Timestamp, e.ChunkOffset)
 }
 
 func (e *ApplicationDataEvent) Validate() error {
@@ -187,6 +239,19 @@ func (e *ApplicationDataEvent) captureSummary() string {
 	}
 	return fmt.Sprintf("chunk=%d+%d call=%d/%d bytes%s",
 		e.ChunkOffset, e.DataLen, e.CapturedLen, e.OriginalLen, suffix)
+}
+
+func (e *ApplicationDataEvent) correlationSummary() string {
+	switch {
+	case e.ContextID != 0 && e.StreamID != 0:
+		return fmt.Sprintf(" Context:0x%x Stream:%d", e.ContextID, e.StreamID)
+	case e.ContextID != 0:
+		return fmt.Sprintf(" Context:0x%x", e.ContextID)
+	case e.StreamID != 0:
+		return fmt.Sprintf(" Stream:%d", e.StreamID)
+	default:
+		return ""
+	}
 }
 
 func (e *ApplicationDataEvent) eventTime() time.Time {

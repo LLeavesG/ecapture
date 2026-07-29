@@ -107,6 +107,42 @@ func TestApplicationProfileRejectsUnsupportedOffset(t *testing.T) {
 	}
 }
 
+func TestApplicationProfileValidatesJNIDiscovery(t *testing.T) {
+	profile := &ApplicationProfile{
+		Version: ApplicationProfileVersion,
+		Name:    "jni-discovery",
+		Match:   ApplicationMatch{Package: "com.example.app"},
+		Capture: ApplicationCapture{
+			Strategies: []string{StrategyJNIDiscovery},
+		},
+		JNI: &JNIDiscoveryProfile{
+			Library:                "/apex/com.android.art/lib64/libart.so",
+			BuildID:                "AA:BB:CC:DD",
+			RegisterNativesOffsets: []OffsetValue{0x1234, 0x1234, 0x5678},
+		},
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	if profile.JNI.BuildID != "aabbccdd" ||
+		len(profile.JNI.RegisterNativesOffsets) != 2 {
+		t.Fatalf("normalized JNI configuration = %#v", profile.JNI)
+	}
+
+	missingStrategy := *profile
+	missingStrategy.Capture.Strategies = nil
+	if err := missingStrategy.Validate(); err == nil {
+		t.Fatal("Validate() should require the jni_discovery strategy")
+	}
+
+	missingConfig := *profile
+	missingConfig.JNI = nil
+	missingConfig.Capture.Strategies = []string{StrategyJNIDiscovery}
+	if err := missingConfig.Validate(); err == nil {
+		t.Fatal("Validate() should require jni_discovery configuration")
+	}
+}
+
 func TestResolveLibraryGlob(t *testing.T) {
 	dir := t.TempDir()
 	first := filepath.Join(dir, "liba.so")

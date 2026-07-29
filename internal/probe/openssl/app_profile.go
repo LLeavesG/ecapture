@@ -34,6 +34,7 @@ const (
 	StrategyTLSKeys      = "tls_keys"
 	StrategyQUICMetadata = "quic_metadata"
 	StrategyAppData      = "application_data"
+	StrategyJNIDiscovery = "jni_discovery"
 	// StrategyCronet is retained as a compatibility alias for profiles that
 	// predate the generic application-data hook name.
 	StrategyCronet      = "cronet"
@@ -65,11 +66,13 @@ const (
 	AppDataLengthReturn   = "return"
 	AppDataBufferRaw      = "raw"
 	AppDataBufferLibCXX   = "libcxx_string"
+	AppDataBufferIOVec    = "iovec"
 	AppDataStateSave      = "save"
 	AppDataStateLoad      = "load"
 
 	MaxApplicationHooks = 8
 	MaxApplicationData  = 8 * MaxDataSize
+	MaxJNIRegisterHooks = 4
 )
 
 var (
@@ -79,6 +82,7 @@ var (
 		StrategyTLSKeys:      {},
 		StrategyQUICMetadata: {},
 		StrategyAppData:      {},
+		StrategyJNIDiscovery: {},
 		StrategyCronet:       {},
 	}
 	supportedHookRoles = map[string]struct{}{
@@ -143,6 +147,7 @@ type ApplicationProfile struct {
 	Capture   ApplicationCapture     `json:"capture"`
 	TLS       ApplicationTLS         `json:"tls"`
 	DataHooks []ApplicationDataHook  `json:"data_hooks,omitempty"`
+	JNI       *JNIDiscoveryProfile   `json:"jni_discovery,omitempty"`
 	Offsets   map[string]OffsetValue `json:"offsets,omitempty"`
 	Metadata  map[string]string      `json:"metadata,omitempty"`
 }
@@ -180,6 +185,18 @@ type ApplicationTLS struct {
 	Hooks           map[string]HookProfile `json:"hooks,omitempty"`
 }
 
+// JNIDiscoveryProfile attaches specialized RegisterNatives decoders to ART.
+// The offsets can be found without private symbols by locating the standard
+// JNINativeInterface table (RegisterNatives is entry 215).
+type JNIDiscoveryProfile struct {
+	Library                string        `json:"library,omitempty"`
+	LibraryGlob            string        `json:"library_glob,omitempty"`
+	BuildID                string        `json:"build_id,omitempty"`
+	RegisterNativesOffsets []OffsetValue `json:"register_natives_offsets"`
+
+	resolvedLibrary string
+}
+
 // HookProfile selects either an exported symbol or a file offset for a
 // well-known probe role. Offset takes precedence when it is non-zero.
 type HookProfile struct {
@@ -212,6 +229,9 @@ type ApplicationDataHook struct {
 	LengthSize     uint32      `json:"length_size,omitempty"`
 	LengthIndirect bool        `json:"length_indirect,omitempty"`
 	MaxBytes       uint32      `json:"max_bytes,omitempty"`
+	ContextArg     uint32      `json:"context_arg,omitempty"`
+	StreamArg      uint32      `json:"stream_arg,omitempty"`
+	VectorCountArg uint32      `json:"vector_count_arg,omitempty"`
 	StateGroup     string      `json:"state_group,omitempty"`
 	StateAction    string      `json:"state_action,omitempty"`
 	StateKeyArg    uint32      `json:"state_key_arg,omitempty"`
@@ -294,6 +314,9 @@ func (p *ApplicationProfile) Validate() error {
 	if err := validateApplicationDataHooks(p.DataHooks); err != nil {
 		return err
 	}
+	if err := validateJNIDiscovery(p); err != nil {
+		return err
+	}
 	for name, value := range p.Offsets {
 		if _, ok := structOffsetConstants[name]; !ok {
 			return fmt.Errorf("unsupported structure offset %q", name)
@@ -304,6 +327,59 @@ func (p *ApplicationProfile) Validate() error {
 	}
 	p.Capture.Strategies = normalizeStrings(p.Capture.Strategies)
 	p.Capture.Interfaces = normalizeInterfaceNames(p.Capture.Interfaces)
+	return nil
+}
+
+func validateJNIDiscovery(profile *ApplicationProfile) error {
+	jni := profile.JNI
+	hasStrategy := false
+	for _, strategy := range profile.Capture.Strategies {
+		if strings.EqualFold(strings.TrimSpace(strategy), StrategyJNIDiscovery) {
+			hasStrategy = true
+			break
+		}
+	}
+	if jni == nil {
+		if hasStrategy {
+			return fmt.Errorf("%s strategy requires jni_discovery configuration",
+				StrategyJNIDiscovery)
+		}
+		return nil
+	}
+	if !hasStrategy {
+		return fmt.Errorf("jni_discovery configuration requires %s strategy",
+			StrategyJNIDiscovery)
+	}
+	jni.Library = strings.TrimSpace(jni.Library)
+	jni.LibraryGlob = strings.TrimSpace(jni.LibraryGlob)
+	if (jni.Library == "") == (jni.LibraryGlob == "") {
+		return fmt.Errorf("jni_discovery requires exactly one of library or library_glob")
+	}
+	var err error
+	jni.BuildID, err = normalizeBuildID(jni.BuildID)
+	if err != nil {
+		return fmt.Errorf("jni_discovery build_id: %w", err)
+	}
+	if len(jni.RegisterNativesOffsets) == 0 {
+		return fmt.Errorf("jni_discovery requires at least one register_natives_offsets entry")
+	}
+	if len(jni.RegisterNativesOffsets) > MaxJNIRegisterHooks {
+		return fmt.Errorf("jni_discovery has %d RegisterNatives offsets, maximum is %d",
+			len(jni.RegisterNativesOffsets), MaxJNIRegisterHooks)
+	}
+	seen := make(map[OffsetValue]struct{}, len(jni.RegisterNativesOffsets))
+	normalized := make([]OffsetValue, 0, len(jni.RegisterNativesOffsets))
+	for _, offset := range jni.RegisterNativesOffsets {
+		if offset == 0 {
+			return fmt.Errorf("jni_discovery RegisterNatives offset must be non-zero")
+		}
+		if _, found := seen[offset]; found {
+			continue
+		}
+		seen[offset] = struct{}{}
+		normalized = append(normalized, offset)
+	}
+	jni.RegisterNativesOffsets = normalized
 	return nil
 }
 
@@ -371,12 +447,20 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 			return fmt.Errorf("application data hook %q buffer_arg must be between 1 and 5",
 				hook.Name)
 		}
+		if hook.ContextArg > 5 {
+			return fmt.Errorf("application data hook %q context_arg must be between 0 and 5",
+				hook.Name)
+		}
+		if hook.StreamArg > 5 {
+			return fmt.Errorf("application data hook %q stream_arg must be between 0 and 5",
+				hook.Name)
+		}
 		hook.BufferFormat = strings.ToLower(strings.TrimSpace(hook.BufferFormat))
 		if hook.BufferFormat == "" {
 			hook.BufferFormat = AppDataBufferRaw
 		}
 		switch hook.BufferFormat {
-		case AppDataBufferRaw, AppDataBufferLibCXX:
+		case AppDataBufferRaw, AppDataBufferLibCXX, AppDataBufferIOVec:
 		default:
 			return fmt.Errorf("application data hook %q has unsupported buffer_format %q",
 				hook.Name, hook.BufferFormat)
@@ -391,6 +475,10 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 		}
 		hook.StateGroup = strings.ToLower(strings.TrimSpace(hook.StateGroup))
 		hook.StateAction = strings.ToLower(strings.TrimSpace(hook.StateAction))
+		if hook.BufferFormat == AppDataBufferIOVec && hook.StateAction != "" {
+			return fmt.Errorf("application data hook %q buffer_format=%s does not support asynchronous state pairing",
+				hook.Name, AppDataBufferIOVec)
+		}
 		if hook.StateAction == "" && hook.StateGroup != "" {
 			return fmt.Errorf("application data hook %q state_group requires state_action",
 				hook.Name)
@@ -434,6 +522,30 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 		}
 
 		hook.LengthSource = strings.ToLower(strings.TrimSpace(hook.LengthSource))
+		if hook.BufferFormat == AppDataBufferIOVec {
+			if hook.VectorCountArg < 1 || hook.VectorCountArg > 5 {
+				return fmt.Errorf("application data hook %q buffer_format=%s requires vector_count_arg between 1 and 5",
+					hook.Name, AppDataBufferIOVec)
+			}
+			if hook.BufferOffset != 0 || hook.BufferIndirect {
+				return fmt.Errorf("application data hook %q buffer_format=%s requires a direct iovec pointer",
+					hook.Name, AppDataBufferIOVec)
+			}
+			if hook.LengthSource != "" || hook.LengthArg != 0 || hook.FixedLength != 0 ||
+				hook.LengthOffset != 0 || hook.LengthSize != 0 || hook.LengthIndirect {
+				return fmt.Errorf("application data hook %q buffer_format=%s derives lengths from vector entries and the optional function return value",
+					hook.Name, AppDataBufferIOVec)
+			}
+			if hook.MaxBytes > MaxApplicationData {
+				return fmt.Errorf("application data hook %q max_bytes %d exceeds %d",
+					hook.Name, hook.MaxBytes, MaxApplicationData)
+			}
+			continue
+		}
+		if hook.VectorCountArg != 0 {
+			return fmt.Errorf("application data hook %q vector_count_arg requires buffer_format=%s",
+				hook.Name, AppDataBufferIOVec)
+		}
 		if hook.BufferFormat == AppDataBufferLibCXX {
 			if hook.LengthSource != "" || hook.LengthArg != 0 || hook.FixedLength != 0 ||
 				hook.LengthOffset != 0 || hook.LengthSize != 0 || hook.LengthIndirect {

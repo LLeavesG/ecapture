@@ -107,17 +107,22 @@ func (w *FileWriter) Close() error {
 	}
 
 	if w.rotateLog != nil {
-		return w.rotateLog.Close()
+		err := w.rotateLog.Close()
+		w.rotateLog = nil
+		return err
 	}
 
 	if w.buffered != nil {
 		if err := w.buffered.Flush(); err != nil {
 			return err
 		}
+		w.buffered = nil
 	}
 
 	if w.file != nil {
-		return w.file.Close()
+		err := w.file.Close()
+		w.file = nil
+		return err
 	}
 
 	return nil

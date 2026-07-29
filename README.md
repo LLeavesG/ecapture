@@ -221,6 +221,8 @@ For details of the Protobuf log schema used by eCapture/eCaptureQ, see:
 - [**Performance Benchmarks**](docs/performance-benchmarks.md) — Overhead measurement methodology and expected characteristics
 - [**Release Verification**](docs/release-verification.md) — How to verify the integrity of release artifacts
 - [**Application Capture Profiles**](docs/application-profiles.md) — Per-app strategies, hooks, interfaces, and runtime TLS offsets
+- [**Full-Traffic Capture Architecture**](docs/capture-architecture.md) — Packet, plaintext-boundary, and reconstruction planes
+- [**Profile Location Guide**](docs/profile-location-guide.md) — Automated inventory and agent-assisted offset validation
 
 # Contributing
 See [CONTRIBUTING](./CONTRIBUTING.md) for details on submitting patches and the contribution workflow.

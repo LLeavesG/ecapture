@@ -11,6 +11,41 @@ Run a profile:
 ecapture tls --profile /data/local/tmp/doubao-13.9.0-android16.json
 ```
 
+Before writing a profile for a new application, inventory its loaded native
+libraries and generate a conservative diagnostic scaffold:
+
+```sh
+ecapture profile inspect \
+  --pid 3423 \
+  --output profile-report.json \
+  --scaffold profile-discovery.json
+```
+
+See [`profile-location-guide.md`](profile-location-guide.md) for the required
+Build-ID and marker-validation workflow. The scaffold includes only public ABIs
+whose direct buffer/length layout is known; hints from stripped Cronet or
+private libraries are never promoted to offsets automatically.
+
+For Android applications using dynamic JNI registration, the scaffold can
+also include an ART Build-ID-pinned `jni_discovery` strategy. Capture a cold
+start as structured events and rank the native boundaries:
+
+```sh
+ecapture tls \
+  --profile profile-discovery.json \
+  --event-format=json \
+  --eventaddr=jni-events.jsonl
+
+ecapture profile learn-jni \
+  --input jni-events.jsonl \
+  --output jni-candidates.json
+```
+
+The learner never emits a data hook directly from a JNI object signature:
+`jstring`, arrays, and `ByteBuffer` parameters are managed references. Its
+output identifies which native method and JNI conversion boundary should be
+validated next.
+
 Explicit CLI flags override profile values. This is useful when only one
 offset changed in a new app build:
 
@@ -28,6 +63,8 @@ The supported strategies are:
 - `tls_keys`: NSS key log output and PCAPNG decryption-secret blocks.
 - `quic_metadata`: `SSL_provide_quic_data` handshake metadata.
 - `application_data`: profile-defined application function hooks.
+- `jni_discovery`: ART `RegisterNatives` metadata and module-relative native
+  method offsets.
 - `cronet`: compatibility alias for `application_data`.
 
 `mode: "all"` enables raw packets and the selected TLS strategies together.
@@ -103,6 +140,59 @@ function returns. Each call is emitted in bounded 16 KiB chunks, up to
 `max_bytes` and an absolute 128 KiB ceiling. Hook names and chunk metadata are
 included in text/JSON events so different application strategies can be
 correlated without rebuilding eCapture.
+
+`context_arg` and `stream_arg` optionally copy two scalar arguments into every
+event and preserve them across a uretprobe. They are intended for a connection,
+request, adapter, channel, or QUIC stream identity. For example,
+`quiche_conn_stream_send(conn, stream_id, buf, len, fin)` uses:
+
+```json
+{
+  "buffer_arg": 3,
+  "length_arg": 4,
+  "context_arg": 1,
+  "stream_arg": 2
+}
+```
+
+This makes multiplexed streams reconstructable; without the connection and
+stream identity, capturing HTTP/3 bytes alone is insufficient.
+
+Scatter/gather APIs use `buffer_format: "iovec"`. The buffer argument is the
+direct `struct iovec *`, and `vector_count_arg` selects the count:
+
+```json
+{
+  "name": "socket-writev",
+  "library": "/apex/com.android.runtime/lib64/bionic/libc.so",
+  "symbol": "writev",
+  "direction": "write",
+  "capture_on": "entry",
+  "buffer_arg": 2,
+  "buffer_format": "iovec",
+  "vector_count_arg": 3,
+  "context_arg": 1,
+  "max_bytes": 131072
+}
+```
+
+For `readv`, use `direction: "read"` and `capture_on: "return"`; the positive
+return value limits the final vector to bytes actually received. No
+`length_*`, buffer offset/indirection, or asynchronous state fields are valid
+for an iovec hook. The eBPF program inspects at most 16 vectors and emits at
+most eight 16 KiB chunks (128 KiB total). Every chunk shares one call
+timestamp and the iovec-array address, and uses an offset in the flattened
+logical stream. More vectors, an oversized stream, or an unreadable vector is
+reported as truncation or a reconstruction gap rather than silently
+concatenating the wrong bytes.
+
+The inspector safely scaffolds the public `readv` and `writev` ABIs. It does
+not treat `sendmsg`/`recvmsg` or a library-specific vector structure as the
+same layout: those require a dedicated `msghdr` or stack-specific adapter.
+The marker-validated integration fixture is
+[`testdata/iovec_capture_profile.json`](../testdata/iovec_capture_profile.json);
+its [runtime evidence](evidence/iovec-capture-2026-07-29.md) includes verifier
+and reconstruction results.
 
 Asynchronous APIs can split buffer creation and completion across different
 functions or threads. Pair two hooks with the same `state_group`: a

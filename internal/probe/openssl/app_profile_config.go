@@ -109,6 +109,16 @@ func (c *Config) ApplyApplicationProfile(profile *ApplicationProfile) error {
 		c.HookOverrides[role] = hook
 	}
 	c.ApplicationDataHooks = append([]ApplicationDataHook(nil), profile.DataHooks...)
+	if profile.JNI != nil {
+		jni := *profile.JNI
+		jni.RegisterNativesOffsets = append(
+			[]OffsetValue(nil),
+			profile.JNI.RegisterNativesOffsets...,
+		)
+		c.JNIDiscovery = &jni
+	} else {
+		c.JNIDiscovery = nil
+	}
 	for name, value := range profile.Offsets {
 		c.StructOffsets[name] = uint64(value)
 	}
@@ -176,6 +186,11 @@ func (c *Config) prepareApplicationProfile() error {
 				StrategyAppData)
 		}
 		if err := c.resolveApplicationDataLibraries(); err != nil {
+			return err
+		}
+	}
+	if c.HasStrategy(StrategyJNIDiscovery) {
+		if err := c.resolveJNIDiscoveryLibrary(); err != nil {
 			return err
 		}
 	}
@@ -288,6 +303,10 @@ func (c *Config) HasApplicationDataStrategy() bool {
 	return c.HasStrategy(StrategyAppData) || c.HasStrategy(StrategyCronet)
 }
 
+func (c *Config) HasJNIDiscoveryStrategy() bool {
+	return c.HasStrategy(StrategyJNIDiscovery)
+}
+
 func (c *Config) EnabledApplicationDataHooks() []ApplicationDataHook {
 	hooks := make([]ApplicationDataHook, 0, len(c.ApplicationDataHooks))
 	for _, hook := range c.ApplicationDataHooks {
@@ -337,6 +356,46 @@ func (h ApplicationDataHook) ResolvedLibrary() string {
 		return h.resolvedLibrary
 	}
 	return h.Library
+}
+
+func (c *Config) resolveJNIDiscoveryLibrary() error {
+	if c.JNIDiscovery == nil {
+		return fmt.Errorf("%s strategy requires jni_discovery configuration",
+			StrategyJNIDiscovery)
+	}
+	jni := c.JNIDiscovery
+	if jni.LibraryGlob != "" {
+		path, err := resolveLibraryGlob(jni.LibraryGlob)
+		if err != nil {
+			return fmt.Errorf("resolve JNI discovery library: %w", err)
+		}
+		jni.resolvedLibrary = path
+	} else {
+		info, err := os.Stat(jni.Library)
+		if err != nil {
+			return fmt.Errorf("stat JNI discovery library %q: %w", jni.Library, err)
+		}
+		if info.IsDir() {
+			return fmt.Errorf("JNI discovery library %q is a directory", jni.Library)
+		}
+		jni.resolvedLibrary = jni.Library
+	}
+	if jni.BuildID != "" {
+		if err := verifyELFBuildID(jni.resolvedLibrary, jni.BuildID); err != nil {
+			return fmt.Errorf("verify JNI discovery library: %w", err)
+		}
+	}
+	return nil
+}
+
+func (p *JNIDiscoveryProfile) ResolvedLibrary() string {
+	if p == nil {
+		return ""
+	}
+	if p.resolvedLibrary != "" {
+		return p.resolvedLibrary
+	}
+	return p.Library
 }
 
 func (c *Config) ApplyStructOffsetAssignment(assignment string) error {
@@ -416,7 +475,7 @@ func captureModeForStrategies(strategies []string) string {
 		switch strategy {
 		case StrategyRawPackets:
 			raw = true
-		case StrategyTLSPlaintext, StrategyQUICMetadata, StrategyAppData, StrategyCronet:
+		case StrategyTLSPlaintext, StrategyQUICMetadata, StrategyAppData, StrategyJNIDiscovery, StrategyCronet:
 			plaintext = true
 		case StrategyTLSKeys:
 			keys = true

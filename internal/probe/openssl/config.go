@@ -56,6 +56,7 @@ type Config struct {
 	StructOffsets        map[string]uint64      `json:"struct_offsets,omitempty"`
 	HookOverrides        map[string]HookProfile `json:"hook_overrides,omitempty"`
 	ApplicationDataHooks []ApplicationDataHook  `json:"application_data_hooks,omitempty"`
+	JNIDiscovery         *JNIDiscoveryProfile   `json:"jni_discovery,omitempty"`
 	StructOffsetSpecs    []string               `json:"-"`
 	HookSpecs            []string               `json:"-"`
 	profileApplied       bool

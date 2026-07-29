@@ -16,6 +16,7 @@
 #include "tc.h"
 #include "openssl_offsets.h"
 #include "app_data.h"
+#include "jni_discovery.h"
 
 /***********************************************************
  * Internal structs and definitions
