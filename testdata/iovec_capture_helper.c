@@ -26,6 +26,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -37,6 +38,14 @@ EXPORTED ssize_t ecapture_test_writev(int fd, const struct iovec *iov, int iovcn
 
 EXPORTED ssize_t ecapture_test_readv(int fd, const struct iovec *iov, int iovcnt) {
     return readv(fd, iov, iovcnt);
+}
+
+EXPORTED ssize_t ecapture_test_sendmsg(int fd, const struct msghdr *message, int flags) {
+    return sendmsg(fd, message, flags);
+}
+
+EXPORTED ssize_t ecapture_test_recvmsg(int fd, struct msghdr *message, int flags) {
+    return recvmsg(fd, message, flags);
 }
 
 int main(void) {
@@ -51,7 +60,9 @@ int main(void) {
 
     int null_fd = open("/dev/null", O_WRONLY);
     int pipe_fds[2];
-    if (null_fd < 0 || pipe(pipe_fds) != 0)
+    int message_fds[2];
+    if (null_fd < 0 || pipe(pipe_fds) != 0 ||
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, message_fds) != 0)
         return 1;
 
     printf("ready pid=%ld\n", (long)getpid());
@@ -81,8 +92,46 @@ int main(void) {
             (int)(sizeof(read_vectors) / sizeof(read_vectors[0]))) < 0)
         return 4;
 
+    static const char message_part_1[] = "ECAPTURE-";
+    static const char message_part_2[] = "MSGHDR-WRITE-";
+    static const char message_part_3[] = "MARKER\n";
+    struct iovec message_vectors[] = {
+        {(void *)message_part_1, sizeof(message_part_1) - 1},
+        {(void *)message_part_2, sizeof(message_part_2) - 1},
+        {(void *)message_part_3, sizeof(message_part_3) - 1},
+    };
+    struct msghdr outgoing = {
+        .msg_iov = message_vectors,
+        .msg_iovlen = sizeof(message_vectors) / sizeof(message_vectors[0]),
+    };
+    if (ecapture_test_sendmsg(message_fds[0], &outgoing, 0) < 0)
+        return 5;
+    char drain[64];
+    if (read(message_fds[1], drain, sizeof(drain)) < 0)
+        return 6;
+
+    static const char receive_marker[] = "ECAPTURE-MSGHDR-READ-MARKER\n";
+    if (write(message_fds[0], receive_marker, sizeof(receive_marker) - 1) < 0)
+        return 7;
+    char message_read_part_1[9] = {};
+    char message_read_part_2[13] = {};
+    char message_read_part_3[32] = {};
+    struct iovec message_read_vectors[] = {
+        {message_read_part_1, sizeof(message_read_part_1)},
+        {message_read_part_2, sizeof(message_read_part_2)},
+        {message_read_part_3, sizeof(message_read_part_3)},
+    };
+    struct msghdr incoming = {
+        .msg_iov = message_read_vectors,
+        .msg_iovlen = sizeof(message_read_vectors) / sizeof(message_read_vectors[0]),
+    };
+    if (ecapture_test_recvmsg(message_fds[1], &incoming, 0) < 0)
+        return 8;
+
     close(pipe_fds[0]);
     close(pipe_fds[1]);
+    close(message_fds[0]);
+    close(message_fds[1]);
     close(null_fd);
     sleep(2);
     return 0;

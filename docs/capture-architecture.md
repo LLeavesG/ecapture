@@ -75,7 +75,7 @@ profile:
 | TLS plaintext | `SSL_read`, `SSL_write`, configured offsets or symbols | decrypted TLS stream chunks | reusable for a matching TLS ABI |
 | TLS keys | TLS key-schedule/master-secret hooks | NSS-style key material where supported | TLS-build dependent |
 | QUIC metadata | `SSL_provide_quic_data` | TLS handshake CRYPTO level/length | not HTTP/3 application plaintext |
-| generic app data | profile symbol/offset uprobes and optional uretprobes | direct, indirect, fixed, memory-length, return-length, libc++ string, iovec, and asynchronous paired buffers | known ABI or Build-ID-pinned |
+| generic app data | profile symbol/offset uprobes and optional uretprobes | direct, indirect, fixed, memory-length, return-length, libc++ string, iovec, msghdr, and asynchronous paired buffers | known ABI or Build-ID-pinned |
 | JNI discovery | ART `RegisterNatives` implementation/wrappers | method name, JNI signature, runtime function and module offset | reusable across apps on the same ART Build ID |
 
 The JNI locator statically finds `JNINativeInterface[215]`; it does not depend
@@ -124,7 +124,8 @@ gQUIC.
 | --- | --- | --- |
 | Stable public C ABI | OpenSSL, GnuTLS, mbedTLS, wolfSSL, NSPR, quiche | Usually; symbol plus known argument recipe |
 | Exported iovec ABI | `readv`, `writev` | Automatically scaffolded with bounded flattening |
-| Other aggregate ABI | `sendmsg`, ngtcp2-specific vectors, C++ containers | Needs an ABI-specific layout recipe |
+| Standard 64-bit msghdr ABI | `sendmsg`, `recvmsg` | Automatically scaffolded; configurable header offsets |
+| Other aggregate ABI | ngtcp2-specific vectors, chained buffers, C++ containers | Needs an ABI-specific layout recipe |
 | Dynamically registered JNI | Android Cronet `J.N.*` methods | Discover registration, then validate arguments |
 | Stripped internal native function | private Cronet or SDK callback | String/xref/static analysis plus marker test |
 | Pure Java/Kotlin or ART JIT code | Java serializers, OkHttp interceptors | Native uprobes are not stable; prefer JNI/native/crypto/socket boundary |
@@ -162,10 +163,11 @@ The current implementation status is:
 | WebSocket frame recognition on TLS output | implemented |
 | generic contiguous custom binary buffers | implemented through application profiles |
 | generic `readv`/`writev` flattened buffers | implemented and verifier/marker-validated |
+| standard 64-bit `sendmsg`/`recvmsg` flattened buffers | implemented and verifier/marker-validated on Linux and Android |
 | dynamic JNI native inventory and ranking | implemented |
 | QUIC handshake metadata | implemented |
 | generic Cronet HTTP/3 or arbitrary QUIC STREAM plaintext | not yet implemented |
-| `msghdr`, chained buffers, Java heap objects | needs dedicated layout adapters |
+| chained buffers, stack-private vectors, Java heap objects | needs dedicated layout/conversion adapters |
 | HTTP/2 HPACK transaction reconstruction | needs reconstruction plugin |
 | HTTP/3 QPACK transaction reconstruction | needs QUIC stream capture plus reconstruction plugin |
 | arbitrary protobuf/private schema decoding | captured bytes can be exported; schema/plugin is required |
@@ -217,9 +219,9 @@ not full HPACK/QPACK transaction decoding.
 A mitmproxy-like operator experience requires four more interfaces above the
 capture planes:
 
-1. **Boundary adapters** for contiguous buffers and iovec (implemented), then
-   msghdr, QUIC-stack-specific vectors, JNI conversions, common C++ containers,
-   and crypto/serializer APIs.
+1. **Boundary adapters** for contiguous buffers, iovec, and standard 64-bit
+   msghdr (implemented), then QUIC-stack-specific vectors, JNI conversions,
+   common C++ containers, and crypto/serializer APIs.
 2. **A normalized stream envelope** carrying package, PID/TID, module Build
    ID, hook identity, connection/request/stream identity, direction,
    monotonic timestamp, original length, chunk offset, and loss/truncation
@@ -229,12 +231,12 @@ capture planes:
 4. **A transaction store/export API** that joins packet, TLS/QUIC stream, and
    semantic events and exposes mitmproxy-style request/response views.
 
-The existing profile, contiguous/iovec adapters, connection/stream correlation
-fields, compact JSON event format, and offline reassembler implement the
-foundation of interfaces 1 and 2. Declaring the suite a full replacement
-before generic Cronet QUIC stream capture, remaining aggregate-buffer
-adapters, cross-call transaction correlation, and full protocol decoders are
-verified would be inaccurate.
+The existing profile, contiguous/iovec/msghdr adapters, connection/stream
+correlation fields, compact JSON event format, and offline reassembler
+implement the foundation of interfaces 1 and 2. Declaring the suite a full
+replacement before generic Cronet QUIC stream capture, remaining
+stack-specific aggregate-buffer adapters, cross-call transaction correlation,
+and full protocol decoders are verified would be inaccurate.
 
 ## Replacement boundary
 

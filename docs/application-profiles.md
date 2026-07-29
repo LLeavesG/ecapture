@@ -186,9 +186,41 @@ logical stream. More vectors, an oversized stream, or an unreadable vector is
 reported as truncation or a reconstruction gap rather than silently
 concatenating the wrong bytes.
 
-The inspector safely scaffolds the public `readv` and `writev` ABIs. It does
-not treat `sendmsg`/`recvmsg` or a library-specific vector structure as the
-same layout: those require a dedicated `msghdr` or stack-specific adapter.
+The inspector safely scaffolds the public `readv` and `writev` ABIs.
+
+The standard 64-bit `sendmsg`/`recvmsg` ABI uses
+`buffer_format: "msghdr"`. `buffer_arg` selects the direct `struct msghdr *`;
+the adapter obtains `msg_iov` and `msg_iovlen` from the header and then uses
+the same bounded flattening path:
+
+```json
+{
+  "name": "socket-recvmsg",
+  "library": "/apex/com.android.runtime/lib64/bionic/libc.so",
+  "symbol": "recvmsg",
+  "direction": "read",
+  "capture_on": "return",
+  "buffer_arg": 2,
+  "buffer_format": "msghdr",
+  "context_arg": 1,
+  "max_bytes": 131072
+}
+```
+
+The defaults are `buffer_offset: 16` for `msg_iov`,
+`length_offset: 24` for `msg_iovlen`, and an eight-byte count. These defaults
+match the Linux/glibc and Android/bionic arm64/amd64 layouts tested by the
+project. A nonstandard or private header can override those offsets only after
+its exact ABI has been verified. `sendmsg` captures on entry; `recvmsg`
+captures on return so the positive result bounds the flattened data.
+`vector_count_arg`, `length_*`, header indirection, and asynchronous state
+fields are invalid for this adapter.
+
+The inspector automatically scaffolds all four standard public ABIs:
+`readv`, `writev`, `sendmsg`, and `recvmsg`. It does not assume a
+library-specific vector, chained buffer, or C++ collection has either layout;
+those require a stack-specific adapter or a hook at a point where pointer and
+length are already materialized.
 The marker-validated integration fixture is
 [`testdata/iovec_capture_profile.json`](../testdata/iovec_capture_profile.json);
 its [runtime evidence](evidence/iovec-capture-2026-07-29.md) includes verifier

@@ -278,22 +278,14 @@ var knownSymbolRecipes = map[string]symbolRecipe{
 		priority:   60,
 		notes:      "Receives protected QUIC packets; locate stream callbacks for application plaintext.",
 	},
-	"sendmsg": {
-		family:     "libc",
-		layer:      LayerTransport,
-		role:       "socket-sendmsg",
-		confidence: ConfidenceExact,
-		priority:   35,
-		notes:      "msghdr/iovec traversal is required; use raw packet capture until an iovec recipe is enabled.",
-	},
-	"recvmsg": {
-		family:     "libc",
-		layer:      LayerTransport,
-		role:       "socket-recvmsg",
-		confidence: ConfidenceExact,
-		priority:   35,
-		notes:      "msghdr/iovec traversal is required; use raw packet capture until an iovec recipe is enabled.",
-	},
+	"sendmsg": msgHdrRecipe(
+		"libc", "socket-sendmsg", "write", 35,
+		"ssize_t sendmsg(int fd, const struct msghdr *msg, int flags)",
+	),
+	"recvmsg": msgHdrRecipe(
+		"libc", "socket-recvmsg", "read", 35,
+		"ssize_t recvmsg(int fd, struct msghdr *msg, int flags)",
+	),
 	"EVP_EncryptUpdate": {
 		family:     "openssl",
 		layer:      LayerCrypto,
@@ -404,6 +396,34 @@ func iovecRecipe(
 			ContextArg:     1,
 		},
 		notes: "Captures a bounded flattened iovec prefix; bytes may already be encrypted by a higher layer.",
+	}
+}
+
+func msgHdrRecipe(
+	family, role, direction string,
+	priority int,
+	abi string,
+) symbolRecipe {
+	captureOn := "entry"
+	if direction == "read" {
+		captureOn = "return"
+	}
+	return symbolRecipe{
+		family:     family,
+		layer:      LayerTransport,
+		role:       role,
+		confidence: ConfidenceExact,
+		priority:   priority,
+		abi:        abi,
+		hook: &HookRecipe{
+			Direction:    direction,
+			CaptureOn:    captureOn,
+			BufferArg:    2,
+			BufferFormat: "msghdr",
+			MaxBytes:     131072,
+			ContextArg:   1,
+		},
+		notes: "Captures the bounded flattened msg_iov stream from the standard 64-bit msghdr ABI; bytes may already be encrypted.",
 	}
 }
 

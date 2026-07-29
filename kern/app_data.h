@@ -27,6 +27,7 @@
 #define APP_DATA_FLAG_STATE_SAVE 0x80
 #define APP_DATA_FLAG_STATE_LOAD 0x100
 #define APP_DATA_FLAG_BUFFER_IOVEC 0x200
+#define APP_DATA_FLAG_BUFFER_MSGHDR 0x400
 #define APP_DATA_EVENT_TRUNCATED 0x01
 #define APP_DATA_MAX_IOVECS 16
 #define APP_DATA_MAX_IOVEC_SEGMENTS 8
@@ -560,9 +561,19 @@ static __always_inline int app_hook_entry(struct pt_regs *ctx, u32 slot) {
     u64 length = 0;
     u64 context_id = app_hook_argument(ctx, config->context_arg);
     u64 stream_id = app_hook_argument(ctx, config->stream_arg);
-    if ((config->flags & APP_DATA_FLAG_BUFFER_IOVEC) != 0) {
+    if ((config->flags &
+         (APP_DATA_FLAG_BUFFER_IOVEC | APP_DATA_FLAG_BUFFER_MSGHDR)) != 0) {
         u64 iovec_address = app_hook_argument(ctx, config->buffer_arg);
         u64 vector_count = app_hook_argument(ctx, config->vector_count_arg);
+        if ((config->flags & APP_DATA_FLAG_BUFFER_MSGHDR) != 0) {
+            u64 message_header = iovec_address;
+            if (message_header == 0 ||
+                bpf_probe_read_user(&iovec_address, sizeof(iovec_address),
+                                    (void *)(message_header + config->buffer_offset)) != 0)
+                return 0;
+            vector_count = app_hook_read_length(
+                message_header + config->length_offset, config->length_size);
+        }
         if ((config->flags & APP_DATA_FLAG_CAPTURE_RETURN) == 0)
             return app_hook_emit_iovec(ctx, slot, config, iovec_address,
                                       vector_count, 0, false,
@@ -638,7 +649,8 @@ static __always_inline int app_hook_return(struct pt_regs *ctx, u32 slot) {
         return 0;
     struct app_hook_config_t *config = bpf_map_lookup_elem(&app_hook_configs, &slot);
     if (config != NULL) {
-        if ((config->flags & APP_DATA_FLAG_BUFFER_IOVEC) != 0) {
+        if ((config->flags &
+             (APP_DATA_FLAG_BUFFER_IOVEC | APP_DATA_FLAG_BUFFER_MSGHDR)) != 0) {
             s64 result = (s64)PT_REGS_RC(ctx);
             if (result > 0)
                 app_hook_emit_iovec(ctx, slot, config, active->buffer,

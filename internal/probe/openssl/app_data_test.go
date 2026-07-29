@@ -115,6 +115,41 @@ func TestApplicationDataHookIOVecBPFConfig(t *testing.T) {
 	}
 }
 
+func TestApplicationDataHookMsgHdrBPFConfig(t *testing.T) {
+	profile := &ApplicationProfile{
+		Version: ApplicationProfileVersion,
+		Name:    "recvmsg-capture",
+		Match:   ApplicationMatch{UID: 10001},
+		Capture: ApplicationCapture{Strategies: []string{StrategyAppData}},
+		DataHooks: []ApplicationDataHook{{
+			Name:         "socket-recvmsg",
+			Library:      "/apex/com.android.runtime/lib64/bionic/libc.so",
+			Symbol:       "recvmsg",
+			Direction:    AppDataDirectionRead,
+			CaptureOn:    AppDataCaptureReturn,
+			BufferArg:    2,
+			BufferFormat: AppDataBufferMsgHdr,
+			ContextArg:   1,
+			MaxBytes:     MaxApplicationData,
+		}},
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	hook := profile.DataHooks[0]
+	if hook.BufferOffset != 16 || hook.LengthOffset != 24 ||
+		hook.LengthSize != 8 || hook.LengthSource != "" {
+		t.Fatalf("msghdr defaults were not applied: %#v", hook)
+	}
+	got := hook.bpfConfig()
+	if got.Flags != appDataFlagBufferMsgHdr|appDataFlagCaptureReturn || got.BufferArg != 2 ||
+		got.BufferOffset != 16 || got.LengthOffset != 24 ||
+		got.LengthSize != 8 || got.ContextArg != 1 {
+		t.Fatalf("unexpected msghdr BPF config: %#v", got)
+	}
+}
+
 func TestApplicationDataHookFixedLengthBPFConfig(t *testing.T) {
 	profile := &ApplicationProfile{
 		Version: ApplicationProfileVersion,
@@ -314,6 +349,27 @@ func TestApplicationDataHookValidationErrors(t *testing.T) {
 		}},
 		{"raw buffer with vector count", func(h *ApplicationDataHook) {
 			h.VectorCountArg = 3
+		}},
+		{"msghdr with vector count argument", func(h *ApplicationDataHook) {
+			h.BufferFormat = AppDataBufferMsgHdr
+			h.VectorCountArg = 3
+			h.LengthSource = ""
+			h.LengthArg = 0
+		}},
+		{"msghdr with explicit length", func(h *ApplicationDataHook) {
+			h.BufferFormat = AppDataBufferMsgHdr
+		}},
+		{"msghdr with indirect header", func(h *ApplicationDataHook) {
+			h.BufferFormat = AppDataBufferMsgHdr
+			h.LengthSource = ""
+			h.LengthArg = 0
+			h.BufferIndirect = true
+		}},
+		{"msghdr with invalid count size", func(h *ApplicationDataHook) {
+			h.BufferFormat = AppDataBufferMsgHdr
+			h.LengthSource = ""
+			h.LengthArg = 0
+			h.LengthSize = 2
 		}},
 		{"state group without action", func(h *ApplicationDataHook) {
 			h.StateGroup = "upload"

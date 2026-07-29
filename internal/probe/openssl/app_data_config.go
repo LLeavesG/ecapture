@@ -25,6 +25,7 @@ const (
 	appDataFlagStateSave
 	appDataFlagStateLoad
 	appDataFlagBufferIOVec
+	appDataFlagBufferMsgHdr
 )
 
 // applicationDataBPFConfig must stay byte-for-byte compatible with
@@ -56,6 +57,9 @@ func (h ApplicationDataHook) bpfConfig() applicationDataBPFConfig {
 	}
 	if h.BufferFormat == AppDataBufferIOVec {
 		flags |= appDataFlagBufferIOVec
+	}
+	if h.BufferFormat == AppDataBufferMsgHdr {
+		flags |= appDataFlagBufferMsgHdr
 	}
 	switch h.StateAction {
 	case AppDataStateSave:

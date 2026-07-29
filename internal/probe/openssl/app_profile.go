@@ -67,6 +67,7 @@ const (
 	AppDataBufferRaw      = "raw"
 	AppDataBufferLibCXX   = "libcxx_string"
 	AppDataBufferIOVec    = "iovec"
+	AppDataBufferMsgHdr   = "msghdr"
 	AppDataStateSave      = "save"
 	AppDataStateLoad      = "load"
 
@@ -460,7 +461,7 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 			hook.BufferFormat = AppDataBufferRaw
 		}
 		switch hook.BufferFormat {
-		case AppDataBufferRaw, AppDataBufferLibCXX, AppDataBufferIOVec:
+		case AppDataBufferRaw, AppDataBufferLibCXX, AppDataBufferIOVec, AppDataBufferMsgHdr:
 		default:
 			return fmt.Errorf("application data hook %q has unsupported buffer_format %q",
 				hook.Name, hook.BufferFormat)
@@ -475,9 +476,10 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 		}
 		hook.StateGroup = strings.ToLower(strings.TrimSpace(hook.StateGroup))
 		hook.StateAction = strings.ToLower(strings.TrimSpace(hook.StateAction))
-		if hook.BufferFormat == AppDataBufferIOVec && hook.StateAction != "" {
+		if (hook.BufferFormat == AppDataBufferIOVec ||
+			hook.BufferFormat == AppDataBufferMsgHdr) && hook.StateAction != "" {
 			return fmt.Errorf("application data hook %q buffer_format=%s does not support asynchronous state pairing",
-				hook.Name, AppDataBufferIOVec)
+				hook.Name, hook.BufferFormat)
 		}
 		if hook.StateAction == "" && hook.StateGroup != "" {
 			return fmt.Errorf("application data hook %q state_group requires state_action",
@@ -535,6 +537,39 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 				hook.LengthOffset != 0 || hook.LengthSize != 0 || hook.LengthIndirect {
 				return fmt.Errorf("application data hook %q buffer_format=%s derives lengths from vector entries and the optional function return value",
 					hook.Name, AppDataBufferIOVec)
+			}
+			if hook.MaxBytes > MaxApplicationData {
+				return fmt.Errorf("application data hook %q max_bytes %d exceeds %d",
+					hook.Name, hook.MaxBytes, MaxApplicationData)
+			}
+			continue
+		}
+		if hook.BufferFormat == AppDataBufferMsgHdr {
+			if hook.VectorCountArg != 0 {
+				return fmt.Errorf("application data hook %q buffer_format=%s derives the vector count from the message header",
+					hook.Name, AppDataBufferMsgHdr)
+			}
+			if hook.BufferIndirect {
+				return fmt.Errorf("application data hook %q buffer_format=%s requires a direct message-header pointer",
+					hook.Name, AppDataBufferMsgHdr)
+			}
+			if hook.LengthSource != "" || hook.LengthArg != 0 || hook.FixedLength != 0 ||
+				hook.LengthIndirect {
+				return fmt.Errorf("application data hook %q buffer_format=%s derives its iovec pointer and count from the message header",
+					hook.Name, AppDataBufferMsgHdr)
+			}
+			if hook.BufferOffset == 0 {
+				hook.BufferOffset = 16
+			}
+			if hook.LengthOffset == 0 {
+				hook.LengthOffset = 24
+			}
+			if hook.LengthSize == 0 {
+				hook.LengthSize = 8
+			}
+			if hook.LengthSize != 4 && hook.LengthSize != 8 {
+				return fmt.Errorf("application data hook %q buffer_format=%s length_size must be 4 or 8",
+					hook.Name, AppDataBufferMsgHdr)
 			}
 			if hook.MaxBytes > MaxApplicationData {
 				return fmt.Errorf("application data hook %q max_bytes %d exceeds %d",

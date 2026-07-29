@@ -54,6 +54,28 @@
       "vector_count_arg": 3,
       "context_arg": 1,
       "max_bytes": 131072
+    },
+    {
+      "name": "fixture-sendmsg",
+      "library": "/tmp/ecapture-iovec-helper",
+      "symbol": "ecapture_test_sendmsg",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 2,
+      "buffer_format": "msghdr",
+      "context_arg": 1,
+      "max_bytes": 131072
+    },
+    {
+      "name": "fixture-recvmsg",
+      "library": "/tmp/ecapture-iovec-helper",
+      "symbol": "ecapture_test_recvmsg",
+      "direction": "read",
+      "capture_on": "return",
+      "buffer_arg": 2,
+      "buffer_format": "msghdr",
+      "context_arg": 1,
+      "max_bytes": 131072
     }
   ],
   "metadata": {

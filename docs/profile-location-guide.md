@@ -18,9 +18,9 @@ ecapture profile inspect \
 It reads executable mappings from `/proc/PID/maps`, opens every accessible ELF,
 records its architecture and GNU Build ID, and ranks:
 
-- direct-buffer and standard `readv`/`writev` public ABIs that can be
-  scaffolded safely;
-- other aggregate APIs that need an msghdr/container/stack-specific recipe;
+- direct-buffer and standard `readv`/`writev`/`sendmsg`/`recvmsg` public ABIs
+  that can be scaffolded safely;
+- other aggregate APIs that need a container/stack-specific recipe;
 - Cronet/JNI/QUIC/serializer strings that are search anchors only.
 
 An explicit library can be inspected offline:
@@ -144,9 +144,21 @@ third-party API proven to use the identical pair of native pointer-sized
 fields. Configure the iovec pointer with `buffer_arg`, its count with
 `vector_count_arg`, and a file descriptor/connection or stream scalar with
 `context_arg`/`stream_arg` when available. `readv` must capture on return so
-the result bounds bytes actually written to user memory. `sendmsg`,
-`recvmsg`, ngtcp2 vectors, chained buffers, and C++ collections are not
-interchangeable with `struct iovec`.
+the result bounds bytes actually written to user memory.
+
+Use `buffer_format: "msghdr"` for the standard 64-bit platform
+`sendmsg`/`recvmsg` ABI. The direct header pointer is `buffer_arg`; defaults
+read `msg_iov` at byte 16 and the eight-byte `msg_iovlen` at byte 24.
+`sendmsg` captures on entry and `recvmsg` on return. Verify and override these
+offsets for any nonstandard ABI. A libc socket hook observes whatever reaches
+the socket—plaintext for an unencrypted protocol, but ciphertext after TLS,
+QUIC, or custom encryption—so it is a baseline, not a universal decryption
+boundary.
+
+ngtcp2 vectors, chained buffers, and C++ collections are not interchangeable
+with either platform adapter. Prefer a public stream ABI with accessible
+pointer/count arguments, a version-pinned mid-function point where they are
+materialized in registers, or a dedicated layout adapter.
 
 Use a state pair when pointer creation and completion are split:
 
@@ -231,7 +243,8 @@ is not a completed profile.
 | Dynamic JNI method identity and module offset | automatic | select semantically relevant methods |
 | Public C ABI recipe | automatic when the inspector knows it | marker test |
 | Standard `readv`/`writev` iovec ABI | automatic | flattened marker and return-length test |
-| `sendmsg`/`recvmsg` and stack-specific vectors | not yet automatic | exact aggregate layout adapter |
+| Standard 64-bit `sendmsg`/`recvmsg` msghdr ABI | automatic | flattened marker, header-layout, and return-length test |
+| Stack-specific vectors/chained buffers | candidate-assisted | exact aggregate layout or materialized-register ABI |
 | Stripped C++/private SDK ABI | candidate-assisted | disassembly and register/memory layout |
 | JNI object conversion | candidate-assisted | correlate the relevant `JNIEnv` conversion call |
 | Serializer/custom encryption boundary | ranked hints | request and response marker proof |

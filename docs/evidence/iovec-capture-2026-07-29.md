@@ -1,14 +1,15 @@
-# Iovec capture runtime evidence (2026-07-29)
+# Iovec and msghdr capture runtime evidence (2026-07-29)
 
 This is a synthetic, non-sensitive integration record for the generic
-application-data iovec adapter.
+application-data iovec and standard 64-bit msghdr adapters.
 
 ## Target and fixture
 
 - Linux 6.8.0 arm64 virtual machine
 - non-CO-RE `openssl_3_0_0_kern_noncore.o`
 - exported fixture wrappers `ecapture_test_writev` and
-  `ecapture_test_readv`
+  `ecapture_test_readv`, followed by `ecapture_test_sendmsg` and
+  `ecapture_test_recvmsg`
 - three vectors per call
 - fixed markers only; no application or account traffic
 
@@ -66,8 +67,8 @@ Artifact hashes:
 | two reconstructed calls | `ca1ac25c893f43d6a691cb9c1f005c285b38fe0b761b88092e304e525b6fb88c` |
 
 This proves the standard `struct iovec` boundary and flattened reconstruction.
-It does not prove `msghdr`, a QUIC library's private vector type, HTTP/3 QPACK,
-or application semantics; those remain separate adapters/decoders.
+It was the initial iovec-only phase; the msghdr follow-up below uses the same
+fixture and profile.
 
 ## Android 16 follow-up
 
@@ -91,3 +92,44 @@ Android artifact hashes:
 | two reconstructed calls | `cfd3834a73c3d6098984e11e373ccba3de4683fa8b3dda158873973f093f4cae` |
 | tested Android-tagged eCapture binary | `1fda10c84cc779436f219570d78c2faa52d400fc8830aed5ad83179daed02e7b` |
 | static marker helper | `bb24dc2c6336e36ac7623d72b1bba464ba31692d4a352a11aa3c41e1e48594be` |
+
+## Standard 64-bit msghdr follow-up
+
+The fixture was extended with a local `AF_UNIX` datagram `socketpair`.
+`sendmsg` supplied three vectors through `msg_iov`; `recvmsg` supplied three
+destination vectors and relied on the positive return value to bound the
+received data. There was no external network traffic.
+
+Both Linux and Android configured six probes for the four hooks: entry-only
+`writev` and `sendmsg`, plus entry/return pairs for `readv` and `recvmsg`.
+Each run emitted 12 chunks and reconstructed four complete calls with zero
+incomplete calls:
+
+| Hook | Direction | Original/captured | Reconstructed marker |
+| --- | --- | ---: | --- |
+| `fixture-writev` | write | 28 / 28 | `ECAPTURE-IOVEC-WRITE-MARKER\n` |
+| `fixture-readv` | read | 27 / 27 | `ECAPTURE-IOVEC-READ-MARKER\n` |
+| `fixture-sendmsg` | write | 29 / 29 | `ECAPTURE-MSGHDR-WRITE-MARKER\n` |
+| `fixture-recvmsg` | read | 28 / 28 | `ECAPTURE-MSGHDR-READ-MARKER\n` |
+
+The Linux verifier/runtime artifact hashes were:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| 12 structured events | `884afb3d7dd40d2d82776a202b270028a426027d1c34e40fedd21301580748e0` |
+| four reconstructed calls | `bd8f1a31bbc5348fb49fcf37d3aaed24937c84beb1560dfc1e157c809fce4202` |
+
+The Android 16 arm64 verifier/runtime artifact hashes were:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| 12 structured events | `a3df8d3d2a48659e37730e920578c5dc0c08700e673c8fbde4a87f8d2db9d7d0` |
+| four reconstructed calls | `ef24d5b7217c63f8d902231a6f44d270e048e0b4864914ecded4a652e85490cd` |
+| tested Android-tagged eCapture binary | `1b59bf08c9db42e1b5c5419ea91ad1a9e08d8a6d78b3b37dae466b3619837b27` |
+| static marker helper | `fc0e2b1b6e08820bcb883b13d115b112fef2dd2020c6be1f21bdeddb0011e3c6` |
+
+This proves default `msg_iov`/`msg_iovlen` extraction for the tested standard
+Linux and Android 64-bit ABIs, bounded vector flattening, and return-length
+handling. It does not prove a QUIC library's private vector type, chained
+buffers, HTTP/3 QPACK, or application semantics; those remain separate
+adapters and decoders.

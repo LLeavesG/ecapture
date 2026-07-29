@@ -96,6 +96,7 @@ func TestCandidateForKnownAndCronetSymbols(t *testing.T) {
 		{"SSL_write", "openssl", "tls-write", true},
 		{"quiche_conn_stream_recv", "quiche", "quic-stream-recv", true},
 		{"writev", "libc", "fd-writev", true},
+		{"sendmsg", "libc", "socket-sendmsg", true},
 		{"Java_org_chromium_net_impl_CronetUrlRequest_onReadCompleted", "cronet", "jni-entry", false},
 		{"CronetUpload_onReadSucceeded", "cronet", "upload-complete", false},
 	}
@@ -118,6 +119,11 @@ func TestCandidateForKnownAndCronetSymbols(t *testing.T) {
 		writev.hook.BufferArg != 2 || writev.hook.VectorCountArg != 3 ||
 		writev.hook.ContextArg != 1 {
 		t.Fatalf("writev recipe = %#v", writev.hook)
+	}
+	sendmsg, _ := candidateForSymbol("sendmsg")
+	if sendmsg.hook.BufferFormat != openssl.AppDataBufferMsgHdr ||
+		sendmsg.hook.BufferArg != 2 || sendmsg.hook.ContextArg != 1 {
+		t.Fatalf("sendmsg recipe = %#v", sendmsg.hook)
 	}
 }
 
