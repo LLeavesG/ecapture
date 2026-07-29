@@ -23,6 +23,9 @@
 #define APP_DATA_FLAG_CAPTURE_RETURN 0x08
 #define APP_DATA_FLAG_LENGTH_INDIRECT 0x10
 #define APP_DATA_FLAG_LENGTH_FIXED 0x20
+#define APP_DATA_FLAG_BUFFER_LIBCXX_STRING 0x40
+#define APP_DATA_FLAG_STATE_SAVE 0x80
+#define APP_DATA_FLAG_STATE_LOAD 0x100
 #define APP_DATA_EVENT_TRUNCATED 0x01
 
 struct app_hook_config_t {
@@ -34,6 +37,8 @@ struct app_hook_config_t {
     u64 length_offset;
     u32 length_size;
     u32 max_bytes;
+    u32 state_id;
+    u32 state_key_arg;
 };
 
 struct active_app_hook_t {
@@ -45,6 +50,18 @@ struct app_hook_key_t {
     u64 pid_tgid;
     u32 slot;
     u32 pad;
+};
+
+struct app_hook_state_key_t {
+    u64 tgid;
+    u64 value;
+    u32 state_id;
+    u32 pad;
+};
+
+struct app_hook_state_t {
+    u64 buffer;
+    u64 maximum_length;
 };
 
 struct app_data_event_t {
@@ -76,6 +93,18 @@ struct {
     __type(value, struct active_app_hook_t);
     __uint(max_entries, 1024);
 } active_app_hooks SEC(".maps");
+
+struct {
+    /*
+     * Async operations can be cancelled before their completion hook runs.
+     * LRU eviction bounds those orphaned entries instead of permanently
+     * exhausting the state map.
+     */
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, struct app_hook_state_key_t);
+    __type(value, struct app_hook_state_t);
+    __uint(max_entries, 1024);
+} app_hook_states SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -151,16 +180,37 @@ static __always_inline int app_hook_resolve(struct pt_regs *ctx, struct app_hook
     u64 buffer_base = app_hook_argument(ctx, config->buffer_arg);
     if (buffer_base == 0)
         return -1;
+    u64 buffer_object = buffer_base + config->buffer_offset;
     if ((config->flags & APP_DATA_FLAG_BUFFER_INDIRECT) != 0) {
-        if (bpf_probe_read_user(buffer, sizeof(*buffer),
-                                (void *)(buffer_base + config->buffer_offset)) != 0)
+        if (bpf_probe_read_user(&buffer_object, sizeof(buffer_object),
+                                (void *)buffer_object) != 0)
             return -1;
-    } else {
-        *buffer = buffer_base + config->buffer_offset;
     }
-    if (*buffer == 0)
+    if (buffer_object == 0)
         return -1;
 
+    /*
+     * Android Chromium uses libc++'s alternate std::string layout. The final
+     * byte stores the short-string length, or has its high bit set for a long
+     * string whose pointer and length live at offsets 0 and 8.
+     */
+    if ((config->flags & APP_DATA_FLAG_BUFFER_LIBCXX_STRING) != 0) {
+        u8 marker = 0;
+        if (bpf_probe_read_user(&marker, sizeof(marker), (void *)(buffer_object + 23)) != 0)
+            return -1;
+        if ((marker & 0x80) != 0) {
+            if (bpf_probe_read_user(buffer, sizeof(*buffer), (void *)buffer_object) != 0)
+                return -1;
+            if (bpf_probe_read_user(length, sizeof(*length), (void *)(buffer_object + 8)) != 0)
+                return -1;
+        } else {
+            *buffer = buffer_object;
+            *length = marker;
+        }
+        return *buffer == 0 || *length == 0 ? -1 : 0;
+    }
+
+    *buffer = buffer_object;
     if ((config->flags & APP_DATA_FLAG_LENGTH_FIXED) != 0) {
         *length = config->length_arg;
         return *length == 0 ? -1 : 0;
@@ -263,6 +313,31 @@ static __always_inline int app_hook_entry(struct pt_regs *ctx, u32 slot) {
     u64 length = 0;
     if (app_hook_resolve(ctx, config, &buffer, &length) != 0)
         return 0;
+    if ((config->flags & (APP_DATA_FLAG_STATE_SAVE | APP_DATA_FLAG_STATE_LOAD)) != 0) {
+        u64 state_value = app_hook_argument(ctx, config->state_key_arg);
+        if (state_value == 0 || config->state_id == 0)
+            return 0;
+        struct app_hook_state_key_t state_key = {
+            .tgid = bpf_get_current_pid_tgid() >> 32,
+            .value = state_value,
+            .state_id = config->state_id,
+        };
+        if ((config->flags & APP_DATA_FLAG_STATE_SAVE) != 0) {
+            struct app_hook_state_t state = {
+                .buffer = buffer,
+                .maximum_length = length,
+            };
+            bpf_map_update_elem(&app_hook_states, &state_key, &state, BPF_ANY);
+            return 0;
+        }
+        struct app_hook_state_t *state = bpf_map_lookup_elem(&app_hook_states, &state_key);
+        if (state == NULL)
+            return 0;
+        buffer = state->buffer;
+        if (length > state->maximum_length)
+            length = state->maximum_length;
+        bpf_map_delete_elem(&app_hook_states, &state_key);
+    }
     if ((config->flags & APP_DATA_FLAG_CAPTURE_RETURN) == 0)
         return app_hook_emit(ctx, slot, config, buffer, length);
 

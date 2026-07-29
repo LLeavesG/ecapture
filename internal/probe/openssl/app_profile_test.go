@@ -185,14 +185,42 @@ func TestApplicationProfileRejectsTrailingJSON(t *testing.T) {
 }
 
 func TestDoubaoExampleProfileIsValid(t *testing.T) {
-	path := filepath.Join("..", "..", "..", "examples", "profiles",
-		"doubao-13.9.0-android16.json")
-	profile, err := LoadApplicationProfile(path)
-	if err != nil {
-		t.Fatalf("LoadApplicationProfile(%q) error = %v", path, err)
+	for _, filename := range []string{
+		"doubao-13.9.0-android16.json",
+		"doubao-13.9.0-android16-cronet-http-diagnostic.json",
+	} {
+		t.Run(filename, func(t *testing.T) {
+			path := filepath.Join("..", "..", "..", "examples", "profiles", filename)
+			profile, err := LoadApplicationProfile(path)
+			if err != nil {
+				t.Fatalf("LoadApplicationProfile(%q) error = %v", path, err)
+			}
+			assertDoubaoSemanticHooks(t, profile.DataHooks)
+		})
 	}
-	if len(profile.DataHooks) != 1 ||
-		profile.DataHooks[0].BuildID != "771865e3ad213419d75869809dc6e2d2d7ef8977" {
-		t.Fatalf("unexpected Doubao data hooks: %#v", profile.DataHooks)
+}
+
+func assertDoubaoSemanticHooks(t *testing.T, hooks []ApplicationDataHook) {
+	t.Helper()
+	if len(hooks) != 7 {
+		t.Fatalf("unexpected Doubao data hooks: %#v", hooks)
+	}
+	for index, hook := range hooks {
+		if hook.BuildID != "771865e3ad213419d75869809dc6e2d2d7ef8977" {
+			t.Fatalf("unexpected Doubao data hook: %#v", hook)
+		}
+		if index < 4 && hook.BufferFormat != AppDataBufferLibCXX {
+			t.Fatalf("unexpected Doubao semantic string hook: %#v", hook)
+		}
+	}
+	if hooks[4].StateAction != AppDataStateSave ||
+		hooks[5].StateAction != AppDataStateLoad ||
+		hooks[4].stateID != hooks[5].stateID {
+		t.Fatalf("unexpected Doubao upload hooks: %#v", hooks[4:])
+	}
+	response := hooks[6]
+	if response.Direction != AppDataDirectionRead || !response.BufferIndirect ||
+		response.BufferOffset != 0x10 || response.LengthArg != 3 {
+		t.Fatalf("unexpected Doubao response hook: %#v", response)
 	}
 }

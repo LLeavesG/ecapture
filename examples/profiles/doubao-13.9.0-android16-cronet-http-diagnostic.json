@@ -1,0 +1,140 @@
+{
+  "version": 1,
+  "name": "doubao-13.9.0-android16-cronet-http-diagnostic",
+  "match": {
+    "package": "com.larus.nova",
+    "android_release": "16",
+    "abi": "arm64-v8a",
+    "version_name": "13.9.0",
+    "version_code": 13090001
+  },
+  "capture": {
+    "mode": "text",
+    "strategies": [
+      "application_data"
+    ],
+    "perf_reorder": true,
+    "perf_reorder_lag_ms": 10
+  },
+  "tls": {
+    "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libttboringssl.so",
+    "version": "boringssl_a_16",
+    "boring_ssl": true,
+    "hooks": {
+      "ssl_read": {
+        "disabled": true
+      },
+      "ssl_write": {
+        "disabled": true
+      },
+      "ssl_set_fd": {
+        "disabled": true
+      },
+      "ssl_set_rfd": {
+        "disabled": true
+      },
+      "ssl_set_wfd": {
+        "disabled": true
+      },
+      "ssl_provide_quic_data": {
+        "disabled": true
+      }
+    }
+  },
+  "data_hooks": [
+    {
+      "name": "cronet-request-url",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "offset": "0x235454",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 4,
+      "buffer_format": "libcxx_string",
+      "max_bytes": 4096
+    },
+    {
+      "name": "cronet-request-method",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "offset": "0x2354e4",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 2,
+      "buffer_format": "libcxx_string",
+      "max_bytes": 32
+    },
+    {
+      "name": "cronet-request-header-name",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "offset": "0x235578",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 2,
+      "buffer_format": "libcxx_string",
+      "max_bytes": 4096
+    },
+    {
+      "name": "cronet-request-header-value",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "offset": "0x235578",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 3,
+      "buffer_format": "libcxx_string",
+      "max_bytes": 4096
+    },
+    {
+      "name": "cronet-upload-buffer-save",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "offset": "0x234bc4",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 2,
+      "buffer_offset": "0x10",
+      "buffer_indirect": true,
+      "length_source": "argument",
+      "length_arg": 3,
+      "state_group": "cronet-upload",
+      "state_action": "save",
+      "state_key_arg": 1,
+      "max_bytes": 131072
+    },
+    {
+      "name": "cronet-request-body",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "offset": "0x2348ec",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 3,
+      "length_source": "argument",
+      "length_arg": 5,
+      "state_group": "cronet-upload",
+      "state_action": "load",
+      "state_key_arg": 3,
+      "max_bytes": 131072
+    },
+    {
+      "name": "cronet-response-body",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "offset": "0x2360bc",
+      "direction": "read",
+      "capture_on": "entry",
+      "buffer_arg": 2,
+      "buffer_offset": "0x10",
+      "buffer_indirect": true,
+      "length_source": "argument",
+      "length_arg": 3,
+      "max_bytes": 131072
+    }
+  ],
+  "metadata": {
+    "libsscronet_build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+    "transport_note": "Focused text-only profile for verified Cronet URL, method, header, asynchronous upload-body, and post-decryption response-body probes. The URL hook observes the converted libc++ string immediately before the native request adapter is constructed."
+  }
+}

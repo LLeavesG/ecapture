@@ -58,8 +58,8 @@ func TestApplicationDataHookValidationAndBPFConfig(t *testing.T) {
 	}
 
 	got := hook.bpfConfig()
-	if size := binary.Size(got); size != 40 {
-		t.Fatalf("applicationDataBPFConfig size = %d, want 40", size)
+	if size := binary.Size(got); size != 48 {
+		t.Fatalf("applicationDataBPFConfig size = %d, want 48", size)
 	}
 	wantFlags := uint32(appDataFlagBufferIndirect |
 		appDataFlagLengthMemory |
@@ -101,6 +101,94 @@ func TestApplicationDataHookFixedLengthBPFConfig(t *testing.T) {
 	}
 	if got.LengthArg != 256 {
 		t.Fatalf("fixed length encoded as %d, want 256", got.LengthArg)
+	}
+}
+
+func TestApplicationDataHookLibCXXStringBPFConfig(t *testing.T) {
+	profile := &ApplicationProfile{
+		Version: ApplicationProfileVersion,
+		Name:    "cronet-libcxx-string",
+		Match:   ApplicationMatch{UID: 10001},
+		Capture: ApplicationCapture{Strategies: []string{StrategyAppData}},
+		DataHooks: []ApplicationDataHook{{
+			Name:         "request-url",
+			Library:      "/data/app/libcronet.so",
+			Offset:       0x1234,
+			Direction:    AppDataDirectionWrite,
+			BufferArg:    4,
+			BufferFormat: "LIBCXX_STRING",
+			MaxBytes:     4096,
+		}},
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	hook := profile.DataHooks[0]
+	if hook.BufferFormat != AppDataBufferLibCXX || hook.LengthSource != "" {
+		t.Fatalf("hook was not normalized: %#v", hook)
+	}
+	got := hook.bpfConfig()
+	if got.Flags != appDataFlagBufferLibCXX || got.BufferArg != 4 || got.LengthArg != 0 {
+		t.Fatalf("unexpected BPF config: %#v", got)
+	}
+}
+
+func TestApplicationDataHookAsyncStateBPFConfig(t *testing.T) {
+	profile := &ApplicationProfile{
+		Version: ApplicationProfileVersion,
+		Name:    "cronet-async-upload",
+		Match:   ApplicationMatch{UID: 10001},
+		Capture: ApplicationCapture{Strategies: []string{StrategyAppData}},
+		DataHooks: []ApplicationDataHook{
+			{
+				Name:           "upload-buffer-save",
+				Library:        "/data/app/libcronet.so",
+				Offset:         0x1000,
+				Direction:      AppDataDirectionWrite,
+				BufferArg:      2,
+				BufferOffset:   0x10,
+				BufferIndirect: true,
+				LengthSource:   AppDataLengthArgument,
+				LengthArg:      3,
+				StateGroup:     "UPLOAD",
+				StateAction:    "SAVE",
+				StateKeyArg:    1,
+			},
+			{
+				Name:         "upload-buffer-load",
+				Library:      "/data/app/libcronet.so",
+				Offset:       0x2000,
+				Direction:    AppDataDirectionWrite,
+				BufferArg:    3,
+				LengthSource: AppDataLengthArgument,
+				LengthArg:    5,
+				StateGroup:   "upload",
+				StateAction:  "LOAD",
+				StateKeyArg:  3,
+				MaxBytes:     32768,
+			},
+		},
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	save := profile.DataHooks[0]
+	load := profile.DataHooks[1]
+	if save.stateID == 0 || save.stateID != load.stateID ||
+		save.StateGroup != "upload" || load.StateAction != AppDataStateLoad {
+		t.Fatalf("state hooks were not paired: save=%#v load=%#v", save, load)
+	}
+	saveConfig := save.bpfConfig()
+	loadConfig := load.bpfConfig()
+	if saveConfig.Flags != appDataFlagBufferIndirect|appDataFlagStateSave ||
+		saveConfig.StateKeyArg != 1 {
+		t.Fatalf("unexpected save config: %#v", saveConfig)
+	}
+	if loadConfig.Flags != appDataFlagStateLoad || loadConfig.StateKeyArg != 3 ||
+		loadConfig.StateID != saveConfig.StateID {
+		t.Fatalf("unexpected load config: %#v", loadConfig)
 	}
 }
 
@@ -156,6 +244,40 @@ func TestApplicationDataHookValidationErrors(t *testing.T) {
 			h.LengthSource = AppDataLengthFixed
 			h.LengthArg = 2
 			h.FixedLength = 128
+		}},
+		{"bad buffer format", func(h *ApplicationDataHook) {
+			h.BufferFormat = "java_string"
+		}},
+		{"libcxx string with explicit length", func(h *ApplicationDataHook) {
+			h.BufferFormat = AppDataBufferLibCXX
+			h.LengthSource = AppDataLengthArgument
+		}},
+		{"state group without action", func(h *ApplicationDataHook) {
+			h.StateGroup = "upload"
+		}},
+		{"state action without group", func(h *ApplicationDataHook) {
+			h.StateAction = AppDataStateSave
+			h.StateKeyArg = 1
+		}},
+		{"state key without action", func(h *ApplicationDataHook) {
+			h.StateKeyArg = 1
+		}},
+		{"state action on return", func(h *ApplicationDataHook) {
+			h.CaptureOn = AppDataCaptureReturn
+			h.StateGroup = "upload"
+			h.StateAction = AppDataStateSave
+			h.StateKeyArg = 1
+		}},
+		{"indirect state load buffer", func(h *ApplicationDataHook) {
+			h.BufferIndirect = true
+			h.StateGroup = "upload"
+			h.StateAction = AppDataStateLoad
+			h.StateKeyArg = 1
+		}},
+		{"unpaired state save", func(h *ApplicationDataHook) {
+			h.StateGroup = "upload"
+			h.StateAction = AppDataStateSave
+			h.StateKeyArg = 1
 		}},
 	}
 	for _, test := range tests {

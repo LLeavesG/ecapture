@@ -57,13 +57,91 @@
   },
   "data_hooks": [
     {
-      "name": "cronet-buffer-write",
+      "name": "cronet-request-url",
       "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
       "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
-      "offset": "0x2adeac",
+      "offset": "0x235454",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 4,
+      "buffer_format": "libcxx_string",
+      "max_bytes": 4096
+    },
+    {
+      "name": "cronet-request-method",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "offset": "0x2354e4",
       "direction": "write",
       "capture_on": "entry",
       "buffer_arg": 2,
+      "buffer_format": "libcxx_string",
+      "max_bytes": 32
+    },
+    {
+      "name": "cronet-request-header-name",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "offset": "0x235578",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 2,
+      "buffer_format": "libcxx_string",
+      "max_bytes": 4096
+    },
+    {
+      "name": "cronet-request-header-value",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "offset": "0x235578",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 3,
+      "buffer_format": "libcxx_string",
+      "max_bytes": 4096
+    },
+    {
+      "name": "cronet-upload-buffer-save",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "offset": "0x234bc4",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 2,
+      "buffer_offset": "0x10",
+      "buffer_indirect": true,
+      "length_source": "argument",
+      "length_arg": 3,
+      "state_group": "cronet-upload",
+      "state_action": "save",
+      "state_key_arg": 1,
+      "max_bytes": 131072
+    },
+    {
+      "name": "cronet-request-body",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "offset": "0x2348ec",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 3,
+      "length_source": "argument",
+      "length_arg": 5,
+      "state_group": "cronet-upload",
+      "state_action": "load",
+      "state_key_arg": 3,
+      "max_bytes": 131072
+    },
+    {
+      "name": "cronet-response-body",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "offset": "0x2360bc",
+      "direction": "read",
+      "capture_on": "entry",
+      "buffer_arg": 2,
+      "buffer_offset": "0x10",
+      "buffer_indirect": true,
       "length_source": "argument",
       "length_arg": 3,
       "max_bytes": 131072
@@ -81,6 +159,6 @@
   },
   "metadata": {
     "libsscronet_build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
-    "transport_note": "The 0x2adeac hook is the concrete Cronet Buffer InitWithDataAndCallback implementation for this build and avoids its shared exported thunk; whether a particular chat request uses this API must be verified against runtime events."
+    "transport_note": "The semantic hooks observe URL, method, headers, and request bodies before Cronet encrypts or frames them, and response bytes after Cronet decrypts them. The paired upload hooks preserve the direct ByteBuffer across Cronet's asynchronous readData/onReadSucceeded callbacks. They cover both TCP/TLS and QUIC requests without decrypting captured packets. Offsets are pinned to the verified libsscronet build ID."
   }
 }

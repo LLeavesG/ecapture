@@ -82,7 +82,11 @@ rejects a library whose GNU ELF build ID differs from the profiled build;
 using it is strongly recommended for offset hooks. `symbol` can be replaced by
 an ELF `offset`. Arguments are numbered from 1 through 5. `buffer_offset` adds
 a byte offset to the selected buffer argument; `buffer_indirect` reads a
-pointer from that location. Length can come from:
+pointer from that location. The optional `buffer_format: "libcxx_string"`
+decodes Android Chromium's 24-byte libc++ `std::string` layout, including its
+short-string optimization; its data pointer and length are derived from the
+object, so all `length_*` fields must be omitted. For the default
+`buffer_format: "raw"`, length can come from:
 
 - `argument`: the value of `length_arg`.
 - `memory`: a 1, 2, 4, or 8-byte integer at
@@ -99,6 +103,14 @@ function returns. Each call is emitted in bounded 16 KiB chunks, up to
 `max_bytes` and an absolute 128 KiB ceiling. Hook names and chunk metadata are
 included in text/JSON events so different application strategies can be
 correlated without rebuilding eCapture.
+
+Asynchronous APIs can split buffer creation and completion across different
+functions or threads. Pair two hooks with the same `state_group`: a
+`state_action: "save"` hook resolves and stores its buffer/maximum length under
+the value of `state_key_arg`; a `state_action: "load"` hook uses its own
+`length_*` fields but retrieves the saved buffer using the same key. Both hooks
+must capture on entry. The load consumes the saved state, preventing stale
+buffers from being reused.
 
 When a hook is intentionally dumping opaque binary objects or second-stage
 pointer targets, run the profile with `--hex`. Text mode preserves payload

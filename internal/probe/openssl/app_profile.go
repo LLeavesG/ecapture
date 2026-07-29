@@ -63,6 +63,10 @@ const (
 	AppDataLengthMemory   = "memory"
 	AppDataLengthFixed    = "fixed"
 	AppDataLengthReturn   = "return"
+	AppDataBufferRaw      = "raw"
+	AppDataBufferLibCXX   = "libcxx_string"
+	AppDataStateSave      = "save"
+	AppDataStateLoad      = "load"
 
 	MaxApplicationHooks = 8
 	MaxApplicationData  = 8 * MaxDataSize
@@ -198,6 +202,7 @@ type ApplicationDataHook struct {
 	Direction      string      `json:"direction"`
 	CaptureOn      string      `json:"capture_on,omitempty"`
 	BufferArg      uint32      `json:"buffer_arg"`
+	BufferFormat   string      `json:"buffer_format,omitempty"`
 	BufferOffset   OffsetValue `json:"buffer_offset,omitempty"`
 	BufferIndirect bool        `json:"buffer_indirect,omitempty"`
 	LengthSource   string      `json:"length_source,omitempty"`
@@ -207,9 +212,13 @@ type ApplicationDataHook struct {
 	LengthSize     uint32      `json:"length_size,omitempty"`
 	LengthIndirect bool        `json:"length_indirect,omitempty"`
 	MaxBytes       uint32      `json:"max_bytes,omitempty"`
+	StateGroup     string      `json:"state_group,omitempty"`
+	StateAction    string      `json:"state_action,omitempty"`
+	StateKeyArg    uint32      `json:"state_key_arg,omitempty"`
 	Disabled       bool        `json:"disabled,omitempty"`
 
 	resolvedLibrary string
+	stateID         uint32
 }
 
 func LoadApplicationProfile(path string) (*ApplicationProfile, error) {
@@ -304,6 +313,8 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 			len(hooks), MaxApplicationHooks)
 	}
 	names := make(map[string]struct{}, len(hooks))
+	stateIDs := make(map[string]uint32)
+	stateActions := make(map[string]uint32)
 	for i := range hooks {
 		hook := &hooks[i]
 		hook.Name = strings.TrimSpace(hook.Name)
@@ -360,6 +371,16 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 			return fmt.Errorf("application data hook %q buffer_arg must be between 1 and 5",
 				hook.Name)
 		}
+		hook.BufferFormat = strings.ToLower(strings.TrimSpace(hook.BufferFormat))
+		if hook.BufferFormat == "" {
+			hook.BufferFormat = AppDataBufferRaw
+		}
+		switch hook.BufferFormat {
+		case AppDataBufferRaw, AppDataBufferLibCXX:
+		default:
+			return fmt.Errorf("application data hook %q has unsupported buffer_format %q",
+				hook.Name, hook.BufferFormat)
+		}
 		if uint64(hook.BufferOffset) > 1<<20 {
 			return fmt.Errorf("application data hook %q buffer_offset is unreasonably large: %#x",
 				hook.Name, uint64(hook.BufferOffset))
@@ -368,8 +389,63 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 			return fmt.Errorf("application data hook %q length_offset is unreasonably large: %#x",
 				hook.Name, uint64(hook.LengthOffset))
 		}
+		hook.StateGroup = strings.ToLower(strings.TrimSpace(hook.StateGroup))
+		hook.StateAction = strings.ToLower(strings.TrimSpace(hook.StateAction))
+		if hook.StateAction == "" && hook.StateGroup != "" {
+			return fmt.Errorf("application data hook %q state_group requires state_action",
+				hook.Name)
+		}
+		if hook.StateAction != "" {
+			if hook.StateGroup == "" {
+				return fmt.Errorf("application data hook %q state_action requires state_group",
+					hook.Name)
+			}
+			if hook.StateKeyArg < 1 || hook.StateKeyArg > 5 {
+				return fmt.Errorf("application data hook %q state_key_arg must be between 1 and 5",
+					hook.Name)
+			}
+			if hook.CaptureOn != AppDataCaptureEntry {
+				return fmt.Errorf("application data hook %q state_action requires capture_on=entry",
+					hook.Name)
+			}
+			switch hook.StateAction {
+			case AppDataStateSave:
+				stateActions[hook.StateGroup] |= 1
+			case AppDataStateLoad:
+				if hook.BufferFormat != AppDataBufferRaw || hook.BufferOffset != 0 ||
+					hook.BufferIndirect {
+					return fmt.Errorf("application data hook %q state_action=load requires a raw buffer with no offset or indirection",
+						hook.Name)
+				}
+				stateActions[hook.StateGroup] |= 2
+			default:
+				return fmt.Errorf("application data hook %q has unsupported state_action %q",
+					hook.Name, hook.StateAction)
+			}
+			id, found := stateIDs[hook.StateGroup]
+			if !found {
+				id = uint32(len(stateIDs) + 1)
+				stateIDs[hook.StateGroup] = id
+			}
+			hook.stateID = id
+		} else if hook.StateKeyArg != 0 {
+			return fmt.Errorf("application data hook %q state_key_arg requires state_action",
+				hook.Name)
+		}
 
 		hook.LengthSource = strings.ToLower(strings.TrimSpace(hook.LengthSource))
+		if hook.BufferFormat == AppDataBufferLibCXX {
+			if hook.LengthSource != "" || hook.LengthArg != 0 || hook.FixedLength != 0 ||
+				hook.LengthOffset != 0 || hook.LengthSize != 0 || hook.LengthIndirect {
+				return fmt.Errorf("application data hook %q buffer_format=%s derives its length from the string object",
+					hook.Name, AppDataBufferLibCXX)
+			}
+			if hook.MaxBytes > MaxApplicationData {
+				return fmt.Errorf("application data hook %q max_bytes %d exceeds %d",
+					hook.Name, hook.MaxBytes, MaxApplicationData)
+			}
+			continue
+		}
 		if hook.LengthSource == "" {
 			hook.LengthSource = AppDataLengthArgument
 		}
@@ -434,6 +510,12 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 		if hook.MaxBytes > MaxApplicationData {
 			return fmt.Errorf("application data hook %q max_bytes %d exceeds %d",
 				hook.Name, hook.MaxBytes, MaxApplicationData)
+		}
+	}
+	for group, actions := range stateActions {
+		if actions != 3 {
+			return fmt.Errorf("application data state group %q requires both save and load hooks",
+				group)
 		}
 	}
 	return nil

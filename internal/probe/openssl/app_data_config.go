@@ -21,6 +21,9 @@ const (
 	appDataFlagCaptureReturn
 	appDataFlagLengthIndirect
 	appDataFlagLengthFixed
+	appDataFlagBufferLibCXX
+	appDataFlagStateSave
+	appDataFlagStateLoad
 )
 
 // applicationDataBPFConfig must stay byte-for-byte compatible with
@@ -34,12 +37,23 @@ type applicationDataBPFConfig struct {
 	LengthOffset uint64
 	LengthSize   uint32
 	MaxBytes     uint32
+	StateID      uint32
+	StateKeyArg  uint32
 }
 
 func (h ApplicationDataHook) bpfConfig() applicationDataBPFConfig {
 	var flags uint32
 	if h.BufferIndirect {
 		flags |= appDataFlagBufferIndirect
+	}
+	if h.BufferFormat == AppDataBufferLibCXX {
+		flags |= appDataFlagBufferLibCXX
+	}
+	switch h.StateAction {
+	case AppDataStateSave:
+		flags |= appDataFlagStateSave
+	case AppDataStateLoad:
+		flags |= appDataFlagStateLoad
 	}
 	switch h.LengthSource {
 	case AppDataLengthMemory:
@@ -69,6 +83,8 @@ func (h ApplicationDataHook) bpfConfig() applicationDataBPFConfig {
 		LengthOffset: uint64(h.LengthOffset),
 		LengthSize:   h.LengthSize,
 		MaxBytes:     h.MaxBytes,
+		StateID:      h.stateID,
+		StateKeyArg:  h.StateKeyArg,
 	}
 }
 

@@ -884,6 +884,7 @@ func (p *Probe) appendApplicationDataProbes(
 		&manager.Map{Name: "app_data_events"},
 		&manager.Map{Name: "app_hook_configs"},
 		&manager.Map{Name: "active_app_hooks"},
+		&manager.Map{Name: "app_hook_states"},
 		&manager.Map{Name: "app_data_buffer_heap"},
 	)
 	p.mapNameToDecoder["app_data_events"] = &applicationDataEventDecoder{
