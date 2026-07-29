@@ -24,6 +24,33 @@ import (
 	"github.com/gojue/ecapture/internal/domain"
 )
 
+func makeWebSocketFrame(payload []byte, masked bool) []byte {
+	first := byte(0x82) // FIN + binary frame
+	second := byte(0)
+	if masked {
+		second |= 0x80
+	}
+	header := []byte{first}
+	switch {
+	case len(payload) < 126:
+		header = append(header, second|byte(len(payload)))
+	case len(payload) <= 0xffff:
+		header = append(header, second|126, byte(len(payload)>>8), byte(len(payload)))
+	default:
+		panic("payload too large for test helper")
+	}
+	if !masked {
+		return append(header, payload...)
+	}
+	maskKey := []byte{0x11, 0x22, 0x33, 0x44}
+	header = append(header, maskKey...)
+	maskedPayload := make([]byte, len(payload))
+	for i := range payload {
+		maskedPayload[i] = payload[i] ^ maskKey[i%len(maskKey)]
+	}
+	return append(header, maskedPayload...)
+}
+
 func TestEvent_DecodeFromBytes(t *testing.T) {
 	// Create a test event in binary format
 	buf := new(bytes.Buffer)
@@ -169,6 +196,90 @@ func TestEvent_StringHex(t *testing.T) {
 	// Check for hex representation of "test"
 	if !strings.Contains(hex, "74657374") {
 		t.Errorf("StringHex() should contain hex of 'test', got: %s", hex)
+	}
+}
+
+func TestEvent_String_DecodesMaskedWebSocketWrite(t *testing.T) {
+	payload := []byte(`{"message":"hello websocket"}`)
+	frame := makeWebSocketFrame(payload, true)
+	event := &Event{
+		DataType:  DataTypeWrite,
+		Timestamp: uint64(time.Now().UnixNano()),
+		Pid:       1234,
+		Tid:       5678,
+		DataLen:   int32(len(frame)),
+		Fd:        3,
+	}
+	copy(event.Comm[:], []byte("curl"))
+	copy(event.Data[:], frame)
+
+	str := event.String()
+	if !strings.Contains(str, "websocket frames=1 opcode=binary masked") {
+		t.Fatalf("String() should describe decoded websocket frame, got: %s", str)
+	}
+	if !strings.Contains(str, `{"message":"hello websocket"}`) {
+		t.Fatalf("String() should contain decoded websocket payload, got: %s", str)
+	}
+}
+
+func TestEvent_StringHex_DecodesMaskedWebSocketWrite(t *testing.T) {
+	payload := []byte("hello websocket")
+	frame := makeWebSocketFrame(payload, true)
+	event := &Event{
+		DataType:  DataTypeWrite,
+		Timestamp: uint64(time.Now().UnixNano()),
+		Pid:       1234,
+		DataLen:   int32(len(frame)),
+	}
+	copy(event.Data[:], frame)
+
+	hex := event.StringHex()
+	if !strings.Contains(hex, "websocket frames=1 opcode=binary masked") {
+		t.Fatalf("StringHex() should describe decoded websocket frame, got: %s", hex)
+	}
+	normalized := strings.NewReplacer(" ", "", "\n", "", "\t", "").Replace(hex)
+	if !strings.Contains(normalized, "68656C6C6F20776562736F636B6574") {
+		t.Fatalf("StringHex() should contain decoded websocket payload bytes, got: %s", hex)
+	}
+}
+
+func TestEvent_String_DecodesUnmaskedWebSocketRead(t *testing.T) {
+	payload := []byte("server says hi")
+	frame := makeWebSocketFrame(payload, false)
+	event := &Event{
+		DataType:  DataTypeRead,
+		Timestamp: uint64(time.Now().UnixNano()),
+		Pid:       1234,
+		Tid:       5678,
+		DataLen:   int32(len(frame)),
+		Fd:        3,
+	}
+	copy(event.Comm[:], []byte("curl"))
+	copy(event.Data[:], frame)
+
+	str := event.String()
+	if !strings.Contains(str, "websocket frames=1 opcode=binary unmasked") {
+		t.Fatalf("String() should describe decoded websocket read frame, got: %s", str)
+	}
+	if !strings.Contains(str, "server says hi") {
+		t.Fatalf("String() should contain decoded server websocket payload, got: %s", str)
+	}
+}
+
+func TestEvent_String_DoesNotDecodeUnmaskedWebSocketWrite(t *testing.T) {
+	payload := []byte("client frame should stay raw")
+	frame := makeWebSocketFrame(payload, false)
+	event := &Event{
+		DataType:  DataTypeWrite,
+		Timestamp: uint64(time.Now().UnixNano()),
+		Pid:       1234,
+		DataLen:   int32(len(frame)),
+	}
+	copy(event.Data[:], frame)
+
+	str := event.String()
+	if strings.Contains(str, "websocket frames=") {
+		t.Fatalf("String() should not decode unmasked websocket writes, got: %s", str)
 	}
 }
 

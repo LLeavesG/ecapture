@@ -198,9 +198,13 @@ func (e *Event) String() string {
 		direction = "READ"
 	}
 
-	dataStr := string(e.GetData())
+	dataBytes, displaySummary := e.displayData()
+	dataStr := string(dataBytes)
+	if displaySummary != "" {
+		displaySummary = ", " + displaySummary
+	}
 
-	return fmt.Sprintf("[%s] PID:%d TID:%d Comm:%s FD:%d SSL:0x%x BIO:0x%x %s (%s):\n%s",
+	return fmt.Sprintf("[%s] PID:%d TID:%d Comm:%s FD:%d SSL:0x%x BIO:0x%x %s (%s%s):\n%s",
 		e.eventTime().Format("2006-01-02 15:04:05.000"),
 		e.Pid,
 		e.Tid,
@@ -210,6 +214,7 @@ func (e *Event) String() string {
 		e.BIOAddr,
 		direction,
 		e.captureSummary(),
+		displaySummary,
 		dataStr,
 	)
 }
@@ -221,9 +226,13 @@ func (e *Event) StringHex() string {
 		direction = "READ"
 	}
 
-	hexData := dumpByteSlice(e.GetData(), "")
+	dataBytes, displaySummary := e.displayData()
+	hexData := dumpByteSlice(dataBytes, "")
+	if displaySummary != "" {
+		displaySummary = ", " + displaySummary
+	}
 
-	return fmt.Sprintf("[%s] PID:%d TID:%d Comm:%s FD:%d SSL:0x%x BIO:0x%x %s (%s, hex):\n%s",
+	return fmt.Sprintf("[%s] PID:%d TID:%d Comm:%s FD:%d SSL:0x%x BIO:0x%x %s (%s%s, hex):\n%s",
 		e.eventTime().Format("2006-01-02 15:04:05.000"),
 		e.Pid,
 		e.Tid,
@@ -233,6 +242,7 @@ func (e *Event) StringHex() string {
 		e.BIOAddr,
 		direction,
 		e.captureSummary(),
+		displaySummary,
 		hexData,
 	)
 }
@@ -397,6 +407,14 @@ func (e *Event) GetTimestamp() uint64 {
 // IsRead returns true if this is a read (receive) event.
 func (e *Event) IsRead() bool {
 	return e.DataType == DataTypeRead
+}
+
+func (e *Event) displayData() ([]byte, string) {
+	data := e.GetData()
+	if decoded, summary, ok := decodeWebSocketForDisplay(data, e.DataType); ok {
+		return decoded, summary
+	}
+	return data, ""
 }
 
 // commToString converts a null-terminated byte array to a string.
