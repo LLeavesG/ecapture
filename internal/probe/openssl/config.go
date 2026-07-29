@@ -43,6 +43,26 @@ type Config struct {
 	*config.BaseConfig
 	OpensslPath string `json:"opensslpath"` // Path to libssl.so
 
+	// Per-application capture profile and runtime overrides.
+	ProfilePath          string                 `json:"profile_path,omitempty"`
+	ProfileName          string                 `json:"profile_name,omitempty"`
+	PackageName          string                 `json:"package_name,omitempty"`
+	OpensslPathPattern   string                 `json:"openssl_path_glob,omitempty"`
+	OpensslBuildID       string                 `json:"openssl_build_id,omitempty"`
+	CaptureStrategies    []string               `json:"capture_strategies,omitempty"`
+	Ifnames              []string               `json:"ifnames,omitempty"`
+	StrictAttribution    bool                   `json:"strict_attribution,omitempty"`
+	UnknownFlowPolicy    string                 `json:"unknown_flow_policy,omitempty"`
+	StructOffsets        map[string]uint64      `json:"struct_offsets,omitempty"`
+	HookOverrides        map[string]HookProfile `json:"hook_overrides,omitempty"`
+	ApplicationDataHooks []ApplicationDataHook  `json:"application_data_hooks,omitempty"`
+	StructOffsetSpecs    []string               `json:"-"`
+	HookSpecs            []string               `json:"-"`
+	profileApplied       bool
+	applicationProfile   *ApplicationProfile
+	packageVersionName   string
+	packageVersionCode   uint64
+
 	// Capture mode configuration
 	CaptureMode string `json:"capturemode"` // "text", "keylog", or "pcap"
 	KeylogFile  string `json:"keylogfile"`  // Path to keylog file (for keylog mode)
@@ -64,13 +84,20 @@ type Config struct {
 // NewConfig creates a new OpenSSL probe configuration.
 func NewConfig() *Config {
 	return &Config{
-		BaseConfig:  config.NewBaseConfig(),
-		CaptureMode: "text", // Default to text mode
+		BaseConfig:        config.NewBaseConfig(),
+		CaptureMode:       handlers.ModeText,
+		UnknownFlowPolicy: UnknownFlowInclude,
+		StructOffsets:     make(map[string]uint64),
+		HookOverrides:     make(map[string]HookProfile),
 	}
 }
 
 // Validate checks if the configuration is valid.
 func (c *Config) Validate() error {
+	if err := c.prepareApplicationProfile(); err != nil {
+		return errors.NewConfigurationError("application profile validation failed", err)
+	}
+
 	if err := c.BaseConfig.Validate(); err != nil {
 		return errors.NewConfigurationError("openssl config validation failed", err)
 	}
@@ -79,10 +106,18 @@ func (c *Config) Validate() error {
 	if err := c.detectOpenSSL(); err != nil {
 		return errors.NewConfigurationError("openssl detection failed", err)
 	}
+	if c.OpensslBuildID != "" {
+		if err := verifyELFBuildID(c.OpensslPath, c.OpensslBuildID); err != nil {
+			return errors.NewConfigurationError("TLS library build ID validation failed", err)
+		}
+	}
 
 	// Detect version (platform-specific)
 	if err := c.detectOS(); err != nil {
 		return errors.NewConfigurationError("openssl version detection failed", err)
+	}
+	if err := c.validateApplicationMatch(); err != nil {
+		return errors.NewConfigurationError("application profile does not match target", err)
 	}
 
 	if err := c.getSslBpfFile(c.OpensslPath, c.SslVersion); err != nil {
@@ -94,7 +129,11 @@ func (c *Config) Validate() error {
 	}
 
 	// Set default interface name if needed (Android-specific)
+	if handlers.IsModeAll(strings.ToLower(c.CaptureMode)) && c.Ifname == "" && len(c.Ifnames) == 0 {
+		c.Ifnames = []string{"all"}
+	}
 	c.setDefaultIfname()
+	c.normalizeInterfaces()
 
 	// Validate cgroup path (platform-specific, Linux only)
 	if err := c.validateCgroupPath(); err != nil {
@@ -142,14 +181,18 @@ func (c *Config) validateCaptureMode() error {
 			return fmt.Errorf("keylog directory does not exist: %s", dir)
 		}
 		return nil
-	case handlers.ModePcap, handlers.ModePcapng:
+	case handlers.ModePcap, handlers.ModePcapng, handlers.ModeAll, handlers.ModeHybrid:
 		// Pcap mode requires pcap file path and network interface
-		c.CaptureMode = handlers.ModePcap
-		if c.PcapFile == "" {
-			return fmt.Errorf("pcap mode requires PcapFile to be set")
+		if mode == handlers.ModePcapng {
+			c.CaptureMode = handlers.ModePcap
+		} else if mode == handlers.ModeHybrid {
+			c.CaptureMode = handlers.ModeAll
 		}
-		if c.Ifname == "" {
-			return fmt.Errorf("pcap mode requires Ifname (network interface) to be set")
+		if c.PcapFile == "" {
+			return fmt.Errorf("%s mode requires PcapFile to be set", c.CaptureMode)
+		}
+		if len(c.Ifnames) == 0 {
+			return fmt.Errorf("%s mode requires at least one network interface", c.CaptureMode)
 		}
 		// Check if pcap directory exists
 		dir := filepath.Dir(c.PcapFile)
@@ -158,7 +201,7 @@ func (c *Config) validateCaptureMode() error {
 		}
 
 		// Validate network interface exists
-		if err := c.validateNetworkInterface(); err != nil {
+		if err := c.validateNetworkInterfaces(); err != nil {
 			return err
 		}
 
@@ -169,7 +212,7 @@ func (c *Config) validateCaptureMode() error {
 
 		return nil
 	default:
-		return fmt.Errorf("unsupported capture mode: %s (supported: text, keylog, pcap)", mode)
+		return fmt.Errorf("unsupported capture mode: %s (supported: text, keylog, pcap, all)", mode)
 	}
 }
 
@@ -210,12 +253,18 @@ func (c *Config) validateNetworkInterface() error {
 		return fmt.Errorf("network interface '%s' is not up", c.Ifname)
 	}
 
-	addrs, err := iface.Addrs() // Just to check if we can access interface addresses (basic functionality check)
-	if err != nil {
-		return fmt.Errorf("cannot access addresses for interface '%s': %w", c.Ifname, err)
-	}
-	if len(addrs) == 0 {
-		return fmt.Errorf("network interface '%s' has no addresses", c.Ifname)
+	return nil
+}
+
+func (c *Config) validateNetworkInterfaces() error {
+	for _, ifname := range c.Interfaces() {
+		original := c.Ifname
+		c.Ifname = ifname
+		err := c.validateNetworkInterface()
+		c.Ifname = original
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -234,10 +283,12 @@ func (c *Config) checkTCSupport() error {
 		return fmt.Errorf("network device management not available: /sys/class/net not found")
 	}
 
-	// Check if the interface exists in sysfs
-	ifacePath := filepath.Join("/sys/class/net", c.Ifname)
-	if _, err := os.Stat(ifacePath); os.IsNotExist(err) {
-		return fmt.Errorf("network interface '%s' not found in sysfs", c.Ifname)
+	// Check if every selected interface exists in sysfs.
+	for _, ifname := range c.Interfaces() {
+		ifacePath := filepath.Join("/sys/class/net", ifname)
+		if _, err := os.Stat(ifacePath); os.IsNotExist(err) {
+			return fmt.Errorf("network interface '%s' not found in sysfs", ifname)
+		}
 	}
 
 	// Note: Full TC classifier support validation (qdisc clsact, eBPF TC programs, etc.)
@@ -267,7 +318,9 @@ func (c *Config) getSslBpfFile(soPath, sslVersion string) error {
 	defer func() {
 		if strings.Contains(c.SslBpfFile, "boringssl") {
 			c.IsBoringSSL = true
-			c.MasterHookFuncs = []string{MasterKeyHookFuncBoringSSL}
+			if len(c.MasterHookFuncs) == 0 {
+				c.MasterHookFuncs = []string{MasterKeyHookFuncBoringSSL}
+			}
 		}
 
 		if len(c.MasterHookFuncs) == 0 {

@@ -232,6 +232,7 @@ https://github.com/user-attachments/assets/c8b7a84d-58eb-4fdb-9843-f775c97bdbfb
 - [**防御与检测**](docs/defense-detection.md) — 如何检测和防御未经授权的使用
 - [**性能基准测试**](docs/performance-benchmarks.md) — 性能开销测量方法与预期特征
 - [**发布验证**](docs/release-verification.md) — 如何验证发布产物的完整性
+- [**应用抓包画像**](docs/application-profiles.md) — 按应用配置策略、Hook、网卡和运行时 TLS 偏移
 
 # 贡献
 

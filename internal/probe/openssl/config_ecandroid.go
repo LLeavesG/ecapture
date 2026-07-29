@@ -21,15 +21,17 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 )
 
 const (
 	// Android-specific default paths
-	DefaultLibcPath    = "/apex/com.android.runtime/lib64/bionic/libc.so"
-	BuildPropPath      = "/system/build.prop"
-	ReleasePrefix      = "ro.build.version.release="
-	DefaultIfname      = "wlan0"
+	DefaultLibcPath = "/apex/com.android.runtime/lib64/bionic/libc.so"
+	BuildPropPath   = "/system/build.prop"
+	ReleasePrefix   = "ro.build.version.release="
+	DefaultIfname   = "wlan0"
 )
 
 // Android-specific version of detectOpenSSL
@@ -76,13 +78,107 @@ func (c *Config) detectOS() error {
 	// Detect Android version from build.prop
 	androidVer, err := detectAndroidVersion()
 	if err == nil && androidVer != "" {
-		c.SslVersion = fmt.Sprintf("boringssl_a_%s", androidVer)
 		c.AndroidVer = androidVer
+		if c.SslVersion == "" {
+			c.SslVersion = fmt.Sprintf("boringssl_a_%s", androidVer)
+		}
 	} else {
-		c.IsBoringSSL = false
+		if err == nil {
+			err = fmt.Errorf("Android version is empty")
+		}
+		return fmt.Errorf("detect Android version: %w", err)
 	}
 
 	return nil
+}
+
+func resolvePackageUID(packageName string) (uint64, error) {
+	output, commandErr := exec.Command(
+		"/system/bin/cmd", "package", "list", "packages", "-U", packageName,
+	).Output()
+	if commandErr == nil {
+		prefix := "package:" + packageName
+		sc := bufio.NewScanner(strings.NewReader(string(output)))
+		for sc.Scan() {
+			fields := strings.Fields(sc.Text())
+			if len(fields) < 2 || fields[0] != prefix {
+				continue
+			}
+			for _, field := range fields[1:] {
+				if !strings.HasPrefix(field, "uid:") {
+					continue
+				}
+				uid, err := strconv.ParseUint(strings.TrimPrefix(field, "uid:"), 10, 64)
+				if err != nil {
+					return 0, fmt.Errorf("parse UID for package %q: %w", packageName, err)
+				}
+				return uid, nil
+			}
+		}
+		if err := sc.Err(); err != nil {
+			commandErr = err
+		}
+	}
+
+	// Older Android releases may not support `cmd package ... -U`. Keep the
+	// package-list parser as a fallback, although modern SELinux policy can
+	// deny direct access even to a Magisk-root process.
+	f, err := os.Open("/data/system/packages.list")
+	if err != nil {
+		if commandErr != nil {
+			return 0, fmt.Errorf("query package manager: %v; open Android package list: %w",
+				commandErr, err)
+		}
+		return 0, fmt.Errorf("Android package %q not found via package manager; open package list: %w",
+			packageName, err)
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 2 || fields[0] != packageName {
+			continue
+		}
+		uid, parseErr := strconv.ParseUint(fields[1], 10, 64)
+		if parseErr != nil {
+			return 0, fmt.Errorf("parse UID for package %q: %w", packageName, parseErr)
+		}
+		return uid, nil
+	}
+	if err := sc.Err(); err != nil {
+		return 0, fmt.Errorf("read Android package list: %w", err)
+	}
+	return 0, fmt.Errorf("Android package %q not found", packageName)
+}
+
+func resolvePackageVersion(packageName string) (string, uint64, error) {
+	output, err := exec.Command("/system/bin/dumpsys", "package", packageName).Output()
+	if err != nil {
+		return "", 0, fmt.Errorf("query Android package %q: %w", packageName, err)
+	}
+	var versionName string
+	var versionCode uint64
+	sc := bufio.NewScanner(strings.NewReader(string(output)))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		switch {
+		case strings.HasPrefix(line, "versionName="):
+			versionName = strings.TrimSpace(strings.TrimPrefix(line, "versionName="))
+		case strings.HasPrefix(line, "versionCode="):
+			value := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "versionCode=")))
+			if len(value) != 0 {
+				versionCode, _ = strconv.ParseUint(value[0], 10, 64)
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", 0, fmt.Errorf("read Android package version for %q: %w", packageName, err)
+	}
+	if versionName == "" && versionCode == 0 {
+		return "", 0, fmt.Errorf("Android package version for %q not found", packageName)
+	}
+	return versionName, versionCode, nil
 }
 
 // detectAndroidVersion reads the Android version from build.prop

@@ -40,6 +40,8 @@ import (
 	"github.com/gojue/ecapture/pkg/util/kernel"
 )
 
+const offsetHookPlaceholder = "__ecapture_offset__"
+
 // Probe implements the OpenSSL TLS tracing probe.
 // Supports Text mode, Keylog mode, and Pcap mode.
 type Probe struct {
@@ -132,6 +134,9 @@ func (p *Probe) Start(ctx context.Context) error {
 	// Initialize eBPF manager
 	if err := p.bpfManager.InitWithOptions(bytes.NewReader(byteBuf), p.getManagerOptions()); err != nil {
 		return errors.NewEBPFLoadError("openssl manager init", err)
+	}
+	if err := p.configureApplicationDataHooks(); err != nil {
+		return errors.NewConfigurationError("configure application data hooks", err)
 	}
 
 	// Start eBPF manager
@@ -243,7 +248,8 @@ func (p *Probe) setupManagerText() error {
 	p.mapNameToDecoder["tls_events"] = &tlsEventDecoder{probe: p}
 	p.mapNameToDecoder["connect_events"] = &connectDecoder{probe: p}
 
-	// TEXT mode: Only SSL_read/SSL_write probes for data capture
+	// TEXT mode: SSL_read/SSL_write probes for data capture, with hook points
+	// optionally replaced by an application profile.
 	probes = []*manager.Probe{
 		{
 			Section:          "uprobe/SSL_write",
@@ -348,26 +354,48 @@ func (p *Probe) setupManagerText() error {
 			UID:              "uprobe_ssl_set_wfd",
 		},
 	}
+	probes = p.applyHookOverrides(probes)
 
-	hasQuicAPI, symbolErr := elfHasDynamicSymbol(opensslPath, "SSL_provide_quic_data")
-	if symbolErr != nil {
-		p.Logger().Debug().
-			Err(symbolErr).
-			Str("symbol", "SSL_provide_quic_data").
-			Msg("Unable to inspect optional QUIC symbol")
-	} else if hasQuicAPI {
-		maps = append(maps, &manager.Map{Name: "quic_events"})
-		p.mapNameToDecoder["quic_events"] = &quicEventDecoder{}
-		probes = append(probes, &manager.Probe{
-			Section:          "uprobe/SSL_provide_quic_data",
-			EbpfFuncName:     "probe_SSL_provide_quic_data",
-			AttachToFuncName: "SSL_provide_quic_data",
-			BinaryPath:       opensslPath,
-			UID:              "uprobe_ssl_provide_quic_data",
-		})
-		p.Logger().Info().
-			Str("symbol", "SSL_provide_quic_data").
-			Msg("QUIC handshake detection enabled; HTTP/3 application data bypasses SSL_read/SSL_write")
+	if p.config.HasStrategy(StrategyQUICMetadata) {
+		quicHook, configured := p.config.HookOverride(HookSSLProvideQUIC)
+		hasQuicAPI := false
+		var symbolErr error
+		if configured {
+			hasQuicAPI = !quicHook.Disabled
+		} else {
+			hasQuicAPI, symbolErr = elfHasDynamicSymbol(opensslPath, "SSL_provide_quic_data")
+		}
+		if symbolErr != nil {
+			p.Logger().Debug().
+				Err(symbolErr).
+				Str("symbol", "SSL_provide_quic_data").
+				Msg("Unable to inspect optional QUIC symbol")
+		} else if hasQuicAPI {
+			probe := &manager.Probe{
+				Section:          "uprobe/SSL_provide_quic_data",
+				EbpfFuncName:     "probe_SSL_provide_quic_data",
+				AttachToFuncName: "SSL_provide_quic_data",
+				BinaryPath:       opensslPath,
+				UID:              "uprobe_ssl_provide_quic_data",
+			}
+			if configured {
+				applyHookToProbe(probe, quicHook)
+			}
+			maps = append(maps, &manager.Map{Name: "quic_events"})
+			p.mapNameToDecoder["quic_events"] = &quicEventDecoder{}
+			probes = append(probes, probe)
+			p.Logger().Info().
+				Str("symbol", probe.AttachToFuncName).
+				Uint64("offset", probe.UAddress).
+				Msg("QUIC handshake detection enabled; HTTP/3 application data bypasses SSL_read/SSL_write")
+		}
+	}
+
+	if !p.config.HasStrategy(StrategyTLSPlaintext) {
+		probes = keepHookRoles(probes, HookSSLProvideQUIC)
+		maps = removeManagerMaps(maps, "tls_events", "connect_events")
+		delete(p.mapNameToDecoder, "tls_events")
+		delete(p.mapNameToDecoder, "connect_events")
 	}
 
 	p.bpfManager = &manager.Manager{
@@ -377,85 +405,179 @@ func (p *Probe) setupManagerText() error {
 	return nil
 }
 
+func (p *Probe) applyHookOverrides(probes []*manager.Probe) []*manager.Probe {
+	filtered := probes[:0]
+	for _, probe := range probes {
+		role := hookRoleForProbe(probe)
+		if role == "" {
+			filtered = append(filtered, probe)
+			continue
+		}
+		hook, configured := p.config.HookOverride(role)
+		if !configured {
+			filtered = append(filtered, probe)
+			continue
+		}
+		if hook.Disabled {
+			p.Logger().Info().Str("hook_role", role).Msg("Application profile disabled TLS hook")
+			continue
+		}
+		applyHookToProbe(probe, hook)
+		filtered = append(filtered, probe)
+		p.Logger().Info().
+			Str("hook_role", role).
+			Str("symbol", probe.AttachToFuncName).
+			Uint64("offset", probe.UAddress).
+			Msg("Applied application-specific TLS hook")
+	}
+	return filtered
+}
+
+func applyHookToProbe(probe *manager.Probe, hook HookProfile) {
+	if hook.Offset != 0 {
+		// ebpfmanager v0.5 requires a non-empty function name even when
+		// cilium/ebpf's explicit Address option takes precedence.
+		probe.AttachToFuncName = offsetHookPlaceholder
+		probe.UAddress = uint64(hook.Offset)
+		return
+	}
+	if hook.Symbol != "" {
+		probe.AttachToFuncName = hook.Symbol
+		probe.UAddress = 0
+	}
+}
+
+func hookRoleForProbe(probe *manager.Probe) string {
+	switch probe.EbpfFuncName {
+	case "probe_entry_SSL_read", "probe_ret_SSL_read":
+		return HookSSLRead
+	case "probe_entry_SSL_write", "probe_ret_SSL_write":
+		return HookSSLWrite
+	}
+	switch probe.UID {
+	case "uprobe_ssl_set_fd":
+		return HookSSLSetFD
+	case "uprobe_ssl_set_rfd":
+		return HookSSLSetRFD
+	case "uprobe_ssl_set_wfd":
+		return HookSSLSetWFD
+	case "uprobe_ssl_provide_quic_data":
+		return HookSSLProvideQUIC
+	}
+	return ""
+}
+
+func removeHookRoles(probes []*manager.Probe, roles ...string) []*manager.Probe {
+	remove := make(map[string]struct{}, len(roles))
+	for _, role := range roles {
+		remove[role] = struct{}{}
+	}
+	filtered := probes[:0]
+	for _, probe := range probes {
+		if _, found := remove[hookRoleForProbe(probe)]; found {
+			continue
+		}
+		filtered = append(filtered, probe)
+	}
+	return filtered
+}
+
+func keepHookRoles(probes []*manager.Probe, roles ...string) []*manager.Probe {
+	keep := make(map[string]struct{}, len(roles))
+	for _, role := range roles {
+		keep[role] = struct{}{}
+	}
+	filtered := probes[:0]
+	for _, probe := range probes {
+		if _, found := keep[hookRoleForProbe(probe)]; found {
+			filtered = append(filtered, probe)
+		}
+	}
+	return filtered
+}
+
+func removeManagerMaps(maps []*manager.Map, names ...string) []*manager.Map {
+	remove := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		remove[name] = struct{}{}
+	}
+	filtered := maps[:0]
+	for _, current := range maps {
+		if _, found := remove[current.Name]; found {
+			continue
+		}
+		filtered = append(filtered, current)
+	}
+	return filtered
+}
+
 func (p *Probe) setupManagerPcapNG() error {
-	opensslPath := p.config.OpensslPath
 	var probes []*manager.Probe
 	var maps []*manager.Map
 	// PCAP mode: TC probes for network capture + master secret probe
 	// Validate network interface is configured
-	if p.config.Ifname == "" {
-		return errors.NewConfigurationError("ifname is required for pcap mode", nil)
+	interfaces := p.config.Interfaces()
+	if len(interfaces) == 0 {
+		return errors.NewConfigurationError("at least one interface is required for pcap mode", nil)
 	}
-	// Master secret events map for keylog in pcapng
-	maps = append(maps, &manager.Map{Name: "mastersecret_events"})
-	p.mapNameToDecoder["mastersecret_events"] = &masterSecretEventDecoder{}
-
-	// Add TC (Traffic Control) classifier probes for packet capture
-	// Ingress: packets coming into the network interface
-	probes = append(probes,
-		&manager.Probe{
+	// Add ingress and egress TC classifiers to every selected interface.
+	for _, ifname := range interfaces {
+		probes = append(probes, &manager.Probe{
 			Section:          "classifier",
 			EbpfFuncName:     base.TcFuncNameIngress,
-			Ifname:           p.config.Ifname,
+			Ifname:           ifname,
 			NetworkDirection: manager.Ingress,
-		},
-	)
-
-	// Egress: packets going out of the network interface
-	probes = append(probes,
-		&manager.Probe{
+			UID:              "tc_ingress_" + ifname,
+			CopyProgram:      true,
+		})
+		probes = append(probes, &manager.Probe{
 			Section:          "classifier",
 			EbpfFuncName:     base.TcFuncNameEgress,
-			Ifname:           p.config.Ifname,
+			Ifname:           ifname,
 			NetworkDirection: manager.Egress,
+			UID:              "tc_egress_" + ifname,
+			CopyProgram:      true,
+		})
+	}
+
+	// TC programs run outside process context, so ingress packets generally
+	// cannot be attributed with bpf_get_current_pid_tgid(). Record each
+	// TCP/UDP socket's tuple while sendmsg still runs in the caller's context,
+	// then let both TC directions look it up in network_map.
+	probes = append(probes,
+		&manager.Probe{
+			Section:          "kprobe/tcp_sendmsg",
+			EbpfFuncName:     "tcp_sendmsg",
+			AttachToFuncName: "tcp_sendmsg",
+			UID:              "kprobe_tc_tcp_sendmsg",
+		},
+		&manager.Probe{
+			Section:          "kprobe/udp_sendmsg",
+			EbpfFuncName:     "udp_sendmsg",
+			AttachToFuncName: "udp_sendmsg",
+			UID:              "kprobe_tc_udp_sendmsg",
 		},
 	)
 
 	// Add TC-related maps for network packet capture
 	maps = append(maps, &manager.Map{Name: "skb_events"})
 	p.mapNameToDecoder["skb_events"] = &packetEventDecoder{}
-	p.mapNameToDecoder["mastersecret_events"] = &masterSecretEventDecoder{}
 
 	// These maps don't need decoders (used internally by eBPF)
 	maps = append(maps, &manager.Map{Name: "skb_data_buffer_heap"})
 	maps = append(maps, &manager.Map{Name: "network_map"})
 
-	p.Logger().Info().Str("ifname", p.config.Ifname).Int("decoder", len(p.mapNameToDecoder)).Msg("Configuring TC probes for network capture in pcapng mode")
+	p.Logger().Info().Strs("interfaces", interfaces).Int("decoder", len(p.mapNameToDecoder)).Msg("Configuring TC probes for network capture in pcapng mode")
 
-	// Add master secret extraction
-	p.Logger().Info().Strs("keylog_hook_funcs", p.config.MasterHookFuncs).Msg("Configuring master secret extraction probes for pcapNG mode")
-	if p.config.IsBoringSSL {
-		maps = append(maps, &manager.Map{Name: "bssl_do_handshake_map"})
-		for _, masterFunc := range p.config.MasterHookFuncs {
-			probes = append(probes, &manager.Probe{
-				Section:          "uprobe/bssl_do_handshake",
-				EbpfFuncName:     "uprobe_bssl_do_handshake",
-				AttachToFuncName: masterFunc,
-				BinaryPath:       opensslPath,
-				UID:              fmt.Sprintf("uprobe_bssl_hs_%s", masterFunc),
-			})
-			probes = append(probes, &manager.Probe{
-				Section:          "uretprobe/bssl_do_handshake",
-				EbpfFuncName:     "uretprobe_bssl_do_handshake",
-				AttachToFuncName: masterFunc,
-				BinaryPath:       opensslPath,
-				UID:              fmt.Sprintf("uretprobe_bssl_hs_%s", masterFunc),
-			})
-		}
-	} else {
-		for _, masterFunc := range p.config.MasterHookFuncs {
-			probes = append(probes, &manager.Probe{
-				Section:          "uprobe/SSL_write_key",
-				EbpfFuncName:     "probe_ssl_master_key",
-				AttachToFuncName: masterFunc,
-				BinaryPath:       opensslPath,
-				UID:              fmt.Sprintf("uprobe_smk_%s", masterFunc),
-			})
-		}
+	captureKeys := p.config.HasStrategy(StrategyTLSKeys)
+	if captureKeys {
+		probes, maps = p.appendMasterSecretProbes(probes, maps)
+		p.Logger().Info().Strs("keylog_hook_funcs", p.config.MasterHookFuncs).
+			Msg("Configuring master secret extraction probes for pcapNG mode")
 	}
 
 	keylogFile := p.config.GetKeylogFile()
-	if keylogFile != "" {
+	if captureKeys && keylogFile != "" {
 		keylogFileWriter, err := writers.NewFileWriter(writers.FileWriterConfig{
 			Path:       keylogFile,
 			BufferSize: 0,
@@ -492,7 +614,9 @@ func (p *Probe) setupManagerPcapNG() error {
 		return fmt.Errorf("failed to create pcap writer: %w", err)
 	}
 
-	pcapHandler, err := handlers.NewPcapHandler(pcapWriter, p.config.Ifname, p.config.PcapFilter, p.Logger())
+	pcapHandler, err := handlers.NewPcapHandlerInterfaces(
+		pcapWriter, p.config.Interfaces(), p.config.PcapFilter, p.Logger(),
+	)
 	if err != nil {
 		_ = pcapWriter.Close()
 		return fmt.Errorf("failed to create pcap handler: %w", err)
@@ -508,12 +632,14 @@ func (p *Probe) setupManagerPcapNG() error {
 	//p.Logger().Info().Str("Writer", pcapWriter.Name()).Msg("Pcap handler registered")
 
 	// Pcapng 的 Keylog writer
-	pcapKeylogWriter := writers.NewPcapKeylogWriter(pcapHandler.PcapWriter())
-	pcapKeylogHandler := handlers.NewKeylogHandler(pcapKeylogWriter)
-	if err := p.BaseProbe.Dispatcher().Register(pcapKeylogHandler); err != nil {
-		_ = pcapHandler.Close()
-		_ = pcapWriter.Close()
-		return fmt.Errorf("failed to register pcapkeylog handler: %w", err)
+	if captureKeys {
+		pcapKeylogWriter := writers.NewPcapKeylogWriter(pcapHandler.PcapWriter())
+		pcapKeylogHandler := handlers.NewKeylogHandler(pcapKeylogWriter)
+		if err := p.BaseProbe.Dispatcher().Register(pcapKeylogHandler); err != nil {
+			_ = pcapHandler.Close()
+			_ = pcapWriter.Close()
+			return fmt.Errorf("failed to register pcapkeylog handler: %w", err)
+		}
 	}
 	// Note: pcapKeylogWriter will be closed through pcapKeylogHandler.Close()
 	// Don't add it to p.closer to avoid double-close
@@ -526,6 +652,44 @@ func (p *Probe) setupManagerPcapNG() error {
 		Maps:   maps,
 	}
 	return nil
+}
+
+func (p *Probe) appendMasterSecretProbes(
+	probes []*manager.Probe, maps []*manager.Map,
+) ([]*manager.Probe, []*manager.Map) {
+	opensslPath := p.config.OpensslPath
+	maps = appendUniqueManagerMaps(maps, &manager.Map{Name: "mastersecret_events"})
+	p.mapNameToDecoder["mastersecret_events"] = &masterSecretEventDecoder{}
+	if p.config.IsBoringSSL {
+		maps = appendUniqueManagerMaps(maps, &manager.Map{Name: "bssl_do_handshake_map"})
+		for _, masterFunc := range p.config.MasterHookFuncs {
+			probes = append(probes, &manager.Probe{
+				Section:          "uprobe/bssl_do_handshake",
+				EbpfFuncName:     "uprobe_bssl_do_handshake",
+				AttachToFuncName: masterFunc,
+				BinaryPath:       opensslPath,
+				UID:              fmt.Sprintf("uprobe_bssl_hs_%s", masterFunc),
+			})
+			probes = append(probes, &manager.Probe{
+				Section:          "uretprobe/bssl_do_handshake",
+				EbpfFuncName:     "uretprobe_bssl_do_handshake",
+				AttachToFuncName: masterFunc,
+				BinaryPath:       opensslPath,
+				UID:              fmt.Sprintf("uretprobe_bssl_hs_%s", masterFunc),
+			})
+		}
+		return probes, maps
+	}
+	for _, masterFunc := range p.config.MasterHookFuncs {
+		probes = append(probes, &manager.Probe{
+			Section:          "uprobe/SSL_write_key",
+			EbpfFuncName:     "probe_ssl_master_key",
+			AttachToFuncName: masterFunc,
+			BinaryPath:       opensslPath,
+			UID:              fmt.Sprintf("uprobe_smk_%s", masterFunc),
+		})
+	}
+	return probes, maps
 }
 
 func (p *Probe) setupManagerKeyLog() error {
@@ -614,6 +778,17 @@ func (p *Probe) setupManager() error {
 		err = p.setupManagerKeyLog()
 	case handlers.ModePcap, handlers.ModePcapng:
 		err = p.setupManagerPcapNG()
+	case handlers.ModeAll, handlers.ModeHybrid:
+		err = p.setupManagerAll()
+	}
+	if err == nil && p.config.HasApplicationDataStrategy() {
+		probes, maps := p.appendApplicationDataProbes(
+			p.bpfManager.Probes, p.bpfManager.Maps,
+		)
+		p.bpfManager.Probes = probes
+		p.bpfManager.Maps = maps
+	}
+	if handlers.IsModePcapng(p.config.CaptureMode) {
 		if err == nil && p.config.PcapFilter != "" {
 			p.Logger().Info().Str("filter", p.config.PcapFilter).Msg("Applying BPF filter to TC probes")
 			ebpfFuncs := []string{base.TcFuncNameIngress, base.TcFuncNameEgress}
@@ -635,6 +810,132 @@ func (p *Probe) setupManager() error {
 	}
 
 	return nil
+}
+
+func (p *Probe) setupManagerAll() error {
+	var probes []*manager.Probe
+	var maps []*manager.Map
+
+	mergeCurrent := func() {
+		probes = append(probes, p.bpfManager.Probes...)
+		maps = appendUniqueManagerMaps(maps, p.bpfManager.Maps...)
+	}
+
+	if p.config.HasStrategy(StrategyRawPackets) {
+		if err := p.setupManagerPcapNG(); err != nil {
+			return err
+		}
+		mergeCurrent()
+	} else if p.config.HasStrategy(StrategyTLSKeys) {
+		if err := p.setupManagerKeyLog(); err != nil {
+			return err
+		}
+		mergeCurrent()
+	}
+
+	if p.config.HasStrategy(StrategyTLSPlaintext) || p.config.HasStrategy(StrategyQUICMetadata) {
+		if err := p.setupManagerText(); err != nil {
+			return err
+		}
+		mergeCurrent()
+	}
+
+	if len(probes) == 0 && !p.config.HasApplicationDataStrategy() {
+		return errors.NewConfigurationError("all mode has no enabled capture strategies", nil)
+	}
+	p.bpfManager = &manager.Manager{Probes: probes, Maps: maps}
+	return nil
+}
+
+func (p *Probe) appendApplicationDataProbes(
+	probes []*manager.Probe, maps []*manager.Map,
+) ([]*manager.Probe, []*manager.Map) {
+	hooks := p.config.EnabledApplicationDataHooks()
+	hookNames := make([]string, 0, len(hooks))
+	for slot, hook := range hooks {
+		hookNames = append(hookNames, hook.Name)
+		entry := &manager.Probe{
+			Section:      fmt.Sprintf("uprobe/app_data_%d", slot),
+			EbpfFuncName: fmt.Sprintf("probe_entry_app_data_%d", slot),
+			BinaryPath:   hook.ResolvedLibrary(),
+			UID:          fmt.Sprintf("uprobe_app_data_%d", slot),
+		}
+		applyApplicationDataHookTarget(entry, hook)
+		probes = append(probes, entry)
+		if hook.CaptureOn == AppDataCaptureReturn {
+			ret := &manager.Probe{
+				Section:      fmt.Sprintf("uretprobe/app_data_%d", slot),
+				EbpfFuncName: fmt.Sprintf("probe_ret_app_data_%d", slot),
+				BinaryPath:   hook.ResolvedLibrary(),
+				UID:          fmt.Sprintf("uretprobe_app_data_%d", slot),
+			}
+			applyApplicationDataHookTarget(ret, hook)
+			probes = append(probes, ret)
+		}
+		p.Logger().Info().
+			Int("slot", slot).
+			Str("name", hook.Name).
+			Str("library", hook.ResolvedLibrary()).
+			Str("symbol", entry.AttachToFuncName).
+			Uint64("offset", entry.UAddress).
+			Msg("Configured application data hook")
+	}
+	maps = appendUniqueManagerMaps(maps,
+		&manager.Map{Name: "app_data_events"},
+		&manager.Map{Name: "app_hook_configs"},
+		&manager.Map{Name: "active_app_hooks"},
+		&manager.Map{Name: "app_data_buffer_heap"},
+	)
+	p.mapNameToDecoder["app_data_events"] = &applicationDataEventDecoder{
+		hookNames: hookNames,
+	}
+	return probes, maps
+}
+
+func applyApplicationDataHookTarget(probe *manager.Probe, hook ApplicationDataHook) {
+	if hook.Offset != 0 {
+		probe.AttachToFuncName = offsetHookPlaceholder
+		probe.UAddress = uint64(hook.Offset)
+		return
+	}
+	probe.AttachToFuncName = hook.Symbol
+}
+
+func (p *Probe) configureApplicationDataHooks() error {
+	if !p.config.HasApplicationDataStrategy() {
+		return nil
+	}
+	configMap, found, err := p.bpfManager.GetMap("app_hook_configs")
+	if err != nil {
+		return fmt.Errorf("get app_hook_configs map: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("app_hook_configs map was not loaded")
+	}
+	for slot, hook := range p.config.EnabledApplicationDataHooks() {
+		key := uint32(slot)
+		value := hook.bpfConfig()
+		if err := configMap.Update(&key, &value, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("update app_hook_configs slot %d (%s): %w",
+				slot, hook.Name, err)
+		}
+	}
+	return nil
+}
+
+func appendUniqueManagerMaps(dst []*manager.Map, values ...*manager.Map) []*manager.Map {
+	seen := make(map[string]struct{}, len(dst)+len(values))
+	for _, current := range dst {
+		seen[current.Name] = struct{}{}
+	}
+	for _, current := range values {
+		if _, found := seen[current.Name]; found {
+			continue
+		}
+		seen[current.Name] = struct{}{}
+		dst = append(dst, current)
+	}
+	return dst
 }
 
 // getManagerOptions returns eBPF manager options.
@@ -675,6 +976,18 @@ func (p *Probe) getManagerOptions() manager.Options {
 			{Name: "target_uid", Value: p.config.GetUid()},
 			{Name: "less52", Value: kernelLess52},
 			{Name: "target_cgroup_id", Value: cgroupId},
+			{Name: "tc_unknown_flow_policy", Value: p.config.UnknownFlowPolicyValue()},
+			{Name: "tc_strict_attribution", Value: boolToUint64(p.config.StrictAttribution)},
+		}
+		for _, offsetName := range p.config.SortedStructOffsetNames() {
+			constantName, ok := StructOffsetConstant(offsetName)
+			if !ok {
+				continue
+			}
+			opts.ConstantEditors = append(opts.ConstantEditors, manager.ConstantEditor{
+				Name:  constantName,
+				Value: p.config.StructOffsets[offsetName],
+			})
 		}
 	} else {
 		// Kernel < 5.2 does not support .rodata global variables, so PID/UID/cgroup filters cannot be applied.
@@ -690,9 +1003,20 @@ func (p *Probe) getManagerOptions() manager.Options {
 			p.Logger().Warn().Str("cgroupPath", p.config.GetCGroupPath()).
 				Msg("cgroup_path filter is not supported on kernel < 5.2, --cgroup_path filter will be ignored")
 		}
+		if len(p.config.StructOffsets) != 0 {
+			p.Logger().Warn().
+				Msg("TLS structure offset overrides are not supported on kernel < 5.2 and will be ignored")
+		}
 	}
 
 	return opts
+}
+
+func boolToUint64(value bool) uint64 {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 func (p *Probe) DecodeFun(em *ebpf.Map) (domain.EventDecoder, bool) {
@@ -774,6 +1098,30 @@ func (d *quicEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, error
 
 func (d *quicEventDecoder) GetDecoder(_ *ebpf.Map) (domain.Event, bool) {
 	return &QuicEvent{}, true
+}
+
+// applicationDataEventDecoder labels generic app-hook events with the stable
+// profile name assigned to their BPF slot.
+type applicationDataEventDecoder struct {
+	hookNames []string
+}
+
+func (d *applicationDataEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, error) {
+	event := &ApplicationDataEvent{}
+	if err := event.DecodeFromBytes(data); err != nil {
+		return nil, err
+	}
+	if int(event.HookID) < len(d.hookNames) {
+		event.HookName = d.hookNames[event.HookID]
+	}
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	return event, nil
+}
+
+func (d *applicationDataEventDecoder) GetDecoder(_ *ebpf.Map) (domain.Event, bool) {
+	return &ApplicationDataEvent{}, true
 }
 
 // masterSecretEventDecoder implements domain.EventDecoder for master secret events

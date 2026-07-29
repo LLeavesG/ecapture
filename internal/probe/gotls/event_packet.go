@@ -24,8 +24,9 @@ import (
 )
 
 const (
-	TaskCommLen = 16
-	CmdlineLen  = 256
+	TaskCommLen       = 16
+	CmdlineLen        = 256
+	PacketMetadataLen = 64
 )
 
 // PacketEvent represents a network packet captured by TC probes.
@@ -37,12 +38,17 @@ type PacketEvent struct {
 	Cmdline        [CmdlineLen]byte
 	PacketLen      uint32
 	InterfaceIndex uint32
+	Uid            uint32
+	Flags          uint32
+	Direction      uint32
+	SocketCookie   uint64
+	CGroupID       uint64
 	PacketData     []byte
 }
 
 // DecodeFromBytes decodes a packet event from raw bytes.
 func (e *PacketEvent) DecodeFromBytes(data []byte) error {
-	if len(data) < 36 {
+	if len(data) < PacketMetadataLen {
 		return errors.New(errors.ErrCodeEventDecode, "packet event data too short")
 	}
 	var err error
@@ -65,6 +71,21 @@ func (e *PacketEvent) DecodeFromBytes(data []byte) error {
 		return err
 	}
 	if err = binary.Read(buf, binary.LittleEndian, &e.InterfaceIndex); err != nil {
+		return err
+	}
+	if err = binary.Read(buf, binary.LittleEndian, &e.Uid); err != nil {
+		return err
+	}
+	if err = binary.Read(buf, binary.LittleEndian, &e.Flags); err != nil {
+		return err
+	}
+	if err = binary.Read(buf, binary.LittleEndian, &e.Direction); err != nil {
+		return err
+	}
+	if err = binary.Read(buf, binary.LittleEndian, &e.SocketCookie); err != nil {
+		return err
+	}
+	if err = binary.Read(buf, binary.LittleEndian, &e.CGroupID); err != nil {
 		return err
 	}
 	tmpData := make([]byte, e.PacketLen)
@@ -98,8 +119,16 @@ func (e *PacketEvent) StringHex() string {
 func (e *PacketEvent) Clone() domain.Event {
 	clone := &PacketEvent{
 		Timestamp:      e.Timestamp,
+		Pid:            e.Pid,
+		Comm:           e.Comm,
+		Cmdline:        e.Cmdline,
 		PacketLen:      e.PacketLen,
 		InterfaceIndex: e.InterfaceIndex,
+		Uid:            e.Uid,
+		Flags:          e.Flags,
+		Direction:      e.Direction,
+		SocketCookie:   e.SocketCookie,
+		CGroupID:       e.CGroupID,
 	}
 	if e.PacketData != nil {
 		clone.PacketData = make([]byte, len(e.PacketData))
@@ -123,6 +152,10 @@ func (e *PacketEvent) GetTimestamp() uint64 {
 	return e.Timestamp
 }
 
+func (e *PacketEvent) PerfMonoNs() uint64 {
+	return e.Timestamp
+}
+
 func (e *PacketEvent) GetPacketData() []byte {
 	return e.PacketData
 }
@@ -133,6 +166,10 @@ func (e *PacketEvent) GetPacketLen() uint32 {
 
 func (e *PacketEvent) GetInterfaceIndex() uint32 {
 	return e.InterfaceIndex
+}
+
+func (e *PacketEvent) GetPacketFlags() uint32 {
+	return e.Flags
 }
 
 // Connection tuple information - these would need to be parsed from packet data

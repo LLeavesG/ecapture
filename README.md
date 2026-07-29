@@ -220,6 +220,7 @@ For details of the Protobuf log schema used by eCapture/eCaptureQ, see:
 - [**Defense & Detection**](docs/defense-detection.md) — How to detect and defend against unauthorized usage
 - [**Performance Benchmarks**](docs/performance-benchmarks.md) — Overhead measurement methodology and expected characteristics
 - [**Release Verification**](docs/release-verification.md) — How to verify the integrity of release artifacts
+- [**Application Capture Profiles**](docs/application-profiles.md) — Per-app strategies, hooks, interfaces, and runtime TLS offsets
 
 # Contributing
 See [CONTRIBUTING](./CONTRIBUTING.md) for details on submitting patches and the contribution workflow.

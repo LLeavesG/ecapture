@@ -41,7 +41,7 @@ int probe_ssl_master_key(struct pt_regs *ctx) {
     }
 
     // Get SSL->version pointer
-    u64 *ssl_version_ptr = (u64 *)(ssl_st_ptr + SSL_ST_VERSION);
+    u64 *ssl_version_ptr = (u64 *)(ssl_st_ptr + ecapture_offset_ssl_st_version);
     int version;
     u64 address;
     int ret = bpf_probe_read_user(&version, sizeof(version), (void *)ssl_version_ptr);

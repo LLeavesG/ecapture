@@ -39,9 +39,9 @@ int probe_ssl_master_key(struct pt_regs *ctx) {
         debug_bpf_printk("mastersecret is null\n");
         return 0;
     }
-    u64 *ssl_version_ptr = (u64 *)(ssl_st_ptr + SSL_ST_VERSION);
+    u64 *ssl_version_ptr = (u64 *)(ssl_st_ptr + ecapture_offset_ssl_st_version);
     // Get a ssl_session_st pointer
-    u64 *ssl_s3_st_ptr = (u64 *)(ssl_st_ptr + SSL_ST_S3);
+    u64 *ssl_s3_st_ptr = (u64 *)(ssl_st_ptr + ecapture_offset_ssl_st_s3);
 
     // Get SSL->version pointer
     int version;

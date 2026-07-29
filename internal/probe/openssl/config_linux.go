@@ -129,3 +129,11 @@ func (c *Config) validateCgroupPath() error {
 	_, err := pkgebpf.GetCgroupIdFromPath(c.CGroupPath)
 	return err
 }
+
+func resolvePackageUID(packageName string) (uint64, error) {
+	return 0, fmt.Errorf("Android package matching is unavailable on Linux; set --uid for %q", packageName)
+}
+
+func resolvePackageVersion(packageName string) (string, uint64, error) {
+	return "", 0, fmt.Errorf("Android package version matching is unavailable on Linux for %q", packageName)
+}

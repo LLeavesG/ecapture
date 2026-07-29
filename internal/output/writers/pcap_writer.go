@@ -18,8 +18,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math"
 	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/gopacket"
@@ -37,10 +40,11 @@ type TcPacket struct {
 
 // PcapWriter handles writing network packets in PCAPNG format
 type PcapWriter struct {
-	writer    *pcapgo.NgWriter
-	ifaceIdx  int
-	ctx       context.Context
-	ctxCancel context.CancelFunc
+	writer           *pcapgo.NgWriter
+	interfaceIDs     map[uint32]pcapInterfaceIDs
+	defaultInterface pcapInterfaceIDs
+	ctx              context.Context
+	ctxCancel        context.CancelFunc
 
 	tcPackets       []*TcPacket
 	packetChan      chan *TcPacket
@@ -52,12 +56,24 @@ type PcapWriter struct {
 	logger          *lger.Logger
 }
 
+type pcapInterfaceIDs struct {
+	ethernet int
+	rawIP    int
+}
+
 // NewPcapWriter creates a new PCAPNG writer
 func NewPcapWriter(w io.Writer, snaplen uint32, ifName, filter string, logger *lger.Logger) (*PcapWriter, error) {
-	// create pcapng writer
-	netIfs, err := net.Interfaces()
-	if err != nil {
-		return nil, err
+	return NewPcapWriterInterfaces(w, snaplen, []string{ifName}, filter, logger)
+}
+
+// NewPcapWriterInterfaces creates PCAPNG interface descriptions for every
+// monitored system interface. Each interface gets Ethernet and raw-IP
+// descriptions so TUN traffic can be represented without corrupt link types.
+func NewPcapWriterInterfaces(
+	w io.Writer, snaplen uint32, ifNames []string, filter string, logger *lger.Logger,
+) (*PcapWriter, error) {
+	if len(ifNames) == 0 {
+		return nil, fmt.Errorf("at least one pcap interface is required")
 	}
 
 	// TODO : write Application "ecapture.lua" to decode PID/Comm info.
@@ -69,40 +85,54 @@ func NewPcapWriter(w io.Writer, snaplen uint32, ifName, filter string, logger *l
 			Comment:     "see https://ecapture.cc for more information. CFC4N <cfc4n.cs@gmail.com>",
 		},
 	}
-	// write interface description
-	ngIface := pcapgo.NgInterface{
-		Name:       ifName,
-		Comment:    "eCapture (旁观者): github.com/gojue/ecapture",
-		Filter:     filter,
-		LinkType:   layers.LinkTypeEthernet,
-		SnapLength: snaplen,
+	firstName := ifNames[0]
+	firstRaw := interfacePrefersRawIP(firstName)
+	firstLinkType := layers.LinkTypeEthernet
+	if firstRaw {
+		firstLinkType = layers.LinkTypeRaw
 	}
-
-	pcapWriter, err := pcapgo.NewNgWriterInterface(w, ngIface, pcapOption)
+	pcapWriter, err := pcapgo.NewNgWriterInterface(
+		w, makeNgInterface(firstName, filter, snaplen, firstLinkType), pcapOption,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	var ifaceIdx int
-	var lastIfaceIdx int
-	// insert other interfaces into pcapng file
-	for _, iface := range netIfs {
-		ngIface = pcapgo.NgInterface{
-			Name:       iface.Name,
-			Comment:    "eCapture (旁观者): github.com/gojue/ecapture",
-			Filter:     "",
-			LinkType:   layers.LinkTypeEthernet,
-			SnapLength: uint32(math.MaxUint16),
-		}
+	interfaceIDs := make(map[uint32]pcapInterfaceIDs, len(ifNames))
+	firstIDs := pcapInterfaceIDs{}
+	if firstRaw {
+		firstIDs.rawIP = 0
+		firstIDs.ethernet, err = pcapWriter.AddInterface(
+			makeNgInterface(firstName, filter, snaplen, layers.LinkTypeEthernet),
+		)
+	} else {
+		firstIDs.ethernet = 0
+		firstIDs.rawIP, err = pcapWriter.AddInterface(
+			makeNgInterface(firstName, filter, snaplen, layers.LinkTypeRaw),
+		)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if systemIndex := systemInterfaceIndex(firstName); systemIndex != 0 {
+		interfaceIDs[systemIndex] = firstIDs
+	}
 
-		ifIdx, err := pcapWriter.AddInterface(ngIface)
-		if err != nil {
-			return nil, err
+	for _, ifName := range ifNames[1:] {
+		ethernetID, addErr := pcapWriter.AddInterface(
+			makeNgInterface(ifName, filter, snaplen, layers.LinkTypeEthernet),
+		)
+		if addErr != nil {
+			return nil, addErr
 		}
-		lastIfaceIdx = ifIdx
-		if iface.Name == ifName {
-			// found the interface index
-			ifaceIdx = ifIdx
+		rawID, addErr := pcapWriter.AddInterface(
+			makeNgInterface(ifName, filter, snaplen, layers.LinkTypeRaw),
+		)
+		if addErr != nil {
+			return nil, addErr
+		}
+		if systemIndex := systemInterfaceIndex(ifName); systemIndex != 0 {
+			interfaceIDs[systemIndex] = pcapInterfaceIDs{ethernet: ethernetID, rawIP: rawID}
 		}
 	}
 
@@ -112,23 +142,19 @@ func NewPcapWriter(w io.Writer, snaplen uint32, ifName, filter string, logger *l
 		return nil, err
 	}
 
-	if ifaceIdx == 0 {
-		// if not found, use the last interface index
-		ifaceIdx = lastIfaceIdx
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	pw := &PcapWriter{
-		writer:     pcapWriter,
-		ifaceIdx:   ifaceIdx,
-		packetChan: make(chan *TcPacket, 1024),
-		keylogChan: make(chan []byte, 256),
-		serveDone:  make(chan struct{}),
-		ctx:        ctx,
-		ctxCancel:  cancel,
-		tcPackets:  []*TcPacket{},
-		isClosed:   false,
-		logger:     logger,
+		writer:           pcapWriter,
+		interfaceIDs:     interfaceIDs,
+		defaultInterface: firstIDs,
+		packetChan:       make(chan *TcPacket, 8192),
+		keylogChan:       make(chan []byte, 256),
+		serveDone:        make(chan struct{}),
+		ctx:              ctx,
+		ctxCancel:        cancel,
+		tcPackets:        []*TcPacket{},
+		isClosed:         false,
+		logger:           logger,
 	}
 	go pw.Serve()
 	return pw, nil
@@ -136,24 +162,33 @@ func NewPcapWriter(w io.Writer, snaplen uint32, ifName, filter string, logger *l
 
 // WritePacket writes a packet to the PCAPNG file
 func (pw *PcapWriter) WritePacket(data []byte, timestamp time.Time) error {
+	return pw.WritePacketForInterface(data, timestamp, 0, false)
+}
+
+func (pw *PcapWriter) WritePacketForInterface(
+	data []byte, timestamp time.Time, systemInterfaceIndex uint32, rawIP bool,
+) error {
+	ids, found := pw.interfaceIDs[systemInterfaceIndex]
+	if !found {
+		ids = pw.defaultInterface
+	}
+	interfaceIndex := ids.ethernet
+	if rawIP {
+		interfaceIndex = ids.rawIP
+	}
 	captureInfo := gopacket.CaptureInfo{
-		Timestamp:     timestamp,
-		CaptureLength: len(data),
-		Length:        len(data),
-		//InterfaceIndex: pw.ifaceIdx,
-		// set 0 default, Because the monitored network interface is the first one written into the pcapng header.
-		// 设置为0，因为被监听的网卡是第一个写入pcapng header中的。
-		// via : https://github.com/gojue/ecapture/issues/347
-		InterfaceIndex: 0,
+		Timestamp:      timestamp,
+		CaptureLength:  len(data),
+		Length:         len(data),
+		InterfaceIndex: interfaceIndex,
 	}
 
 	select {
 	case pw.packetChan <- &TcPacket{ci: captureInfo, data: data}:
-	default:
-		// If the channel is full, write directly (blocking)
-		return fmt.Errorf("pcap write packet channel full")
+		return nil
+	case <-pw.ctx.Done():
+		return fmt.Errorf("pcap writer is closed")
 	}
-	return nil
 }
 
 // Serve processes packets and keylogs from channels and writes them to the PCAPNG writer.
@@ -390,6 +425,40 @@ func (pw *PcapWriter) Close() error {
 
 func (pw *PcapWriter) Name() string {
 	return "pcap_writer"
+}
+
+func makeNgInterface(name, filter string, snaplen uint32, linkType layers.LinkType) pcapgo.NgInterface {
+	return pcapgo.NgInterface{
+		Name:       name,
+		Comment:    "eCapture (旁观者): github.com/gojue/ecapture",
+		Filter:     filter,
+		LinkType:   linkType,
+		SnapLength: snaplen,
+	}
+}
+
+func systemInterfaceIndex(name string) uint32 {
+	iface, err := net.InterfaceByName(name)
+	if err != nil || iface.Index < 0 {
+		return 0
+	}
+	return uint32(iface.Index)
+}
+
+func interfacePrefersRawIP(name string) bool {
+	data, err := os.ReadFile(filepath.Join("/sys/class/net", name, "type"))
+	if err != nil {
+		return false
+	}
+	hardwareType, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return false
+	}
+	const (
+		arphrdNone = 0xfffe
+		arphrdRaw  = 0x0300
+	)
+	return hardwareType == arphrdNone || hardwareType == arphrdRaw
 }
 
 // nullTerminatedString returns the string up to the first null byte

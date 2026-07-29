@@ -14,6 +14,7 @@
 
 #include "ecapture.h"
 #include "include/tls_constants.h"
+#include "openssl_offsets.h"
 
 // ARM64 MTE/TBI: strip pointer tag from top byte
 #define UNTAG_PTR(p) ((p) & 0x00FFFFFFFFFFFFFF)
@@ -211,10 +212,10 @@ int probe_ssl_master_key(struct pt_regs *ctx) {
     int ret;
     int ssl_version;
     // Get a ssl_session_st pointer
-    u64 *ssl_s3_st_ptr = (u64 *)(ssl_st_ptr + SSL_ST_S3);
+    u64 *ssl_s3_st_ptr = (u64 *)(ssl_st_ptr + ecapture_offset_ssl_st_s3);
     mastersecret->version = 0;
 #ifndef SSL_SESSION_ST_SSL_VERSION
-    u64 *ssl_version_ptr = (u64 *)(ssl_st_ptr + SSL_ST_VERSION);
+    u64 *ssl_version_ptr = (u64 *)(ssl_st_ptr + ecapture_offset_ssl_st_version);
     // Get SSL->version pointer
     ret = bpf_probe_read_user(&ssl_version, sizeof(ssl_version), (void *)ssl_version_ptr);
     if (ret) {
@@ -237,7 +238,7 @@ int probe_ssl_master_key(struct pt_regs *ctx) {
     // Android 16: ssl_st.version was removed; the negotiated protocol version
     // now lives in SSL3_STATE.version. Read it here — before the TLS 1.2/1.3
     // branch decision — so that TLS 1.3 connections are correctly identified.
-    u64 *s3_version_ptr = (u64 *)(s3_address + BSSL__SSL3_STATE_VERSION);
+    u64 *s3_version_ptr = (u64 *)(s3_address + ecapture_offset_ssl3_state_version);
     ret = bpf_probe_read_user(&ssl_version, sizeof(ssl_version), (void *)s3_version_ptr);
     if (ret == 0) {
         mastersecret->version = ssl_version & 0xFFFF;
@@ -477,7 +478,7 @@ int uretprobe_bssl_do_handshake(struct pt_regs *ctx) {
 
     int ret;
     u64 s3_addr;
-    u64 *ssl_s3_ptr = (u64 *)(ssl_st_ptr + SSL_ST_S3);
+    u64 *ssl_s3_ptr = (u64 *)(ssl_st_ptr + ecapture_offset_ssl_st_s3);
     ret = bpf_probe_read_user(&s3_addr, sizeof(s3_addr), ssl_s3_ptr);
     if (ret || s3_addr == 0) {
         bpf_printk("bssl_hs: s3 read failed ret=%d s3=%llx", ret, s3_addr);
@@ -496,10 +497,10 @@ int uretprobe_bssl_do_handshake(struct pt_regs *ctx) {
     int ssl_version = 0;
 #ifndef SSL_SESSION_ST_SSL_VERSION
     bpf_probe_read_user(&ssl_version, sizeof(ssl_version),
-        (void *)(ssl_st_ptr + SSL_ST_VERSION));
+        (void *)(ssl_st_ptr + ecapture_offset_ssl_st_version));
 #else
     bpf_probe_read_user(&ssl_version, sizeof(ssl_version),
-        (void *)(s3_addr + BSSL__SSL3_STATE_VERSION));
+        (void *)(s3_addr + ecapture_offset_ssl3_state_version));
 #endif
     mastersecret->version = ssl_version & 0xFFFF;
 

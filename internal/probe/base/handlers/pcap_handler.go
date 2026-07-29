@@ -17,13 +17,13 @@ package handlers
 import (
 	"bytes"
 	"sync"
-	"time"
 
 	"github.com/google/gopacket"
 
 	"github.com/gojue/ecapture/internal/logger"
 
 	"github.com/gojue/ecapture/internal/output/writers"
+	"github.com/gojue/ecapture/pkg/util/ktime"
 
 	"github.com/gojue/ecapture/internal/domain"
 	"github.com/gojue/ecapture/internal/errors"
@@ -96,6 +96,7 @@ type PcapHandler struct {
 	ifName          string
 	filter          string
 	logger          *logger.Logger
+	realtimeOffset  int64
 }
 
 func (h *PcapHandler) Writer() writers.OutputWriter {
@@ -109,9 +110,24 @@ func NewPcapHandler(writer writers.OutputWriter, ifName, filter string, lger *lo
 	}
 
 	// Create pcap writer with Ethernet link type and 65535 snaplen
-	pcapWriter, err := writers.NewPcapWriter(writer, 65535, ifName, filter, lger)
+	return NewPcapHandlerInterfaces(writer, []string{ifName}, filter, lger)
+}
+
+// NewPcapHandlerInterfaces creates a handler for one or more TC interfaces.
+func NewPcapHandlerInterfaces(
+	writer writers.OutputWriter, ifNames []string, filter string, lger *logger.Logger,
+) (*PcapHandler, error) {
+	if writer == nil {
+		return nil, errors.New(errors.ErrCodeResourceAllocation, "output writer cannot be nil")
+	}
+	pcapWriter, err := writers.NewPcapWriterInterfaces(writer, 65535, ifNames, filter, lger)
 	if err != nil {
 		return nil, errors.Wrap(errors.ErrCodeResourceAllocation, "failed to create pcap writer", err)
+	}
+	realtimeOffset, err := ktime.RealtimeOffset()
+	if err != nil {
+		_ = pcapWriter.Close()
+		return nil, errors.Wrap(errors.ErrCodeResourceAllocation, "failed to calibrate packet clock", err)
 	}
 
 	return &PcapHandler{
@@ -119,6 +135,7 @@ func NewPcapHandler(writer writers.OutputWriter, ifName, filter string, lger *lo
 		pcapWriter:      pcapWriter,
 		masterKeyBuffer: bytes.NewBuffer(nil),
 		logger:          lger,
+		realtimeOffset:  realtimeOffset,
 	}, nil
 }
 
@@ -146,11 +163,18 @@ func (h *PcapHandler) Handle(event domain.Event) error {
 		return nil // Empty packet, skip
 	}
 
-	// Convert timestamp from nanoseconds to time.Time
-	timestamp := time.Unix(0, int64(pktEvent.GetTimestamp()))
+	// bpf_ktime_get_ns is monotonic; PCAPNG requires Unix wall time.
+	timestamp := ktime.ToWallTime(pktEvent.GetTimestamp(), h.realtimeOffset)
+	rawIP := false
+	if metadata, ok := event.(interface{ GetPacketFlags() uint32 }); ok {
+		const packetFlagRawIP = 0x08
+		rawIP = metadata.GetPacketFlags()&packetFlagRawIP != 0
+	}
 
 	// Write packet to pcapng file
-	err := h.pcapWriter.WritePacket(packetData, timestamp)
+	err := h.pcapWriter.WritePacketForInterface(
+		packetData, timestamp, pktEvent.GetInterfaceIndex(), rawIP,
+	)
 	if err != nil {
 		return errors.Wrap(errors.ErrCodeEventDispatch, "failed to write packet to pcapng", err)
 	}

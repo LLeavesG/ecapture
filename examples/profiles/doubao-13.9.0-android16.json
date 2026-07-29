@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "name": "doubao-13.9.0-android16",
+  "match": {
+    "package": "com.larus.nova",
+    "android_release": "16",
+    "abi": "arm64-v8a",
+    "version_name": "13.9.0",
+    "version_code": 13090001
+  },
+  "capture": {
+    "mode": "all",
+    "strategies": [
+      "raw_packets",
+      "tls_plaintext",
+      "tls_keys",
+      "quic_metadata",
+      "application_data"
+    ],
+    "interfaces": [
+      "all"
+    ],
+    "strict_attribution": true,
+    "unknown_flows": "drop",
+    "pcap_file": "/data/local/tmp/doubao-all.pcapng",
+    "keylog_file": "/data/local/tmp/doubao-tls.keys",
+    "perf_reorder": true,
+    "perf_reorder_lag_ms": 10
+  },
+  "tls": {
+    "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libttboringssl.so",
+    "version": "boringssl_a_16",
+    "boring_ssl": true,
+    "master_hook_funcs": [
+      "SSL_do_handshake"
+    ],
+    "hooks": {
+      "ssl_read": {
+        "symbol": "SSL_read"
+      },
+      "ssl_write": {
+        "symbol": "SSL_write"
+      },
+      "ssl_set_fd": {
+        "symbol": "SSL_set_fd"
+      },
+      "ssl_set_rfd": {
+        "symbol": "SSL_set_rfd"
+      },
+      "ssl_set_wfd": {
+        "symbol": "SSL_set_wfd"
+      },
+      "ssl_provide_quic_data": {
+        "symbol": "SSL_provide_quic_data"
+      }
+    }
+  },
+  "data_hooks": [
+    {
+      "name": "cronet-buffer-write",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "offset": "0x2adeac",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 2,
+      "length_source": "argument",
+      "length_arg": 3,
+      "max_bytes": 131072
+    }
+  ],
+  "offsets": {
+    "ssl_st_rbio": "0x18",
+    "ssl_st_wbio": "0x20",
+    "ssl_st_version": "0x0",
+    "ssl_st_s3": "0x30",
+    "ssl3_state_version": "0xd0",
+    "bio_st_method": "0x0",
+    "bio_st_num": "0x20",
+    "bio_method_st_type": "0x0"
+  },
+  "metadata": {
+    "libsscronet_build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+    "transport_note": "The 0x2adeac hook is the concrete Cronet Buffer InitWithDataAndCallback implementation for this build and avoids its shared exported thunk; whether a particular chat request uses this API must be verified against runtime events."
+  }
+}

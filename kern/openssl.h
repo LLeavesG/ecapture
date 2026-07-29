@@ -14,6 +14,8 @@
 
 #include "ecapture.h"
 #include "tc.h"
+#include "openssl_offsets.h"
+#include "app_data.h"
 
 /***********************************************************
  * Internal structs and definitions
@@ -275,7 +277,7 @@ static u32 process_BIO_type(u64 ssl_bio_addr) {
     int ret;
 
     // get ssl->bio->method
-    ssl_bio_method_ptr = (u64*)(ssl_bio_addr + BIO_ST_METHOD);
+    ssl_bio_method_ptr = (u64*)(ssl_bio_addr + ecapture_offset_bio_st_method);
     ret = bpf_probe_read_user(&ssl_bio_method_addr, sizeof(ssl_bio_method_addr), ssl_bio_method_ptr);
     if (ret) {
         debug_bpf_printk("(OPENSSL) process_BIO_type: bpf_probe_read ssl_bio_method_ptr failed, ret: %d\n", ret);
@@ -283,7 +285,7 @@ static u32 process_BIO_type(u64 ssl_bio_addr) {
     }
 
     // get ssl->bio->method->type
-    ssl_bio_method_type_ptr = (u64*)(ssl_bio_method_addr + BIO_METHOD_ST_TYPE);
+    ssl_bio_method_type_ptr = (u64*)(ssl_bio_method_addr + ecapture_offset_bio_method_st_type);
     ret = bpf_probe_read_user(&bio_type, sizeof(bio_type), ssl_bio_method_type_ptr);
     if (ret) {
         debug_bpf_printk("(OPENSSL) process_BIO_type: bpf_probe_read ssl_bio_method_type_ptr failed, ret: %d\n", ret);
@@ -294,7 +296,7 @@ static u32 process_BIO_type(u64 ssl_bio_addr) {
     return bio_type;
 }
 
-static int process_SSL_bio(void* ssl, int bio_offset, u32* fd, u32* bio_type, u64* bio_addr) {
+static int process_SSL_bio(void* ssl, u64 bio_offset, u32* fd, u32* bio_type, u64* bio_addr) {
     u64* ssl_bio_ptr;
     u64 ssl_bio_addr;
     s32* ssl_bio_num_ptr;
@@ -338,7 +340,7 @@ static int process_SSL_bio(void* ssl, int bio_offset, u32* fd, u32* bio_type, u6
     }
 
     // bio_st->num is an int, not a pointer-sized value.
-    ssl_bio_num_ptr = (s32*)(ssl_bio_addr + BIO_ST_NUM);
+    ssl_bio_num_ptr = (s32*)(ssl_bio_addr + ecapture_offset_bio_st_num);
     ret = bpf_probe_read_user(&ssl_bio_num, sizeof(ssl_bio_num), ssl_bio_num_ptr);
     if (ret) {
         debug_bpf_printk("(OPENSSL) bpf_probe_read ssl_bio_num_ptr failed, ret: %d\n", ret);
@@ -353,7 +355,7 @@ static int process_SSL_bio(void* ssl, int bio_offset, u32* fd, u32* bio_type, u6
     return 0;
 }
 
-static __always_inline int probe_entry_SSL(struct pt_regs* ctx, void* map, int bio_offset) {
+static __always_inline int probe_entry_SSL(struct pt_regs* ctx, void* map, u64 bio_offset) {
     if (!passes_filter(ctx)) {
         return 0;
     }
@@ -365,17 +367,17 @@ static __always_inline int probe_entry_SSL(struct pt_regs* ctx, void* map, int b
 
 #ifdef BSSL__SSL3_STATE_VERSION
     u64 ssl_s3_addr = 0;
-    u64* ssl_s3_ptr = (u64*)((uintptr_t)ssl + SSL_ST_S3);
+    u64* ssl_s3_ptr = (u64*)((uintptr_t)ssl + ecapture_offset_ssl_st_s3);
     ret = bpf_probe_read_user(&ssl_s3_addr, sizeof(ssl_s3_addr), ssl_s3_ptr);
     if (ret == 0 && ssl_s3_addr != 0) {
-        s32* ssl_s3_version_ptr = (s32*)(ssl_s3_addr + BSSL__SSL3_STATE_VERSION);
+        s32* ssl_s3_version_ptr = (s32*)(ssl_s3_addr + ecapture_offset_ssl3_state_version);
         ret = bpf_probe_read_user(&ssl_version, sizeof(ssl_version), ssl_s3_version_ptr);
     }
     if (ret) {
         debug_bpf_printk("(OPENSSL) bpf_probe_read ssl_s3 version failed, ret: %d\n", ret);
     }
 #elif !defined(SSL_SESSION_ST_SSL_VERSION)
-    ssl_ver_ptr = (s32*)((uintptr_t)ssl + SSL_ST_VERSION);
+    ssl_ver_ptr = (s32*)((uintptr_t)ssl + ecapture_offset_ssl_st_version);
     ret = bpf_probe_read_user(&ssl_version, sizeof(ssl_version), (void*)ssl_ver_ptr);
     if (ret) {
         debug_bpf_printk("(OPENSSL) bpf_probe_read ssl_ver_ptr failed, ret: %d\n", ret);
@@ -432,7 +434,9 @@ static __always_inline int probe_ret_SSL(struct pt_regs* ctx, void* map, enum ss
 // Function signature being probed:
 // int SSL_write(SSL *ssl, const void *buf, int num);
 SEC("uprobe/SSL_write")
-int probe_entry_SSL_write(struct pt_regs* ctx) { return probe_entry_SSL(ctx, &active_ssl_write_args_map, SSL_ST_WBIO); }
+int probe_entry_SSL_write(struct pt_regs* ctx) {
+    return probe_entry_SSL(ctx, &active_ssl_write_args_map, ecapture_offset_ssl_st_wbio);
+}
 
 SEC("uretprobe/SSL_write")
 int probe_ret_SSL_write(struct pt_regs* ctx) { return probe_ret_SSL(ctx, &active_ssl_write_args_map, kSSLWrite); }
@@ -440,7 +444,9 @@ int probe_ret_SSL_write(struct pt_regs* ctx) { return probe_ret_SSL(ctx, &active
 // Function signature being probed:
 // int SSL_read(SSL *s, void *buf, int num)
 SEC("uprobe/SSL_read")
-int probe_entry_SSL_read(struct pt_regs* ctx) { return probe_entry_SSL(ctx, &active_ssl_read_args_map, SSL_ST_RBIO); }
+int probe_entry_SSL_read(struct pt_regs* ctx) {
+    return probe_entry_SSL(ctx, &active_ssl_read_args_map, ecapture_offset_ssl_st_rbio);
+}
 
 SEC("uretprobe/SSL_read")
 int probe_ret_SSL_read(struct pt_regs* ctx) { return probe_ret_SSL(ctx, &active_ssl_read_args_map, kSSLRead); }
