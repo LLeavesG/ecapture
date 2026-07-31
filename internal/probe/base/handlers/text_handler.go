@@ -24,8 +24,9 @@ import (
 // TextHandler handles events by writing their encoded output to a destination.
 // It delegates formatting to the event itself via String() or StringHex() methods.
 type TextHandler struct {
-	writer  writers.OutputWriter
-	encoder encoders.Encoder
+	writer          writers.OutputWriter
+	encoder         encoders.Encoder
+	suppressPackets bool
 }
 
 func (h *TextHandler) Writer() writers.OutputWriter {
@@ -60,11 +61,24 @@ func NewEncodedTextHandler(
 	return &TextHandler{writer: writer, encoder: encoder}
 }
 
+// SuppressPacketEvents prevents raw TC packets from being duplicated into the
+// line-oriented event sink. PCAP-only captures use this when no explicit event
+// collector was requested; otherwise remote logs can become traffic that is
+// captured and logged again in a self-amplifying loop.
+func (h *TextHandler) SuppressPacketEvents() {
+	h.suppressPackets = true
+}
+
 // Handle processes an event and writes its formatted output.
 // The event is responsible for its own formatting via String() or StringHex() methods.
 func (h *TextHandler) Handle(event domain.Event) error {
 	if event == nil {
 		return errors.New(errors.ErrCodeEventValidation, "event cannot be nil")
+	}
+	if h.suppressPackets {
+		if _, packet := event.(PacketEvent); packet {
+			return nil
+		}
 	}
 
 	output, err := h.encoder.Encode(event)

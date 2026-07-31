@@ -17,6 +17,7 @@ package openssl
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -145,6 +146,26 @@ func TestConnDataEvent_DecodeFromBytes_IPv4(t *testing.T) {
 	}
 	if !strings.Contains(event.Tuple, "443") {
 		t.Errorf("Tuple should contain dst port 443, got: %s", event.Tuple)
+	}
+
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	var envelope struct {
+		EventType    string `json:"eventType"`
+		CaptureLayer string `json:"captureLayer"`
+		Transport    string `json:"transport"`
+		Fd           uint32 `json:"fd"`
+	}
+	if err := json.Unmarshal(encoded, &envelope); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if envelope.EventType != "connection_metadata" ||
+		envelope.CaptureLayer != CaptureLayerMetadata ||
+		envelope.Transport != "tcp" ||
+		envelope.Fd != 5 {
+		t.Fatalf("unexpected connection envelope: %#v", envelope)
 	}
 }
 

@@ -75,6 +75,7 @@ type JNIDiscoveryEvent struct {
 func (e JNIDiscoveryEvent) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
 		EventType             string `json:"eventType"`
+		CaptureLayer          string `json:"captureLayer"`
 		Timestamp             uint64 `json:"timestamp"`
 		RegisterNativesAddr   uint64 `json:"registerNativesAddr"`
 		MethodsAddr           uint64 `json:"methodsAddr"`
@@ -95,6 +96,7 @@ func (e JNIDiscoveryEvent) MarshalJSON() ([]byte, error) {
 		ModuleResolutionError string `json:"moduleResolutionError,omitempty"`
 	}{
 		EventType:             "jni_register_natives",
+		CaptureLayer:          CaptureLayerSemantic,
 		Timestamp:             e.Timestamp,
 		RegisterNativesAddr:   e.RegisterNativesAddr,
 		MethodsAddr:           e.MethodsAddr,

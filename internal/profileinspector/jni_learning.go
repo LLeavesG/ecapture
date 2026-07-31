@@ -26,20 +26,32 @@ import (
 	"strings"
 )
 
-const JNILearningReportVersion = 1
+const JNILearningReportVersion = 2
+
+// JNILearningOptions narrows conversion-callsite discovery with payload
+// markers injected by a controlled request. Markers are matched as exact
+// bytes so arbitrary binary protocols can use non-text sentinels through the
+// programmatic API.
+type JNILearningOptions struct {
+	Markers [][]byte
+}
 
 // JNILearningReport turns a large RegisterNatives trace into a short,
 // deterministic list of boundaries worth validating. It intentionally does
 // not emit data hooks: JNI reference arguments are not native byte pointers.
 type JNILearningReport struct {
-	Version          int                  `json:"version"`
-	InputFormat      string               `json:"input_format"`
-	EventsObserved   int                  `json:"events_observed"`
-	UniqueMethods    int                  `json:"unique_methods"`
-	ResolvedMethods  int                  `json:"resolved_methods"`
-	UnresolvedEvents int                  `json:"unresolved_events"`
-	Candidates       []JNIMethodCandidate `json:"candidates"`
-	Safety           []string             `json:"safety"`
+	Version                    int                      `json:"version"`
+	InputFormat                string                   `json:"input_format"`
+	EventsObserved             int                      `json:"events_observed"`
+	UniqueMethods              int                      `json:"unique_methods"`
+	ResolvedMethods            int                      `json:"resolved_methods"`
+	UnresolvedEvents           int                      `json:"unresolved_events"`
+	Candidates                 []JNIMethodCandidate     `json:"candidates"`
+	ConversionEventsObserved   int                      `json:"conversion_events_observed"`
+	UniqueConversionCallsites  int                      `json:"unique_conversion_callsites"`
+	UnresolvedConversionEvents int                      `json:"unresolved_conversion_events"`
+	ConversionCandidates       []JNIConversionCandidate `json:"conversion_candidates"`
+	Safety                     []string                 `json:"safety"`
 }
 
 type JNIMethodCandidate struct {
@@ -71,6 +83,29 @@ type jniLearningEvent struct {
 	ModuleOffset    uint64 `json:"moduleOffset"`
 }
 
+type jniConversionLearningEvent struct {
+	EventType           string `json:"eventType"`
+	Pid                 uint32 `json:"pid"`
+	Tid                 uint32 `json:"tid"`
+	Role                string `json:"role"`
+	Phase               string `json:"phase"`
+	Flags               uint32 `json:"flags"`
+	ByteLength          uint64 `json:"byteLength"`
+	ElementCount        uint64 `json:"elementCount"`
+	CapturedLen         uint32 `json:"capturedLen"`
+	ChunkOffset         uint32 `json:"chunkOffset"`
+	DataLen             uint32 `json:"dataLen"`
+	Data                []byte `json:"data"`
+	CallerModulePath    string `json:"callerModulePath"`
+	CallerModuleOffset  uint64 `json:"callerModuleOffset"`
+	CallerModuleBuildID string `json:"callerModuleBuildID"`
+}
+
+type jniLearningInput struct {
+	methods     []jniLearningEvent
+	conversions []jniConversionLearningEvent
+}
+
 type jniCandidateAccumulator struct {
 	event        jniLearningEvent
 	observations int
@@ -85,6 +120,15 @@ var plainJNIEventPattern = regexp.MustCompile(
 // LearnJNI accepts either JSON event output produced with
 // --event-format=json or the historical plain-text event stream.
 func LearnJNI(reader io.Reader) (*JNILearningReport, error) {
+	return LearnJNIWithOptions(reader, JNILearningOptions{})
+}
+
+// LearnJNIWithOptions accepts the same JSON/plain event streams as LearnJNI
+// and additionally annotates conversion callers that observed a marker.
+func LearnJNIWithOptions(
+	reader io.Reader,
+	options JNILearningOptions,
+) (*JNILearningReport, error) {
 	if reader == nil {
 		return nil, fmt.Errorf("JNI learning input is nil")
 	}
@@ -93,18 +137,20 @@ func LearnJNI(reader io.Reader) (*JNILearningReport, error) {
 	if err != nil {
 		return nil, err
 	}
-	var events []jniLearningEvent
+	var input jniLearningInput
 	format := "plain"
 	if first == '{' {
 		format = "json"
-		events, err = decodeJNILearningJSON(buffered)
+		input, err = decodeJNILearningJSON(buffered)
 	} else {
-		events, err = decodeJNILearningPlain(buffered)
+		input.methods, err = decodeJNILearningPlain(buffered)
 	}
 	if err != nil {
 		return nil, err
 	}
-	return rankJNILearningEvents(format, events), nil
+	report := rankJNILearningEvents(format, input.methods)
+	rankJNIConversionEvents(report, input.conversions, options)
+	return report, nil
 }
 
 func firstNonSpaceByte(reader *bufio.Reader) (byte, error) {
@@ -129,23 +175,39 @@ func isJSONSpace(value byte) bool {
 	return value == ' ' || value == '\n' || value == '\r' || value == '\t'
 }
 
-func decodeJNILearningJSON(reader io.Reader) ([]jniLearningEvent, error) {
+func decodeJNILearningJSON(reader io.Reader) (jniLearningInput, error) {
 	decoder := json.NewDecoder(reader)
-	var events []jniLearningEvent
+	var input jniLearningInput
 	for {
-		var event jniLearningEvent
-		if err := decoder.Decode(&event); err != nil {
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
 			if err == io.EOF {
 				break
 			}
-			return nil, fmt.Errorf("decode structured JNI event: %w", err)
+			return jniLearningInput{}, fmt.Errorf("decode structured JNI event: %w", err)
 		}
-		if event.EventType != "jni_register_natives" {
-			continue
+		var header struct {
+			EventType string `json:"eventType"`
 		}
-		events = append(events, event)
+		if err := json.Unmarshal(raw, &header); err != nil {
+			return jniLearningInput{}, fmt.Errorf("decode structured JNI event type: %w", err)
+		}
+		switch header.EventType {
+		case "jni_register_natives":
+			var event jniLearningEvent
+			if err := json.Unmarshal(raw, &event); err != nil {
+				return jniLearningInput{}, fmt.Errorf("decode RegisterNatives event: %w", err)
+			}
+			input.methods = append(input.methods, event)
+		case "jni_conversion":
+			var event jniConversionLearningEvent
+			if err := json.Unmarshal(raw, &event); err != nil {
+				return jniLearningInput{}, fmt.Errorf("decode JNI conversion event: %w", err)
+			}
+			input.conversions = append(input.conversions, event)
+		}
 	}
-	return events, nil
+	return input, nil
 }
 
 func decodeJNILearningPlain(reader io.Reader) ([]jniLearningEvent, error) {

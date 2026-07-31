@@ -3,6 +3,7 @@ package openssl
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"strconv"
@@ -42,6 +43,44 @@ type ConnDataEvent struct {
 	connDataEvent
 	eventType Type
 	Tuple     string `json:"tuple"`
+}
+
+func (ce ConnDataEvent) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		EventType    string   `json:"eventType"`
+		CaptureLayer string   `json:"captureLayer"`
+		Transport    string   `json:"transport"`
+		Saddr        [16]byte `json:"saddr"`
+		Daddr        [16]byte `json:"daddr"`
+		Comm         [16]byte `json:"Comm"`
+		TimestampNs  uint64   `json:"timestampNs"`
+		Sock         uint64   `json:"sock"`
+		Pid          uint32   `json:"pid"`
+		Tid          uint32   `json:"tid"`
+		Fd           uint32   `json:"fd"`
+		Family       uint16   `json:"family"`
+		Sport        uint16   `json:"sport"`
+		Dport        uint16   `json:"dport"`
+		IsDestroy    uint8    `json:"isDestroy"`
+		Tuple        string   `json:"tuple"`
+	}{
+		EventType:    "connection_metadata",
+		CaptureLayer: CaptureLayerMetadata,
+		Transport:    "tcp",
+		Saddr:        ce.Saddr,
+		Daddr:        ce.Daddr,
+		Comm:         ce.Comm,
+		TimestampNs:  ce.TimestampNs,
+		Sock:         ce.Sock,
+		Pid:          ce.Pid,
+		Tid:          ce.Tid,
+		Fd:           ce.Fd,
+		Family:       ce.Family,
+		Sport:        ce.Sport,
+		Dport:        ce.Dport,
+		IsDestroy:    ce.IsDestroy,
+		Tuple:        ce.Tuple,
+	})
 }
 
 func (ce *ConnDataEvent) Type() domain.EventType {

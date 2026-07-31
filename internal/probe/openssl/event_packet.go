@@ -17,6 +17,7 @@ package openssl
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 
 	"github.com/gojue/ecapture/internal/domain"
@@ -45,6 +46,7 @@ type PacketEvent struct {
 	Comm           [TaskCommLen]byte
 	Cmdline        [CmdlineLen]byte
 	PacketLen      uint32
+	CapturedLen    uint32
 	InterfaceIndex uint32
 	Uid            uint32
 	Flags          uint32
@@ -52,6 +54,27 @@ type PacketEvent struct {
 	SocketCookie   uint64
 	CGroupID       uint64
 	PacketData     []byte
+}
+
+func (e PacketEvent) MarshalJSON() ([]byte, error) {
+	type packetEventAlias PacketEvent
+	transport := e.GetTransportProtocol()
+	if transport == "" {
+		transport = "unknown"
+	}
+	return json.Marshal(struct {
+		EventType    string `json:"eventType"`
+		CaptureLayer string `json:"captureLayer"`
+		Transport    string `json:"transport"`
+		WallTime     string `json:"wallTime,omitempty"`
+		packetEventAlias
+	}{
+		EventType:        "packet",
+		CaptureLayer:     CaptureLayerWire,
+		Transport:        transport,
+		WallTime:         wallTimeFromMonotonic(e.Timestamp),
+		packetEventAlias: packetEventAlias(e),
+	})
 }
 
 // DecodeFromBytes decodes a packet event from raw bytes.
@@ -96,10 +119,17 @@ func (e *PacketEvent) DecodeFromBytes(data []byte) error {
 	if err = binary.Read(buf, binary.LittleEndian, &e.CGroupID); err != nil {
 		return err
 	}
-	tmpData := make([]byte, e.PacketLen)
-	if err = binary.Read(buf, binary.LittleEndian, &tmpData); err != nil {
-		return err
+	// PacketLen is the original skb length. The kernel deliberately caps the
+	// bytes appended to one perf sample so large GSO/loopback skbs cannot
+	// overflow perf_event_header.size and desynchronise the reader.
+	// cilium/perf may expose up to seven bytes of record-alignment padding
+	// after RawSample. Never treat those bytes as packet data.
+	capturedLength := len(buf.Bytes())
+	if uint64(capturedLength) > uint64(e.PacketLen) {
+		capturedLength = int(e.PacketLen)
 	}
+	tmpData := append([]byte(nil), buf.Bytes()[:capturedLength]...)
+	e.CapturedLen = uint32(len(tmpData))
 	e.PacketData = tmpData
 	return nil
 }
@@ -108,6 +138,12 @@ func (e *PacketEvent) DecodeFromBytes(data []byte) error {
 func (e *PacketEvent) Validate() error {
 	if e.PacketLen == 0 {
 		return errors.New(errors.ErrCodeEventValidation, "packet length is zero")
+	}
+	if len(e.PacketData) == 0 {
+		return errors.New(errors.ErrCodeEventValidation, "captured packet data is empty")
+	}
+	if uint64(len(e.PacketData)) > uint64(e.PacketLen) {
+		return errors.New(errors.ErrCodeEventValidation, "captured packet data exceeds original packet length")
 	}
 	return nil
 }
@@ -146,6 +182,7 @@ func (e *PacketEvent) Clone() domain.Event {
 		Comm:           e.Comm,
 		Cmdline:        e.Cmdline,
 		PacketLen:      e.PacketLen,
+		CapturedLen:    e.CapturedLen,
 		InterfaceIndex: e.InterfaceIndex,
 		Uid:            e.Uid,
 		Flags:          e.Flags,

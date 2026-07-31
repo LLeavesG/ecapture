@@ -17,10 +17,12 @@ package openssl
 import (
 	"bytes"
 	"context"
+	"debug/elf"
 	"fmt"
 	"io"
 	"math"
 	"strings"
+	"sync"
 
 	"github.com/cilium/ebpf"
 	manager "github.com/gojue/ebpfmanager"
@@ -53,10 +55,17 @@ type Probe struct {
 	eventMaps        []*ebpf.Map
 	output           io.Writer
 	closer           []io.Closer
+	pcapWriter       *writers.PcapWriter
+
+	interfaceWatcherCancel  context.CancelFunc
+	interfaceWatcherDone    chan struct{}
+	relatedUIDWatcherCancel context.CancelFunc
+	relatedUIDWatcherDone   chan struct{}
 
 	sslBpfFile      string
 	isBoringSSL     bool
 	masterHookFuncs []string
+	archiveUprobes  []archiveUprobeSpec
 }
 
 // NewProbe creates a new OpenSSL probe instance.
@@ -138,6 +147,15 @@ func (p *Probe) Start(ctx context.Context) error {
 	if err := p.configureApplicationDataHooks(); err != nil {
 		return errors.NewConfigurationError("configure application data hooks", err)
 	}
+	if err := p.configureJNIConversionCallerFilter(); err != nil {
+		return errors.NewConfigurationError("configure JNI conversion caller filter", err)
+	}
+	if err := p.configureRelatedProcessUIDs(ctx); err != nil {
+		return errors.NewConfigurationError("configure related process UIDs", err)
+	}
+	if err := p.attachArchiveUprobes(); err != nil {
+		return errors.NewEBPFAttachError("archive-backed uprobes", err)
+	}
 
 	// Start eBPF manager
 	if err := p.bpfManager.Start(); err != nil {
@@ -158,6 +176,7 @@ func (p *Probe) Start(ctx context.Context) error {
 			Str("map", em.String()).
 			Msg("Started perf event reader")
 	}
+	p.startInterfaceWatcher(ctx)
 
 	p.Logger().Info().Msg("OpenSSL probe started successfully")
 	return nil
@@ -194,6 +213,8 @@ func (p *Probe) retrieveEventMaps() error {
 
 // Stop gracefully stops the probe.
 func (p *Probe) Stop(ctx context.Context) error {
+	p.stopInterfaceWatcher()
+	p.stopRelatedProcessUIDWatcher()
 	// Stop event readers are handled by BaseProbe
 	return p.BaseProbe.Stop(ctx)
 }
@@ -209,6 +230,8 @@ func (p *Probe) Events() []*ebpf.Map {
 // Close releases all probe resources.
 func (p *Probe) Close() error {
 	p.Logger().Debug().Msg("Closing OpenSSL probe")
+	p.stopInterfaceWatcher()
+	p.stopRelatedProcessUIDWatcher()
 
 	// Stop eBPF manager
 	if p.bpfManager != nil {
@@ -397,12 +420,104 @@ func (p *Probe) setupManagerText() error {
 		delete(p.mapNameToDecoder, "tls_events")
 		delete(p.mapNameToDecoder, "connect_events")
 	}
+	probes = p.appendAuxiliaryTLSProbes(probes)
 
 	p.bpfManager = &manager.Manager{
 		Probes: probes,
 		Maps:   maps,
 	}
 	return nil
+}
+
+func (p *Probe) appendAuxiliaryTLSProbes(
+	probes []*manager.Probe,
+) []*manager.Probe {
+	libraries := p.config.TLSLibraryTargets()
+	if len(libraries) < 2 {
+		return probes
+	}
+	primary := p.config.OpensslPath
+	base := append([]*manager.Probe(nil), probes...)
+	for libraryIndex, library := range libraries[1:] {
+		added := 0
+		for _, current := range base {
+			if current.BinaryPath != primary || hookRoleForProbe(current) == "" {
+				continue
+			}
+			// An offset recovered for one private image is not portable to a
+			// second provider. Auxiliary providers are intentionally limited
+			// to named exported SSL APIs.
+			if current.UAddress != 0 ||
+				current.AttachToFuncName == "" ||
+				current.AttachToFuncName == offsetHookPlaceholder {
+				continue
+			}
+			found, err := elfTargetHasDynamicSymbol(
+				library,
+				current.AttachToFuncName,
+			)
+			if err != nil {
+				p.Logger().Debug().
+					Err(err).
+					Str("library", library.String()).
+					Str("symbol", current.AttachToFuncName).
+					Msg("Unable to inspect auxiliary TLS provider")
+				continue
+			}
+			if !found {
+				continue
+			}
+			// manager.Probe owns synchronization and runtime attachment
+			// state, so a struct copy would duplicate a live mutex. Copy()
+			// intentionally carries only declarative fields; retain the
+			// uprobe-specific exported fields that auxiliary providers need.
+			clone := current.Copy()
+			clone.AttachPID = current.AttachPID
+			clone.UprobeOffset = current.UprobeOffset
+			clone.UAddress = current.UAddress
+			clone.BinaryPath = library.RuntimePath
+			clone.CopyProgram = true
+			uidBase := clone.UID
+			if uidBase == "" {
+				uidBase = clone.EbpfFuncName
+			}
+			clone.UID = fmt.Sprintf(
+				"%s_tlslib_%d",
+				uidBase,
+				libraryIndex+1,
+			)
+			if library.IsArchive() {
+				elfOffset, err := librarySymbolFileOffset(
+					library,
+					clone.AttachToFuncName,
+				)
+				if err != nil {
+					p.Logger().Debug().
+						Err(err).
+						Str("library", library.String()).
+						Msg("Unable to resolve archive TLS symbol")
+					continue
+				}
+				runtimeOffset, err := library.runtimeOffset(elfOffset)
+				if err != nil {
+					continue
+				}
+				clone.AttachToFuncName = offsetHookPlaceholder
+				clone.UAddress = runtimeOffset
+				p.archiveUprobes = append(
+					p.archiveUprobes,
+					newArchiveUprobeSpec(clone, library),
+				)
+			}
+			probes = append(probes, clone)
+			added++
+		}
+		p.Logger().Info().
+			Str("library", library.String()).
+			Int("hooks", added).
+			Msg("Configured auxiliary TLS provider")
+	}
+	return probes
 }
 
 func (p *Probe) applyHookOverrides(probes []*manager.Probe) []*manager.Probe {
@@ -627,6 +742,8 @@ func (p *Probe) setupManagerPcapNG() error {
 		_ = pcapWriter.Close()
 		return fmt.Errorf("failed to register pcap handler: %w", err)
 	}
+	p.pcapWriter = pcapHandler.PcapWriter()
+	p.pcapWriter.SetExpectKeylog(captureKeys)
 	// Note: pcapWriter will be closed through pcapHandler.Close() when dispatcher closes
 	// Don't add it to p.closer to avoid double-close
 	//p.Logger().Info().Str("Writer", pcapWriter.Name()).Msg("Pcap handler registered")
@@ -781,7 +898,7 @@ func (p *Probe) setupManager() error {
 	case handlers.ModeAll, handlers.ModeHybrid:
 		err = p.setupManagerAll()
 	}
-	if err == nil && p.config.HasApplicationDataStrategy() {
+	if err == nil && p.config.HasDataHookStrategy() {
 		probes, maps := p.appendApplicationDataProbes(
 			p.bpfManager.Probes, p.bpfManager.Maps,
 		)
@@ -804,6 +921,12 @@ func (p *Probe) setupManager() error {
 	}
 	if err != nil {
 		return err
+	}
+	if p.config.PackageName != "" && p.config.GetUid() != 0 {
+		p.bpfManager.Maps = appendUniqueManagerMaps(
+			p.bpfManager.Maps,
+			&manager.Map{Name: relatedUIDMapName},
+		)
 	}
 	p.Logger().Info().
 		Str("openssl_path", p.config.OpensslPath).
@@ -848,7 +971,7 @@ func (p *Probe) setupManagerAll() error {
 	}
 
 	if len(probes) == 0 &&
-		!p.config.HasApplicationDataStrategy() &&
+		!p.config.HasDataHookStrategy() &&
 		!p.config.HasJNIDiscoveryStrategy() {
 		return errors.NewConfigurationError("all mode has no enabled capture strategies", nil)
 	}
@@ -859,26 +982,37 @@ func (p *Probe) setupManagerAll() error {
 func (p *Probe) appendApplicationDataProbes(
 	probes []*manager.Probe, maps []*manager.Map,
 ) ([]*manager.Probe, []*manager.Map) {
-	hooks := p.config.EnabledApplicationDataHooks()
-	hookNames := make([]string, 0, len(hooks))
+	hooks := p.config.EnabledCaptureDataHooks()
 	for slot, hook := range hooks {
-		hookNames = append(hookNames, hook.Name)
+		target := hook.ResolvedTarget()
 		entry := &manager.Probe{
 			Section:      fmt.Sprintf("uprobe/app_data_%d", slot),
 			EbpfFuncName: fmt.Sprintf("probe_entry_app_data_%d", slot),
-			BinaryPath:   hook.ResolvedLibrary(),
+			BinaryPath:   target.RuntimePath,
 			UID:          fmt.Sprintf("uprobe_app_data_%d", slot),
 		}
 		applyApplicationDataHookTarget(entry, hook)
+		if target.IsArchive() {
+			p.archiveUprobes = append(
+				p.archiveUprobes,
+				newArchiveUprobeSpec(entry, target),
+			)
+		}
 		probes = append(probes, entry)
 		if hook.CaptureOn == AppDataCaptureReturn {
 			ret := &manager.Probe{
 				Section:      fmt.Sprintf("uretprobe/app_data_%d", slot),
 				EbpfFuncName: fmt.Sprintf("probe_ret_app_data_%d", slot),
-				BinaryPath:   hook.ResolvedLibrary(),
+				BinaryPath:   target.RuntimePath,
 				UID:          fmt.Sprintf("uretprobe_app_data_%d", slot),
 			}
 			applyApplicationDataHookTarget(ret, hook)
+			if target.IsArchive() {
+				p.archiveUprobes = append(
+					p.archiveUprobes,
+					newArchiveUprobeSpec(ret, target),
+				)
+			}
 			probes = append(probes, ret)
 		}
 		p.Logger().Info().
@@ -887,7 +1021,7 @@ func (p *Probe) appendApplicationDataProbes(
 			Str("library", hook.ResolvedLibrary()).
 			Str("symbol", entry.AttachToFuncName).
 			Uint64("offset", entry.UAddress).
-			Msg("Configured application data hook")
+			Msg("Configured profile-defined capture boundary hook")
 	}
 	maps = appendUniqueManagerMaps(maps,
 		&manager.Map{Name: "app_data_events"},
@@ -898,18 +1032,51 @@ func (p *Probe) appendApplicationDataProbes(
 		&manager.Map{Name: "app_iovec_state_heap"},
 	)
 	p.mapNameToDecoder["app_data_events"] = &applicationDataEventDecoder{
-		hookNames: hookNames,
+		hooks: append([]ApplicationDataHook(nil), hooks...),
 	}
 	return probes, maps
 }
 
-func applyApplicationDataHookTarget(probe *manager.Probe, hook ApplicationDataHook) {
-	if hook.Offset != 0 {
-		probe.AttachToFuncName = offsetHookPlaceholder
-		probe.UAddress = uint64(hook.Offset)
+func applyApplicationDataHookTarget(
+	probe *manager.Probe, hook ApplicationDataHook,
+) {
+	target := hook.ResolvedTarget()
+	if !target.IsArchive() {
+		if hook.Offset != 0 {
+			probe.AttachToFuncName = offsetHookPlaceholder
+			probe.UAddress = uint64(hook.Offset)
+			return
+		}
+		probe.AttachToFuncName = hook.Symbol
 		return
 	}
-	probe.AttachToFuncName = hook.Symbol
+	probe.AttachToFuncName = offsetHookPlaceholder
+	probe.UAddress = hook.resolvedOffset
+}
+
+type jniConversionProbeProgram struct {
+	role      string
+	hasReturn bool
+}
+
+var jniConversionProbePrograms = []jniConversionProbeProgram{
+	{JNIConversionGetStringLength, true},
+	{JNIConversionGetStringChars, true},
+	{JNIConversionReleaseStringChars, false},
+	{JNIConversionGetStringUTFLength, true},
+	{JNIConversionGetStringUTFChars, true},
+	{JNIConversionReleaseStringUTFChars, false},
+	{JNIConversionGetArrayLength, true},
+	{JNIConversionGetByteArrayElements, true},
+	{JNIConversionReleaseByteArrayElements, false},
+	{JNIConversionGetByteArrayRegion, true},
+	{JNIConversionSetByteArrayRegion, false},
+	{JNIConversionGetPrimitiveArrayCritical, true},
+	{JNIConversionReleasePrimitiveArrayCritical, false},
+	{JNIConversionGetStringCritical, true},
+	{JNIConversionReleaseStringCritical, false},
+	{JNIConversionGetDirectBufferAddress, true},
+	{JNIConversionGetDirectBufferCapacity, true},
 }
 
 func (p *Probe) appendJNIDiscoveryProbes(
@@ -943,19 +1110,83 @@ func (p *Probe) appendJNIDiscoveryProbes(
 				Msg("Configured JNI RegisterNatives discovery hook")
 		}
 	}
-	maps = appendUniqueManagerMaps(maps,
-		&manager.Map{Name: "jni_register_events"},
-		&manager.Map{Name: "jni_register_buffer_heap"},
-	)
-	p.mapNameToDecoder["jni_register_events"] = &jniDiscoveryDecoder{
-		resolver:               newProcessModuleResolver(),
-		registerNativesOffsets: offsetValues(jni.RegisterNativesOffsets),
+	if len(jni.RegisterNativesOffsets) != 0 {
+		maps = appendUniqueManagerMaps(maps,
+			&manager.Map{Name: "jni_register_events"},
+			&manager.Map{Name: "jni_register_buffer_heap"},
+		)
+		p.mapNameToDecoder["jni_register_events"] = &jniDiscoveryDecoder{
+			resolver:               newProcessModuleResolver(),
+			registerNativesOffsets: offsetValues(jni.RegisterNativesOffsets),
+		}
+	}
+	hasConversions := false
+	for _, program := range jniConversionProbePrograms {
+		for offsetIndex, offset := range jni.ConversionOffsets[program.role] {
+			entrySection := "uprobe/jni_" + program.role
+			entryFunction := "probe_jni_" + program.role
+			if program.hasReturn {
+				entrySection += "_entry"
+				entryFunction = "probe_entry_jni_" + program.role
+			}
+			probes = append(probes, &manager.Probe{
+				Section:          entrySection,
+				EbpfFuncName:     entryFunction,
+				AttachToFuncName: offsetHookPlaceholder,
+				BinaryPath:       jni.ResolvedLibrary(),
+				UAddress:         uint64(offset),
+				UID: fmt.Sprintf(
+					"uprobe_jni_conversion_%s_%d",
+					program.role,
+					offsetIndex,
+				),
+			})
+			if program.hasReturn {
+				probes = append(probes, &manager.Probe{
+					Section:          "uretprobe/jni_" + program.role + "_return",
+					EbpfFuncName:     "probe_return_jni_" + program.role,
+					AttachToFuncName: offsetHookPlaceholder,
+					BinaryPath:       jni.ResolvedLibrary(),
+					UAddress:         uint64(offset),
+					UID: fmt.Sprintf(
+						"uretprobe_jni_conversion_%s_%d",
+						program.role,
+						offsetIndex,
+					),
+				})
+			}
+			hasConversions = true
+			if p.Logger() != nil {
+				p.Logger().Info().
+					Str("role", program.role).
+					Str("library", jni.ResolvedLibrary()).
+					Uint64("offset", uint64(offset)).
+					Msg("Configured JNI managed-reference conversion hook")
+			}
+		}
+	}
+	if hasConversions {
+		maps = appendUniqueManagerMaps(maps,
+			&manager.Map{Name: "jni_conversion_events"},
+			&manager.Map{Name: "active_jni_conversions"},
+			&manager.Map{Name: "jni_object_states"},
+			&manager.Map{Name: "jni_conversion_buffer_heap"},
+		)
+		if len(jni.CallerAllowlist) != 0 {
+			maps = appendUniqueManagerMaps(maps,
+				&manager.Map{Name: "jni_conversion_allowed_callers"},
+				&manager.Map{Name: "jni_conversion_filter_pids"},
+			)
+		}
+		p.mapNameToDecoder["jni_conversion_events"] = &jniConversionDecoder{
+			resolver: newProcessModuleResolver(),
+		}
 	}
 	return probes, maps
 }
 
 func (p *Probe) configureApplicationDataHooks() error {
-	if !p.config.HasApplicationDataStrategy() {
+	if !p.config.HasDataHookStrategy() {
 		return nil
 	}
 	configMap, found, err := p.bpfManager.GetMap("app_hook_configs")
@@ -965,7 +1196,7 @@ func (p *Probe) configureApplicationDataHooks() error {
 	if !found {
 		return fmt.Errorf("app_hook_configs map was not loaded")
 	}
-	for slot, hook := range p.config.EnabledApplicationDataHooks() {
+	for slot, hook := range p.config.EnabledCaptureDataHooks() {
 		key := uint32(slot)
 		value := hook.bpfConfig()
 		if err := configMap.Update(&key, &value, ebpf.UpdateAny); err != nil {
@@ -973,6 +1204,40 @@ func (p *Probe) configureApplicationDataHooks() error {
 				slot, hook.Name, err)
 		}
 	}
+	return nil
+}
+
+func (p *Probe) configureJNIConversionCallerFilter() error {
+	if p.config.JNIDiscovery == nil ||
+		len(p.config.JNIDiscovery.CallerAllowlist) == 0 {
+		return nil
+	}
+	decoder, found := p.mapNameToDecoder["jni_conversion_events"].(*jniConversionDecoder)
+	if !found {
+		return fmt.Errorf("jni_conversion_events decoder was not configured")
+	}
+	allowed, found, err := p.bpfManager.GetMap("jni_conversion_allowed_callers")
+	if err != nil {
+		return fmt.Errorf("get jni_conversion_allowed_callers map: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("jni_conversion_allowed_callers map was not loaded")
+	}
+	enabled, found, err := p.bpfManager.GetMap("jni_conversion_filter_pids")
+	if err != nil {
+		return fmt.Errorf("get jni_conversion_filter_pids map: %w", err)
+	}
+	if !found {
+		return fmt.Errorf("jni_conversion_filter_pids map was not loaded")
+	}
+	decoder.filter = newJNIConversionCallerFilter(
+		p.config.JNIDiscovery.CallerAllowlist,
+		allowed,
+		enabled,
+	)
+	p.Logger().Info().
+		Int("rules", len(p.config.JNIDiscovery.CallerAllowlist)).
+		Msg("Configured ASLR-aware JNI conversion caller filter")
 	return nil
 }
 
@@ -1156,7 +1421,9 @@ func (d *quicEventDecoder) GetDecoder(_ *ebpf.Map) (domain.Event, bool) {
 // applicationDataEventDecoder labels generic app-hook events with the stable
 // profile name assigned to their BPF slot.
 type applicationDataEventDecoder struct {
-	hookNames []string
+	hooks        []ApplicationDataHook
+	resolver     *processModuleResolver
+	moduleBuilds *moduleBuildIDCache
 }
 
 func (d *applicationDataEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, error) {
@@ -1164,8 +1431,51 @@ func (d *applicationDataEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.E
 	if err := event.DecodeFromBytes(data); err != nil {
 		return nil, err
 	}
-	if int(event.HookID) < len(d.hookNames) {
-		event.HookName = d.hookNames[event.HookID]
+	if int(event.HookID) < len(d.hooks) {
+		hook := d.hooks[event.HookID]
+		event.HookName = hook.Name
+		event.CaptureLayer = hook.CaptureLayer
+		event.Transport = hook.Transport
+		event.BoundaryRole = hook.BoundaryRole
+	}
+	if event.UserStackDepth > 0 {
+		if d.resolver == nil {
+			d.resolver = newProcessModuleResolver()
+		}
+		if d.moduleBuilds == nil {
+			d.moduleBuilds = &moduleBuildIDCache{}
+		}
+		event.StackFrames = make(
+			[]ApplicationDataStackFrame, 0, event.UserStackDepth)
+		for _, address := range event.UserStack[:event.UserStackDepth] {
+			if address == 0 {
+				continue
+			}
+			frame := ApplicationDataStackFrame{Address: address}
+			path, offset, resolveErr := d.resolver.resolve(event.Pid, address)
+			if resolveErr != nil {
+				frame.ResolutionError = resolveErr.Error()
+			} else {
+				path, offset, resolveErr = d.moduleBuilds.resolveLocation(
+					path,
+					offset,
+				)
+				frame.ModulePath = path
+				frame.ModuleOffset = offset
+				if resolveErr != nil {
+					frame.ResolutionError = resolveErr.Error()
+					event.StackFrames = append(event.StackFrames, frame)
+					continue
+				}
+				buildID, buildErr := d.moduleBuilds.resolve(path)
+				if buildErr != nil {
+					frame.ResolutionError = buildErr.Error()
+				} else {
+					frame.ModuleBuildID = buildID
+				}
+			}
+			event.StackFrames = append(event.StackFrames, frame)
+		}
 	}
 	if err := event.Validate(); err != nil {
 		return nil, err
@@ -1182,6 +1492,7 @@ func (d *applicationDataEventDecoder) GetDecoder(_ *ebpf.Map) (domain.Event, boo
 // loaded after process start are still resolved.
 type jniDiscoveryDecoder struct {
 	resolver               *processModuleResolver
+	moduleLocations        *moduleBuildIDCache
 	registerNativesOffsets []uint64
 }
 
@@ -1196,20 +1507,222 @@ func (d *jniDiscoveryDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, er
 	if d.resolver == nil {
 		d.resolver = newProcessModuleResolver()
 	}
+	if d.moduleLocations == nil {
+		d.moduleLocations = &moduleBuildIDCache{}
+	}
 	if path, offset, err := d.resolver.resolve(event.Pid, event.FunctionAddr); err == nil {
-		event.ModulePath = path
-		event.ModuleOffset = offset
+		path, offset, err = d.moduleLocations.resolveLocation(path, offset)
+		if err == nil {
+			event.ModulePath = path
+			event.ModuleOffset = offset
+		} else {
+			event.ModuleResolutionError = err.Error()
+		}
 	} else {
 		event.ModuleResolutionError = err.Error()
 	}
 	if path, offset, err := d.resolver.resolve(event.Pid, event.RegisterNativesAddr); err == nil {
-		event.RegisterModulePath = path
-		event.RegisterModuleOffset = offset
-		event.HookID = registerNativesHookID(d.registerNativesOffsets, offset)
+		path, offset, err = d.moduleLocations.resolveLocation(path, offset)
+		if err == nil {
+			event.RegisterModulePath = path
+			event.RegisterModuleOffset = offset
+			event.HookID = registerNativesHookID(
+				d.registerNativesOffsets,
+				offset,
+			)
+		} else if event.ModuleResolutionError == "" {
+			event.ModuleResolutionError = err.Error()
+		}
 	} else if event.ModuleResolutionError == "" {
 		event.ModuleResolutionError = err.Error()
 	}
 	return event, nil
+}
+
+type jniConversionDecoder struct {
+	resolver     *processModuleResolver
+	filter       jniConversionFilter
+	moduleBuilds *moduleBuildIDCache
+}
+
+type jniConversionFilter interface {
+	activate(uint32) (jniConversionFilterState, error)
+}
+
+type moduleBuildIDCache struct {
+	mu       sync.Mutex
+	results  map[string]moduleBuildIDResult
+	archives map[string]archiveModuleIndexResult
+}
+
+type moduleBuildIDResult struct {
+	buildID string
+	err     string
+}
+
+type archiveModuleIndexResult struct {
+	targets []libraryTarget
+	err     string
+}
+
+// resolveLocation turns an address resolved against an APK inode into the
+// exact stored ELF member and an ELF-relative file offset. Those are the
+// values an application profile can pin and reuse after ASLR.
+func (c *moduleBuildIDCache) resolveLocation(
+	path string,
+	offset uint64,
+) (string, uint64, error) {
+	if !isNativeLibraryArchive(path) {
+		return path, offset, nil
+	}
+	targets, err := c.archiveTargets(path)
+	if err != nil {
+		return path, offset, err
+	}
+	for _, target := range targets {
+		end := target.ContainerOffset + target.ELFSize
+		if end < target.ContainerOffset ||
+			offset < target.ContainerOffset ||
+			offset >= end {
+			continue
+		}
+		return target.String(), offset - target.ContainerOffset, nil
+	}
+	return path, offset, fmt.Errorf(
+		"archive offset %#x in %q is outside every stored ELF member",
+		offset,
+		path,
+	)
+}
+
+func (c *moduleBuildIDCache) archiveTargets(
+	path string,
+) ([]libraryTarget, error) {
+	path = strings.TrimSpace(path)
+	c.mu.Lock()
+	if c.archives == nil {
+		c.archives = make(map[string]archiveModuleIndexResult)
+	} else if cached, found := c.archives[path]; found {
+		c.mu.Unlock()
+		if cached.err != "" {
+			return nil, fmt.Errorf("%s", cached.err)
+		}
+		return cached.targets, nil
+	}
+	c.mu.Unlock()
+
+	targets, err := archiveLibraryTargets(path)
+	result := archiveModuleIndexResult{targets: targets}
+	if err != nil {
+		result.err = err.Error()
+	}
+
+	c.mu.Lock()
+	c.archives[path] = result
+	c.mu.Unlock()
+
+	if err != nil {
+		return nil, err
+	}
+	return targets, nil
+}
+
+func (c *moduleBuildIDCache) resolve(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", nil
+	}
+	c.mu.Lock()
+	if c.results == nil {
+		c.results = make(map[string]moduleBuildIDResult)
+	} else if cached, found := c.results[path]; found {
+		c.mu.Unlock()
+		if cached.err != "" {
+			return "", fmt.Errorf("%s", cached.err)
+		}
+		return cached.buildID, nil
+	}
+	c.mu.Unlock()
+
+	target, err := resolveLibraryTarget(path)
+	var buildID string
+	if err == nil {
+		err = withLibraryELF(target, func(file *elf.File) error {
+			var readErr error
+			buildID, readErr = readELFBuildIDFromFile(
+				file,
+				target.String(),
+			)
+			return readErr
+		})
+	}
+	result := moduleBuildIDResult{buildID: buildID}
+	if err != nil {
+		result.err = err.Error()
+	}
+
+	c.mu.Lock()
+	c.results[path] = result
+	c.mu.Unlock()
+
+	if err != nil {
+		return "", err
+	}
+	return buildID, nil
+}
+
+func (d *jniConversionDecoder) Decode(
+	_ *ebpf.Map,
+	data []byte,
+) (domain.Event, error) {
+	event := &JNIConversionEvent{}
+	if err := event.DecodeFromBytes(data); err != nil {
+		return nil, err
+	}
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	if d.resolver == nil {
+		d.resolver = newProcessModuleResolver()
+	}
+	if event.CallerAddr != 0 {
+		path, offset, err := d.resolver.resolve(event.Pid, event.CallerAddr)
+		if err == nil {
+			if d.moduleBuilds == nil {
+				d.moduleBuilds = &moduleBuildIDCache{}
+			}
+			path, offset, err = d.moduleBuilds.resolveLocation(
+				path,
+				offset,
+			)
+		}
+		if err == nil {
+			event.CallerModulePath = path
+			event.CallerModuleOffset = offset
+			buildID, buildErr := d.moduleBuilds.resolve(path)
+			if buildErr == nil {
+				event.CallerModuleBuildID = buildID
+			} else {
+				event.CallerModuleBuildIDError = buildErr.Error()
+			}
+		} else {
+			event.ModuleResolutionError = err.Error()
+		}
+	}
+	if d.filter != nil {
+		state, err := d.filter.activate(event.Pid)
+		event.CallerFilterActive = state.Active
+		event.CallerFilterJustActivated = state.JustActivated
+		event.CallerFilterPendingRules = uint32(state.PendingRules)
+		if err != nil {
+			event.CallerFilterError = err.Error()
+		}
+	}
+	return event, nil
+}
+
+func (d *jniConversionDecoder) GetDecoder(_ *ebpf.Map) (domain.Event, bool) {
+	return &JNIConversionEvent{}, true
 }
 
 func offsetValues(values []OffsetValue) []uint64 {

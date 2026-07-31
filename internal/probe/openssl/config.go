@@ -48,9 +48,14 @@ type Config struct {
 	ProfileName          string                 `json:"profile_name,omitempty"`
 	PackageName          string                 `json:"package_name,omitempty"`
 	OpensslPathPattern   string                 `json:"openssl_path_glob,omitempty"`
+	OpensslExtraPaths    []string               `json:"openssl_extra_paths,omitempty"`
+	OpensslExtraPatterns []string               `json:"openssl_extra_path_globs,omitempty"`
+	AutoDiscoverTLSLibs  bool                   `json:"auto_discover_tls_libraries,omitempty"`
 	OpensslBuildID       string                 `json:"openssl_build_id,omitempty"`
 	CaptureStrategies    []string               `json:"capture_strategies,omitempty"`
 	Ifnames              []string               `json:"ifnames,omitempty"`
+	WatchInterfaces      bool                   `json:"watch_interfaces,omitempty"`
+	EmitPacketEvents     bool                   `json:"emit_packet_events"`
 	StrictAttribution    bool                   `json:"strict_attribution,omitempty"`
 	UnknownFlowPolicy    string                 `json:"unknown_flow_policy,omitempty"`
 	StructOffsets        map[string]uint64      `json:"struct_offsets,omitempty"`
@@ -63,6 +68,7 @@ type Config struct {
 	applicationProfile   *ApplicationProfile
 	packageVersionName   string
 	packageVersionCode   uint64
+	tlsLibraryTargets    []libraryTarget
 
 	// Capture mode configuration
 	CaptureMode string `json:"capturemode"` // "text", "keylog", or "pcap"
@@ -87,6 +93,7 @@ func NewConfig() *Config {
 	return &Config{
 		BaseConfig:        config.NewBaseConfig(),
 		CaptureMode:       handlers.ModeText,
+		EmitPacketEvents:  true,
 		UnknownFlowPolicy: UnknownFlowInclude,
 		StructOffsets:     make(map[string]uint64),
 		HookOverrides:     make(map[string]HookProfile),
@@ -116,6 +123,9 @@ func (c *Config) Validate() error {
 	// Detect version (platform-specific)
 	if err := c.detectOS(); err != nil {
 		return errors.NewConfigurationError("openssl version detection failed", err)
+	}
+	if err := c.resolveTLSLibraries(); err != nil {
+		return errors.NewConfigurationError("TLS library discovery failed", err)
 	}
 	if err := c.validateApplicationMatch(); err != nil {
 		return errors.NewConfigurationError("application profile does not match target", err)
@@ -302,6 +312,12 @@ func (c *Config) checkTCSupport() error {
 // GetCaptureMode returns the capture mode (text, keylog, or pcap).
 func (c *Config) GetCaptureMode() string {
 	return c.CaptureMode
+}
+
+// GetEmitPacketEvents reports whether raw packets should be duplicated into
+// the structured event stream in addition to the authoritative PCAPNG.
+func (c *Config) GetEmitPacketEvents() bool {
+	return c.EmitPacketEvents
 }
 
 // GetPcapFile returns the pcap file path.

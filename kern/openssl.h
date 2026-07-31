@@ -17,6 +17,7 @@
 #include "openssl_offsets.h"
 #include "app_data.h"
 #include "jni_discovery.h"
+#include "jni_conversion.h"
 
 /***********************************************************
  * Internal structs and definitions
@@ -635,10 +636,15 @@ SEC("kprobe/tcp_v4_destroy_sock")
 int probe_tcp_v4_destroy_sock(struct pt_regs* ctx) {
     struct sock* sk = (struct sock*)PT_REGS_PARM1(ctx);
     struct connect_event_t conn;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
 
     __builtin_memset(&conn, 0, sizeof(conn));
+    conn.timestamp_ns = bpf_ktime_get_ns();
     conn.sock = (u64)sk;
+    conn.pid = pid_tgid >> 32;
+    conn.tid = pid_tgid;
     conn.is_destroy = 1;
+    bpf_get_current_comm(&conn.comm, sizeof(conn.comm));
 
     bpf_perf_event_output(ctx, &connect_events, BPF_F_CURRENT_CPU, &conn, sizeof(struct connect_event_t));
 

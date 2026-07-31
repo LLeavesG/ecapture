@@ -61,6 +61,47 @@ func TestAppendJNIDiscoveryProbesReusesSegmentPrograms(t *testing.T) {
 	}
 }
 
+func TestAppendJNIDiscoveryProbesAddsManagedConversions(t *testing.T) {
+	probe, err := NewProbe()
+	if err != nil {
+		t.Fatalf("NewProbe() error = %v", err)
+	}
+	jni := &JNIDiscoveryProfile{
+		RegisterNativesOffsets: []OffsetValue{0x1000},
+		ConversionOffsets: map[string][]OffsetValue{
+			JNIConversionGetStringUTFChars:      {0x2000, 0x3000},
+			JNIConversionReleaseStringUTFChars:  {0x4000},
+			JNIConversionSetByteArrayRegion:     {0x5000},
+			JNIConversionGetDirectBufferAddress: {0x6000},
+		},
+		CallerAllowlist: []JNIConversionCaller{{
+			Module: "libworker.so",
+			Role:   JNIConversionGetStringUTFChars,
+			Offset: 0x1234,
+		}},
+		resolvedLibrary: "/apex/com.android.art/lib64/libart.so",
+	}
+	probe.config = &Config{JNIDiscovery: jni}
+	probes, maps := probe.appendJNIDiscoveryProbes(nil, nil)
+	wantProbes := JNIDiscoverySegments + 4 + 1 + 1 + 2
+	if len(probes) != wantProbes {
+		t.Fatalf("probe count = %d, want %d", len(probes), wantProbes)
+	}
+	uids := make(map[string]struct{}, len(probes))
+	for _, current := range probes {
+		if _, found := uids[current.UID]; found {
+			t.Fatalf("duplicate uprobe UID %q", current.UID)
+		}
+		uids[current.UID] = struct{}{}
+	}
+	if len(maps) != 8 {
+		t.Fatalf("map count = %d, want 8", len(maps))
+	}
+	if _, found := probe.mapNameToDecoder["jni_conversion_events"]; !found {
+		t.Fatal("JNI conversion event decoder was not configured")
+	}
+}
+
 func TestJNIDiscoveryEventMarshalJSON(t *testing.T) {
 	event := &JNIDiscoveryEvent{
 		Timestamp:    123,

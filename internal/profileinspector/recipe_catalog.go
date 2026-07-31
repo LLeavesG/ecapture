@@ -175,7 +175,7 @@ func (c *RecipeCatalog) Validate() error {
 		if recipe.Priority < 1 || recipe.Priority > 100 {
 			return fmt.Errorf("recipe %q priority must be between 1 and 100", recipe.Name)
 		}
-		if err := validateCatalogHookRecipe(recipe.Name, recipe.Recipe); err != nil {
+		if err := validateCatalogHookRecipe(recipe); err != nil {
 			return err
 		}
 		keyBytes, _ := json.Marshal([]string{
@@ -193,34 +193,61 @@ func (c *RecipeCatalog) Validate() error {
 	return nil
 }
 
-func validateCatalogHookRecipe(name string, recipe *HookRecipe) error {
-	if recipe == nil {
+func validateCatalogHookRecipe(catalogRecipe *CatalogRecipe) error {
+	if catalogRecipe == nil || catalogRecipe.Recipe == nil {
+		name := ""
+		if catalogRecipe != nil {
+			name = catalogRecipe.Name
+		}
 		return fmt.Errorf("recipe %q requires a hook recipe", name)
 	}
+	name := catalogRecipe.Name
+	recipe := catalogRecipe.Recipe
+	captureLayer, transport := hookProvenance(HookCandidate{
+		Family: catalogRecipe.Family,
+		Layer:  catalogRecipe.Layer,
+		Role:   catalogRecipe.Role,
+	})
 	profile := &openssl.ApplicationProfile{
 		Version: openssl.ApplicationProfileVersion,
 		Name:    "catalog-validation",
 		Match:   openssl.ApplicationMatch{PID: 1},
 		DataHooks: []openssl.ApplicationDataHook{{
-			Name:           "catalog-hook",
-			Library:        "/catalog/validation.so",
-			Symbol:         "catalog_validation",
-			Direction:      recipe.Direction,
-			CaptureOn:      recipe.CaptureOn,
-			BufferArg:      recipe.BufferArg,
-			BufferOffset:   openssl.OffsetValue(recipe.BufferOffset),
-			BufferIndirect: recipe.BufferIndirect,
-			LengthSource:   recipe.LengthSource,
-			LengthArg:      recipe.LengthArg,
-			FixedLength:    recipe.FixedLength,
-			LengthOffset:   openssl.OffsetValue(recipe.LengthOffset),
-			LengthSize:     recipe.LengthSize,
-			LengthIndirect: recipe.LengthIndirect,
-			MaxBytes:       recipe.MaxBytes,
-			ContextArg:     recipe.ContextArg,
-			StreamArg:      recipe.StreamArg,
-			BufferFormat:   recipe.BufferFormat,
-			VectorCountArg: recipe.VectorCountArg,
+			Name:                   "catalog-hook",
+			Library:                "/catalog/validation.so",
+			Symbol:                 "catalog_validation",
+			CaptureLayer:           captureLayer,
+			Transport:              transport,
+			Direction:              recipe.Direction,
+			CaptureOn:              recipe.CaptureOn,
+			BufferArg:              recipe.BufferArg,
+			BufferOffset:           openssl.OffsetValue(recipe.BufferOffset),
+			BufferIndirect:         recipe.BufferIndirect,
+			LengthSource:           recipe.LengthSource,
+			LengthArg:              recipe.LengthArg,
+			FixedLength:            recipe.FixedLength,
+			LengthOffset:           openssl.OffsetValue(recipe.LengthOffset),
+			LengthSize:             recipe.LengthSize,
+			LengthIndirect:         recipe.LengthIndirect,
+			MaxBytes:               recipe.MaxBytes,
+			ContextArg:             recipe.ContextArg,
+			ContextOffset:          openssl.OffsetValue(recipe.ContextOffset),
+			ContextSize:            recipe.ContextSize,
+			StreamArg:              recipe.StreamArg,
+			StreamOffset:           openssl.OffsetValue(recipe.StreamOffset),
+			StreamSize:             recipe.StreamSize,
+			StreamByteOffsetArg:    recipe.StreamByteOffsetArg,
+			StreamByteOffsetOffset: openssl.OffsetValue(recipe.StreamByteOffsetOffset),
+			StreamByteOffsetSize:   recipe.StreamByteOffsetSize,
+			FinArg:                 recipe.FinArg,
+			FinOffset:              openssl.OffsetValue(recipe.FinOffset),
+			FinSize:                recipe.FinSize,
+			BufferFormat:           recipe.BufferFormat,
+			VectorCountArg:         recipe.VectorCountArg,
+			VectorStride:           recipe.VectorStride,
+			VectorBaseOffset:       recipe.VectorBaseOffset,
+			VectorLengthOffset:     recipe.VectorLengthOffset,
+			VectorLengthSize:       recipe.VectorLengthSize,
 		}},
 	}
 	if err := profile.Validate(); err != nil {

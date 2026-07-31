@@ -55,6 +55,38 @@ type mockTLSDataEvent struct {
 	isRead    bool
 }
 
+type mockTextPacketEvent struct {
+	mockTLSDataEvent
+}
+
+func (m *mockTextPacketEvent) GetPacketData() []byte {
+	return m.data
+}
+
+func (m *mockTextPacketEvent) GetPacketLen() uint32 {
+	return uint32(len(m.data))
+}
+
+func (m *mockTextPacketEvent) GetInterfaceIndex() uint32 {
+	return 7
+}
+
+func (m *mockTextPacketEvent) GetSrcIP() string {
+	return "192.0.2.1"
+}
+
+func (m *mockTextPacketEvent) GetDstIP() string {
+	return "192.0.2.2"
+}
+
+func (m *mockTextPacketEvent) GetSrcPort() uint16 {
+	return 12345
+}
+
+func (m *mockTextPacketEvent) GetDstPort() uint16 {
+	return 443
+}
+
 func (m *mockTLSDataEvent) GetPid() uint32 {
 	return m.pid
 }
@@ -154,6 +186,30 @@ func TestTextHandler_Handle_Write(t *testing.T) {
 	if !strings.Contains(output, "GET / HTTP/1.1") {
 		t.Errorf("Output should contain request data, got: %s", output)
 		return
+	}
+}
+
+func TestTextHandlerSuppressesOnlyPacketEvents(t *testing.T) {
+	writer := newMockWriter()
+	handler := NewTextHandler(writer, false)
+	handler.SuppressPacketEvents()
+
+	packet := &mockTextPacketEvent{mockTLSDataEvent: mockTLSDataEvent{
+		data: []byte("raw-packet"),
+	}}
+	if err := handler.Handle(packet); err != nil {
+		t.Fatalf("Handle(packet) error = %v", err)
+	}
+	if writer.Len() != 0 {
+		t.Fatalf("suppressed packet output = %q", writer.String())
+	}
+
+	transport := &mockTLSDataEvent{data: []byte("transport-stream")}
+	if err := handler.Handle(transport); err != nil {
+		t.Fatalf("Handle(transport) error = %v", err)
+	}
+	if got, want := writer.String(), "transport-stream\n"; got != want {
+		t.Fatalf("transport output = %q, want %q", got, want)
 	}
 }
 

@@ -15,6 +15,7 @@
 package writers
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -36,5 +37,60 @@ func TestFileWriterCloseIsIdempotent(t *testing.T) {
 	}
 	if err := writer.Close(); err != nil {
 		t.Fatalf("second Close() error = %v", err)
+	}
+}
+
+func TestFileWriterUsesPrivateModeForNewAndExistingCapture(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "capture.jsonl")
+	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := NewFileWriter(FileWriterConfig{
+		Path:     path,
+		Truncate: true,
+	})
+	if err != nil {
+		t.Fatalf("NewFileWriter() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("capture mode = %04o, want 0600", got)
+	}
+}
+
+func TestRotatingFileWriterHardensExistingCapture(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rotating.jsonl")
+	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := NewFileWriter(FileWriterConfig{
+		Path:         path,
+		EnableRotate: true,
+		MaxSizeMB:    1,
+	})
+	if err != nil {
+		t.Fatalf("NewFileWriter() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("rotating capture mode = %04o, want 0600", got)
 	}
 }

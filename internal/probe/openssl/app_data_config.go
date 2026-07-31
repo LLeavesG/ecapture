@@ -26,25 +26,40 @@ const (
 	appDataFlagStateLoad
 	appDataFlagBufferIOVec
 	appDataFlagBufferMsgHdr
+	appDataFlagUserStack
 )
 
 // applicationDataBPFConfig must stay byte-for-byte compatible with
 // struct app_hook_config_t in kern/app_data.h.
 type applicationDataBPFConfig struct {
-	BufferArg      uint32
-	LengthArg      uint32
-	Direction      uint32
-	Flags          uint32
-	BufferOffset   uint64
-	LengthOffset   uint64
-	LengthSize     uint32
-	MaxBytes       uint32
-	StateID        uint32
-	StateKeyArg    uint32
-	ContextArg     uint32
-	StreamArg      uint32
-	VectorCountArg uint32
-	Reserved       uint32
+	BufferArg              uint32
+	LengthArg              uint32
+	Direction              uint32
+	Flags                  uint32
+	BufferOffset           uint64
+	LengthOffset           uint64
+	LengthSize             uint32
+	MaxBytes               uint32
+	StateID                uint32
+	StateKeyArg            uint32
+	ContextArg             uint32
+	StreamArg              uint32
+	VectorCountArg         uint32
+	Reserved               uint32
+	ContextOffset          uint64
+	StreamOffset           uint64
+	ContextSize            uint32
+	StreamSize             uint32
+	VectorStride           uint32
+	VectorBaseOffset       uint32
+	VectorLengthOffset     uint32
+	VectorLengthSize       uint32
+	StreamByteOffsetArg    uint32
+	StreamByteOffsetSize   uint32
+	StreamByteOffsetOffset uint64
+	FinArg                 uint32
+	FinSize                uint32
+	FinOffset              uint64
 }
 
 func (h ApplicationDataHook) bpfConfig() applicationDataBPFConfig {
@@ -55,7 +70,8 @@ func (h ApplicationDataHook) bpfConfig() applicationDataBPFConfig {
 	if h.BufferFormat == AppDataBufferLibCXX {
 		flags |= appDataFlagBufferLibCXX
 	}
-	if h.BufferFormat == AppDataBufferIOVec {
+	if h.BufferFormat == AppDataBufferIOVec ||
+		h.BufferFormat == AppDataBufferVector {
 		flags |= appDataFlagBufferIOVec
 	}
 	if h.BufferFormat == AppDataBufferMsgHdr {
@@ -81,25 +97,51 @@ func (h ApplicationDataHook) bpfConfig() applicationDataBPFConfig {
 	if h.LengthIndirect {
 		flags |= appDataFlagLengthIndirect
 	}
+	if h.CollectUserStack {
+		flags |= appDataFlagUserStack
+	}
 
 	direction := uint32(DataTypeRead)
 	if h.Direction == AppDataDirectionWrite {
 		direction = DataTypeWrite
 	}
+	vectorStride := h.VectorStride
+	vectorLengthOffset := h.VectorLengthOffset
+	vectorLengthSize := h.VectorLengthSize
+	if (h.BufferFormat == AppDataBufferIOVec ||
+		h.BufferFormat == AppDataBufferMsgHdr) && vectorStride == 0 {
+		vectorStride = 16
+		vectorLengthOffset = 8
+		vectorLengthSize = 8
+	}
 	return applicationDataBPFConfig{
-		BufferArg:      h.BufferArg,
-		LengthArg:      h.bpfLengthArg(),
-		Direction:      direction,
-		Flags:          flags,
-		BufferOffset:   uint64(h.BufferOffset),
-		LengthOffset:   uint64(h.LengthOffset),
-		LengthSize:     h.LengthSize,
-		MaxBytes:       h.MaxBytes,
-		StateID:        h.stateID,
-		StateKeyArg:    h.StateKeyArg,
-		ContextArg:     h.ContextArg,
-		StreamArg:      h.StreamArg,
-		VectorCountArg: h.VectorCountArg,
+		BufferArg:              h.BufferArg,
+		LengthArg:              h.bpfLengthArg(),
+		Direction:              direction,
+		Flags:                  flags,
+		BufferOffset:           uint64(h.BufferOffset),
+		LengthOffset:           uint64(h.LengthOffset),
+		LengthSize:             h.LengthSize,
+		MaxBytes:               h.MaxBytes,
+		StateID:                h.stateID,
+		StateKeyArg:            h.StateKeyArg,
+		ContextArg:             h.ContextArg,
+		StreamArg:              h.StreamArg,
+		VectorCountArg:         h.VectorCountArg,
+		ContextOffset:          uint64(h.ContextOffset),
+		StreamOffset:           uint64(h.StreamOffset),
+		ContextSize:            h.ContextSize,
+		StreamSize:             h.StreamSize,
+		VectorStride:           vectorStride,
+		VectorBaseOffset:       h.VectorBaseOffset,
+		VectorLengthOffset:     vectorLengthOffset,
+		VectorLengthSize:       vectorLengthSize,
+		StreamByteOffsetArg:    h.StreamByteOffsetArg,
+		StreamByteOffsetSize:   h.StreamByteOffsetSize,
+		StreamByteOffsetOffset: uint64(h.StreamByteOffsetOffset),
+		FinArg:                 h.FinArg,
+		FinSize:                h.FinSize,
+		FinOffset:              uint64(h.FinOffset),
 	}
 }
 

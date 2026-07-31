@@ -73,6 +73,36 @@ EXPORTED ssize_t ecapture_test_higharg_iovec(
     return (ssize_t)destination_length;
 }
 
+/*
+ * Models a stripped C++ transport whose vector element is not struct iovec.
+ * The 24-byte layout matches the profiled QuicheMemSlice build:
+ * owner/callback at +0, data pointer at +8, and length at +16.
+ * The stream ID is deliberately stored inside the context object so the
+ * fixture also validates object-relative identity extraction.
+ */
+struct private_slice {
+    void *owner;
+    const char *data;
+    uint64_t length;
+};
+
+struct private_stream_context {
+    uint64_t connection_id;
+    uint32_t stream_id;
+    uint32_t reserved;
+    uint64_t stream_byte_offset;
+    uint8_t fin;
+    uint8_t padding[7];
+};
+
+EXPORTED size_t ecapture_test_private_vector(
+    struct private_stream_context *context,
+    const struct private_slice *vectors, size_t vector_count) {
+    (void)context;
+    (void)vectors;
+    return vector_count;
+}
+
 int main(void) {
     static const char write_part_1[] = "ECAPTURE-";
     static const char write_part_2[] = "IOVEC-WRITE-";
@@ -171,6 +201,25 @@ int main(void) {
         return 9;
     if (accepted_length != 36)
         return 10;
+
+    static const char private_part_1[] = "ECAPTURE-";
+    static const char private_part_2[] = "PRIVATE-VECTOR-";
+    static const char private_part_3[] = "STREAM-MARKER\n";
+    struct private_slice private_vectors[] = {
+        {(void *)(uintptr_t)0x1111, private_part_1, sizeof(private_part_1) - 1},
+        {(void *)(uintptr_t)0x2222, private_part_2, sizeof(private_part_2) - 1},
+        {(void *)(uintptr_t)0x3333, private_part_3, sizeof(private_part_3) - 1},
+    };
+    struct private_stream_context private_context = {
+        .connection_id = 0xaabbccddeeff0011ULL,
+        .stream_id = 0x13572468,
+        .stream_byte_offset = 0x102030405060708ULL,
+        .fin = 1,
+    };
+    if (ecapture_test_private_vector(
+            &private_context, private_vectors,
+            sizeof(private_vectors) / sizeof(private_vectors[0])) != 3)
+        return 11;
 
     close(pipe_fds[0]);
     close(pipe_fds[1]);

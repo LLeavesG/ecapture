@@ -86,6 +86,12 @@ func (c *Config) ApplyApplicationProfile(profile *ApplicationProfile) error {
 	if profile.Capture.PcapFilter != "" {
 		c.PcapFilter = profile.Capture.PcapFilter
 	}
+	if profile.Capture.PerfBufferPages != 0 {
+		c.SetPerCpuMapSize(int(profile.Capture.PerfBufferPages))
+	}
+	if profile.Capture.EmitPacketEvents != nil {
+		c.EmitPacketEvents = *profile.Capture.EmitPacketEvents
+	}
 	if profile.Capture.PerfReorder != nil {
 		c.PerfReorder = *profile.Capture.PerfReorder
 	}
@@ -95,6 +101,15 @@ func (c *Config) ApplyApplicationProfile(profile *ApplicationProfile) error {
 
 	c.OpensslPath = profile.TLS.Library
 	c.OpensslPathPattern = profile.TLS.LibraryGlob
+	c.OpensslExtraPaths = append(
+		[]string(nil),
+		profile.TLS.AdditionalLibraries...,
+	)
+	c.OpensslExtraPatterns = append(
+		[]string(nil),
+		profile.TLS.AdditionalLibGlobs...,
+	)
+	c.AutoDiscoverTLSLibs = profile.TLS.AutoDiscoverLibraries
 	c.OpensslBuildID = profile.TLS.BuildID
 	if profile.TLS.Version != "" {
 		c.SslVersion = profile.TLS.Version
@@ -114,6 +129,17 @@ func (c *Config) ApplyApplicationProfile(profile *ApplicationProfile) error {
 		jni.RegisterNativesOffsets = append(
 			[]OffsetValue(nil),
 			profile.JNI.RegisterNativesOffsets...,
+		)
+		jni.ConversionOffsets = make(
+			map[string][]OffsetValue,
+			len(profile.JNI.ConversionOffsets),
+		)
+		for role, offsets := range profile.JNI.ConversionOffsets {
+			jni.ConversionOffsets[role] = append([]OffsetValue(nil), offsets...)
+		}
+		jni.CallerAllowlist = append(
+			[]JNIConversionCaller(nil),
+			profile.JNI.CallerAllowlist...,
 		)
 		c.JNIDiscovery = &jni
 	} else {
@@ -180,10 +206,14 @@ func (c *Config) prepareApplicationProfile() error {
 	if err := validateProfileStrategies(c.CaptureStrategies); err != nil {
 		return err
 	}
-	if c.HasApplicationDataStrategy() {
-		if len(c.EnabledApplicationDataHooks()) == 0 {
-			return fmt.Errorf("%s strategy requires at least one enabled data_hooks entry",
-				StrategyAppData)
+	if c.HasDataHookStrategy() {
+		if len(c.EnabledCaptureDataHooks()) == 0 {
+			return fmt.Errorf("data-hook capture strategy requires at least one matching enabled data_hooks entry")
+		}
+		if c.HasStrategy(StrategyBoundaryData) &&
+			len(c.EnabledBoundaryDataHooks()) == 0 {
+			return fmt.Errorf("%s strategy requires at least one wire or transport data_hooks entry",
+				StrategyBoundaryData)
 		}
 		if err := c.resolveApplicationDataLibraries(); err != nil {
 			return err
@@ -251,12 +281,20 @@ func (c *Config) normalizeInterfaces() {
 	if c.Ifname != "" {
 		values = append(values, c.Ifname)
 	}
+	// Validation can run more than once. Once "all" has been expanded into the
+	// current concrete names, retain the watcher intent on later passes.
+	watchInterfaces := c.WatchInterfaces
 	for _, value := range values {
 		if strings.EqualFold(strings.TrimSpace(value), "all") {
+			// Preserve the intent after expanding the current snapshot. The
+			// probe uses this bit to attach the running TC programs to
+			// interfaces that appear later (VPN/TUN, cellular, containers).
+			watchInterfaces = true
 			values = allUpInterfaces()
 			break
 		}
 	}
+	c.WatchInterfaces = watchInterfaces
 	values = normalizeInterfaceNames(values)
 	c.Ifnames = values
 	if len(values) != 0 {
@@ -303,24 +341,70 @@ func (c *Config) HasApplicationDataStrategy() bool {
 	return c.HasStrategy(StrategyAppData) || c.HasStrategy(StrategyCronet)
 }
 
+func (c *Config) HasBoundaryDataStrategy() bool {
+	return c.HasStrategy(StrategyBoundaryData)
+}
+
+func (c *Config) HasDataHookStrategy() bool {
+	return c.HasBoundaryDataStrategy() || c.HasApplicationDataStrategy()
+}
+
 func (c *Config) HasJNIDiscoveryStrategy() bool {
 	return c.HasStrategy(StrategyJNIDiscovery)
 }
 
-func (c *Config) EnabledApplicationDataHooks() []ApplicationDataHook {
+// EnabledBoundaryDataHooks returns only hooks with evidence-bearing wire or
+// transport provenance. Semantic hooks are intentionally excluded.
+func (c *Config) EnabledBoundaryDataHooks() []ApplicationDataHook {
 	hooks := make([]ApplicationDataHook, 0, len(c.ApplicationDataHooks))
 	for _, hook := range c.ApplicationDataHooks {
-		if !hook.Disabled {
+		if !hook.Disabled && hook.CaptureLayer != CaptureLayerSemantic {
 			hooks = append(hooks, hook)
 		}
 	}
 	return hooks
 }
 
+// EnabledCaptureDataHooks selects the hooks requested by the strategy layer.
+// application_data/cronet alone retains the pre-boundary_data behaviour for
+// old profiles. New profiles should use boundary_data for wire/transport hooks
+// and application_data only for explicitly optional semantic diagnostics.
+func (c *Config) EnabledCaptureDataHooks() []ApplicationDataHook {
+	hooks := make([]ApplicationDataHook, 0, len(c.ApplicationDataHooks))
+	for _, hook := range c.ApplicationDataHooks {
+		if c.captureDataHookEnabled(hook) {
+			hooks = append(hooks, hook)
+		}
+	}
+	return hooks
+}
+
+func (c *Config) captureDataHookEnabled(hook ApplicationDataHook) bool {
+	if hook.Disabled {
+		return false
+	}
+	boundaryEnabled := c.HasBoundaryDataStrategy()
+	legacyEnabled := c.HasApplicationDataStrategy()
+	switch {
+	case boundaryEnabled && hook.CaptureLayer != CaptureLayerSemantic:
+		return true
+	case legacyEnabled && (!boundaryEnabled || hook.CaptureLayer == CaptureLayerSemantic):
+		return true
+	default:
+		return false
+	}
+}
+
+// EnabledApplicationDataHooks is kept for callers compiled against the
+// generic hook engine's historical name.
+func (c *Config) EnabledApplicationDataHooks() []ApplicationDataHook {
+	return c.EnabledCaptureDataHooks()
+}
+
 func (c *Config) resolveApplicationDataLibraries() error {
 	for i := range c.ApplicationDataHooks {
 		hook := &c.ApplicationDataHooks[i]
-		if hook.Disabled {
+		if !c.captureDataHookEnabled(*hook) {
 			continue
 		}
 		if hook.LibraryGlob != "" {
@@ -328,21 +412,40 @@ func (c *Config) resolveApplicationDataLibraries() error {
 			if err != nil {
 				return fmt.Errorf("resolve application data hook %q: %w", hook.Name, err)
 			}
-			hook.resolvedLibrary = path
+			hook.Library = path
 		} else {
-			info, err := os.Stat(hook.Library)
+			hook.Library = strings.TrimSpace(hook.Library)
+		}
+		target, err := resolveLibraryTarget(hook.Library)
+		if err != nil {
+			return fmt.Errorf("resolve application data hook %q library %q: %w",
+				hook.Name, hook.Library, err)
+		}
+		hook.resolvedTarget = target
+		hook.resolvedLibrary = target.String()
+		if target.IsArchive() {
+			elfOffset := uint64(hook.Offset)
+			if hook.Symbol != "" {
+				elfOffset, err = librarySymbolFileOffset(target, hook.Symbol)
+				if err != nil {
+					return fmt.Errorf(
+						"resolve application data hook %q symbol: %w",
+						hook.Name,
+						err,
+					)
+				}
+			}
+			hook.resolvedOffset, err = target.runtimeOffset(elfOffset)
 			if err != nil {
-				return fmt.Errorf("stat application data hook %q library %q: %w",
-					hook.Name, hook.Library, err)
+				return fmt.Errorf(
+					"resolve application data hook %q offset: %w",
+					hook.Name,
+					err,
+				)
 			}
-			if info.IsDir() {
-				return fmt.Errorf("application data hook %q library %q is a directory",
-					hook.Name, hook.Library)
-			}
-			hook.resolvedLibrary = hook.Library
 		}
 		if hook.BuildID != "" {
-			if err := verifyELFBuildID(hook.resolvedLibrary, hook.BuildID); err != nil {
+			if err := verifyLibraryTargetBuildID(target, hook.BuildID); err != nil {
 				return fmt.Errorf("verify application data hook %q library: %w",
 					hook.Name, err)
 			}
@@ -356,6 +459,14 @@ func (h ApplicationDataHook) ResolvedLibrary() string {
 		return h.resolvedLibrary
 	}
 	return h.Library
+}
+
+func (h ApplicationDataHook) ResolvedTarget() libraryTarget {
+	if h.resolvedTarget.RuntimePath != "" {
+		return h.resolvedTarget
+	}
+	target, _ := resolveLibraryTarget(h.ResolvedLibrary())
+	return target
 }
 
 func (c *Config) resolveJNIDiscoveryLibrary() error {
@@ -475,7 +586,7 @@ func captureModeForStrategies(strategies []string) string {
 		switch strategy {
 		case StrategyRawPackets:
 			raw = true
-		case StrategyTLSPlaintext, StrategyQUICMetadata, StrategyAppData, StrategyJNIDiscovery, StrategyCronet:
+		case StrategyTLSPlaintext, StrategyQUICMetadata, StrategyBoundaryData, StrategyAppData, StrategyJNIDiscovery, StrategyCronet:
 			plaintext = true
 		case StrategyTLSKeys:
 			keys = true
@@ -499,9 +610,14 @@ func captureModeForStrategies(strategies []string) string {
 func strategiesForCaptureMode(mode string) []string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case handlers.ModeAll, handlers.ModeHybrid:
-		return []string{StrategyRawPackets, StrategyTLSPlaintext, StrategyTLSKeys, StrategyQUICMetadata}
+		// Combined observation means packet plus communication-boundary
+		// capture. Key extraction is an optional export mechanism and must be
+		// requested explicitly.
+		return []string{StrategyRawPackets, StrategyTLSPlaintext, StrategyQUICMetadata}
 	case handlers.ModePcap, handlers.ModePcapng:
-		return []string{StrategyRawPackets, StrategyTLSKeys}
+		// Packet mode preserves the on-wire bytes; it must not silently become
+		// a TLS-decryption workflow.
+		return []string{StrategyRawPackets}
 	case handlers.ModeKey, handlers.ModeKeylog:
 		return []string{StrategyTLSKeys}
 	default:

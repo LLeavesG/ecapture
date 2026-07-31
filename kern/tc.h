@@ -298,7 +298,7 @@ static __always_inline int capture_packets(struct __sk_buff *skb, bool is_ingres
         if (target_uid != 0) {
             if (!socket_uid_known) {
                 identity_unknown = true;
-            } else if (socket_uid != target_uid) {
+            } else if (!target_uid_matches(socket_uid)) {
                 return TC_ACT_OK;
             }
         }
@@ -324,8 +324,12 @@ static __always_inline int capture_packets(struct __sk_buff *skb, bool is_ingres
     event.direction = is_ingress ? 0 : 1;
     event.socket_cookie = bpf_get_socket_cookie(skb);
 
+    u32 capture_len = skb->len;
+    if (capture_len > SKB_MAX_DATA_SIZE)
+        capture_len = SKB_MAX_DATA_SIZE;
+
     u64 flags = BPF_F_CURRENT_CPU;
-    flags |= (u64)skb->len << 32;
+    flags |= (u64)capture_len << 32;
 
     size_t pkt_size = TC_PACKET_META_SIZE;
     bpf_perf_event_output(skb, &skb_events, flags, &event, pkt_size);

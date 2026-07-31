@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "name": "doubao-13.9.0-android16-quic-stream-validation",
+  "match": {
+    "package": "com.larus.nova",
+    "android_release": "16",
+    "abi": "arm64-v8a",
+    "version_name": "13.9.0",
+    "version_code": 13090001
+  },
+  "capture": {
+    "mode": "all",
+    "strategies": [
+      "raw_packets",
+      "quic_metadata",
+      "boundary_data"
+    ],
+    "interfaces": [
+      "all"
+    ],
+    "strict_attribution": false,
+    "unknown_flows": "mark",
+    "pcap_file": "/data/local/tmp/doubao-quic-validation.pcapng",
+    "perf_reorder": true,
+    "perf_reorder_lag_ms": 10
+  },
+  "tls": {
+    "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libttboringssl.so",
+    "version": "boringssl_a_16",
+    "boring_ssl": true,
+    "hooks": {
+      "ssl_provide_quic_data": {
+        "symbol": "SSL_provide_quic_data"
+      }
+    }
+  },
+  "offsets": {
+    "ssl_st_rbio": "0x18",
+    "ssl_st_wbio": "0x20",
+    "ssl_st_version": "0x0",
+    "ssl_st_s3": "0x30",
+    "ssl3_state_version": "0xd0",
+    "bio_st_method": "0x0",
+    "bio_st_num": "0x20",
+    "bio_method_st_type": "0x0"
+  },
+  "data_hooks": [
+    {
+      "name": "quiche-stream-write-or-buffer-data-candidate",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "capture_layer": "transport",
+      "transport": "quic",
+      "offset": "0x61d904",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 2,
+      "length_source": "argument",
+      "length_arg": 3,
+      "context_arg": 1,
+      "context_offset": "0x1e0",
+      "context_size": 8,
+      "stream_arg": 1,
+      "stream_offset": "0x1d8",
+      "stream_size": 4,
+      "fin_arg": 4,
+      "max_bytes": 16384
+    },
+    {
+      "name": "quiche-stream-write-mem-slices-candidate",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "capture_layer": "transport",
+      "transport": "quic",
+      "offset": "0x61e13c",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 2,
+      "buffer_format": "vector",
+      "vector_count_arg": 3,
+      "vector_stride": 24,
+      "vector_base_offset": 8,
+      "vector_length_offset": 16,
+      "vector_length_size": 8,
+      "context_arg": 1,
+      "context_offset": "0x1e0",
+      "context_size": 8,
+      "stream_arg": 1,
+      "stream_offset": "0x1d8",
+      "stream_size": 4,
+      "fin_arg": 4,
+      "max_bytes": 131072
+    },
+    {
+      "name": "quiche-stream-on-stream-frame-candidate",
+      "library_glob": "/data/app/*/com.larus.nova-*/lib/arm64/libsscronet.so",
+      "build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+      "capture_layer": "transport",
+      "transport": "quic",
+      "offset": "0x61c9f8",
+      "direction": "read",
+      "capture_on": "entry",
+      "buffer_arg": 2,
+      "buffer_offset": "0x8",
+      "buffer_indirect": true,
+      "length_source": "memory",
+      "length_arg": 2,
+      "length_offset": "0x2",
+      "length_size": 2,
+      "context_arg": 1,
+      "context_offset": "0x1e0",
+      "context_size": 8,
+      "stream_arg": 1,
+      "stream_offset": "0x1d8",
+      "stream_size": 4,
+      "stream_byte_offset_arg": 2,
+      "stream_byte_offset_offset": "0x10",
+      "stream_byte_offset_size": 8,
+      "fin_arg": 2,
+      "fin_offset": "0x1",
+      "fin_size": 1,
+      "max_bytes": 16384
+    }
+  ],
+  "metadata": {
+    "libsscronet_build_id": "771865e3ad213419d75869809dc6e2d2d7ef8977",
+    "validation_status": "bidirectional QUIC stream bytes and stream IDs runtime-validated during cold start; connection identity, stream byte offset, and FIN require runtime validation before promotion",
+    "boundary_abi": "contiguous write: libsscronet.so+0x61d904 QuicStream::WriteOrBufferDataAtLevel(this, data_ptr, data_len, fin, encryption_level, ack_listener); vector write: libsscronet.so+0x61e13c QuicStream::WriteMemSlices(this, span_ptr, span_count, fin), private QuicheMemSlice stride=24/data=+0x8/length=+0x10; read: libsscronet.so+0x61c9f8 QuicStream::OnStreamFrame(this, frame), fin=frame+0x1, uint16 data_length=frame+0x2, data_buffer=frame+0x8, stream byte offset=frame+0x10; stream id is uint32 at this+0x1d8 and the shared QuicSession pointer is this+0x1e0"
+  }
+}

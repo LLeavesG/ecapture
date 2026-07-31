@@ -58,14 +58,17 @@ func readELFBuildID(path string) (string, error) {
 		return "", fmt.Errorf("open ELF %q: %w", path, err)
 	}
 	defer file.Close()
+	return readELFBuildIDFromFile(file, path)
+}
 
+func readELFBuildIDFromFile(file *elf.File, label string) (string, error) {
 	section := file.Section(".note.gnu.build-id")
 	if section == nil {
-		return "", fmt.Errorf("ELF %q has no .note.gnu.build-id section", path)
+		return "", fmt.Errorf("ELF %q has no .note.gnu.build-id section", label)
 	}
 	data, err := section.Data()
 	if err != nil {
-		return "", fmt.Errorf("read ELF build ID note from %q: %w", path, err)
+		return "", fmt.Errorf("read ELF build ID note from %q: %w", label, err)
 	}
 	for len(data) >= 12 {
 		nameSize := int(file.ByteOrder.Uint32(data[0:4]))
@@ -76,18 +79,37 @@ func readELFBuildID(path string) (string, error) {
 		descEnd := descStart + descSize
 		next := alignNote(descEnd)
 		if nameEnd > len(data) || descEnd > len(data) || next > len(data) {
-			return "", fmt.Errorf("malformed ELF build ID note in %q", path)
+			return "", fmt.Errorf("malformed ELF build ID note in %q", label)
 		}
 		name := bytes.TrimRight(data[12:nameEnd], "\x00")
 		if noteType == gnuBuildIDNoteType && bytes.Equal(name, []byte("GNU")) {
 			if descSize == 0 {
-				return "", fmt.Errorf("empty ELF build ID in %q", path)
+				return "", fmt.Errorf("empty ELF build ID in %q", label)
 			}
 			return hex.EncodeToString(data[descStart:descEnd]), nil
 		}
 		data = data[next:]
 	}
-	return "", fmt.Errorf("ELF %q has no GNU build ID note", path)
+	return "", fmt.Errorf("ELF %q has no GNU build ID note", label)
+}
+
+func verifyLibraryTargetBuildID(
+	target libraryTarget, expected string,
+) error {
+	var actual string
+	err := withLibraryELF(target, func(file *elf.File) error {
+		var readErr error
+		actual, readErr = readELFBuildIDFromFile(file, target.String())
+		return readErr
+	})
+	if err != nil {
+		return err
+	}
+	if actual != expected {
+		return fmt.Errorf("ELF build ID mismatch for %q: got %s, want %s",
+			target.String(), actual, expected)
+	}
+	return nil
 }
 
 func alignNote(value int) int {

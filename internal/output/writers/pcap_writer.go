@@ -23,6 +23,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/gopacket"
@@ -42,16 +44,22 @@ type TcPacket struct {
 type PcapWriter struct {
 	writer           *pcapgo.NgWriter
 	interfaceIDs     map[uint32]pcapInterfaceIDs
+	interfaceNames   map[uint32]string
+	interfaceMu      sync.RWMutex
 	defaultInterface pcapInterfaceIDs
+	snaplen          uint32
+	filter           string
 	ctx              context.Context
 	ctxCancel        context.CancelFunc
 
 	tcPackets       []*TcPacket
 	packetChan      chan *TcPacket
+	interfaceChan   chan pcapInterfaceRegistration
 	keylogChan      chan []byte // channel for DSB (keylog) writes, serialized with packet writes
 	serveDone       chan struct{}
 	packetCount     int
 	firstDSBWritten bool // true after the first DSB has been written to the file
+	expectKeylog    atomic.Bool
 	isClosed        bool
 	logger          *lger.Logger
 }
@@ -59,6 +67,12 @@ type PcapWriter struct {
 type pcapInterfaceIDs struct {
 	ethernet int
 	rawIP    int
+}
+
+type pcapInterfaceRegistration struct {
+	name        string
+	systemIndex uint32
+	done        chan error
 }
 
 // NewPcapWriter creates a new PCAPNG writer
@@ -99,6 +113,7 @@ func NewPcapWriterInterfaces(
 	}
 
 	interfaceIDs := make(map[uint32]pcapInterfaceIDs, len(ifNames))
+	interfaceNames := make(map[uint32]string, len(ifNames))
 	firstIDs := pcapInterfaceIDs{}
 	if firstRaw {
 		firstIDs.rawIP = 0
@@ -116,6 +131,7 @@ func NewPcapWriterInterfaces(
 	}
 	if systemIndex := systemInterfaceIndex(firstName); systemIndex != 0 {
 		interfaceIDs[systemIndex] = firstIDs
+		interfaceNames[systemIndex] = firstName
 	}
 
 	for _, ifName := range ifNames[1:] {
@@ -133,6 +149,7 @@ func NewPcapWriterInterfaces(
 		}
 		if systemIndex := systemInterfaceIndex(ifName); systemIndex != 0 {
 			interfaceIDs[systemIndex] = pcapInterfaceIDs{ethernet: ethernetID, rawIP: rawID}
+			interfaceNames[systemIndex] = ifName
 		}
 	}
 
@@ -146,8 +163,12 @@ func NewPcapWriterInterfaces(
 	pw := &PcapWriter{
 		writer:           pcapWriter,
 		interfaceIDs:     interfaceIDs,
+		interfaceNames:   interfaceNames,
 		defaultInterface: firstIDs,
+		snaplen:          snaplen,
+		filter:           filter,
 		packetChan:       make(chan *TcPacket, 8192),
+		interfaceChan:    make(chan pcapInterfaceRegistration, 32),
 		keylogChan:       make(chan []byte, 256),
 		serveDone:        make(chan struct{}),
 		ctx:              ctx,
@@ -156,22 +177,45 @@ func NewPcapWriterInterfaces(
 		isClosed:         false,
 		logger:           logger,
 	}
+	// Preserve the historical DSB-first behavior until the owning probe says
+	// key extraction is disabled.
+	pw.expectKeylog.Store(true)
 	go pw.Serve()
 	return pw, nil
 }
 
+// SetExpectKeylog controls the short DSB-first buffering window. Wire-only
+// capture disables it so packets flush on the first timer tick.
+func (pw *PcapWriter) SetExpectKeylog(expect bool) {
+	if pw == nil {
+		return
+	}
+	pw.expectKeylog.Store(expect)
+}
+
 // WritePacket writes a packet to the PCAPNG file
 func (pw *PcapWriter) WritePacket(data []byte, timestamp time.Time) error {
-	return pw.WritePacketForInterface(data, timestamp, 0, false)
+	return pw.WritePacketForInterface(
+		data, timestamp, 0, false, uint32(len(data)),
+	)
 }
 
 func (pw *PcapWriter) WritePacketForInterface(
-	data []byte, timestamp time.Time, systemInterfaceIndex uint32, rawIP bool,
+	data []byte,
+	timestamp time.Time,
+	systemInterfaceIndex uint32,
+	rawIP bool,
+	originalLength uint32,
 ) error {
+	if originalLength < uint32(len(data)) {
+		originalLength = uint32(len(data))
+	}
+	pw.interfaceMu.RLock()
 	ids, found := pw.interfaceIDs[systemInterfaceIndex]
 	if !found {
 		ids = pw.defaultInterface
 	}
+	pw.interfaceMu.RUnlock()
 	interfaceIndex := ids.ethernet
 	if rawIP {
 		interfaceIndex = ids.rawIP
@@ -179,7 +223,7 @@ func (pw *PcapWriter) WritePacketForInterface(
 	captureInfo := gopacket.CaptureInfo{
 		Timestamp:      timestamp,
 		CaptureLength:  len(data),
-		Length:         len(data),
+		Length:         int(originalLength),
 		InterfaceIndex: interfaceIndex,
 	}
 
@@ -189,6 +233,77 @@ func (pw *PcapWriter) WritePacketForInterface(
 	case <-pw.ctx.Done():
 		return fmt.Errorf("pcap writer is closed")
 	}
+}
+
+// RegisterInterface adds PCAPNG interface-description blocks for an interface
+// discovered after capture startup. NgWriter is not concurrency-safe, so the
+// request is executed by Serve alongside packet and keylog writes.
+func (pw *PcapWriter) RegisterInterface(name string, systemIndex uint32) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("pcap interface name is empty")
+	}
+	if systemIndex == 0 {
+		return fmt.Errorf("pcap interface %q has invalid system index 0", name)
+	}
+
+	pw.interfaceMu.RLock()
+	registeredName, found := pw.interfaceNames[systemIndex]
+	pw.interfaceMu.RUnlock()
+	if found && registeredName == name {
+		return nil
+	}
+
+	request := pcapInterfaceRegistration{
+		name:        name,
+		systemIndex: systemIndex,
+		done:        make(chan error, 1),
+	}
+	select {
+	case pw.interfaceChan <- request:
+	case <-pw.ctx.Done():
+		return fmt.Errorf("pcap writer is closed")
+	}
+	select {
+	case err := <-request.done:
+		return err
+	case <-pw.ctx.Done():
+		return fmt.Errorf("pcap writer closed while registering interface %q", name)
+	}
+}
+
+func (pw *PcapWriter) registerInterface(request pcapInterfaceRegistration) error {
+	pw.interfaceMu.RLock()
+	registeredName, found := pw.interfaceNames[request.systemIndex]
+	pw.interfaceMu.RUnlock()
+	if found && registeredName == request.name {
+		return nil
+	}
+
+	ethernetID, err := pw.writer.AddInterface(
+		makeNgInterface(request.name, pw.filter, pw.snaplen, layers.LinkTypeEthernet),
+	)
+	if err != nil {
+		return fmt.Errorf("add Ethernet PCAPNG interface %q: %w", request.name, err)
+	}
+	rawID, err := pw.writer.AddInterface(
+		makeNgInterface(request.name, pw.filter, pw.snaplen, layers.LinkTypeRaw),
+	)
+	if err != nil {
+		return fmt.Errorf("add raw-IP PCAPNG interface %q: %w", request.name, err)
+	}
+	if err := pw.writer.Flush(); err != nil {
+		return fmt.Errorf("flush PCAPNG interface %q: %w", request.name, err)
+	}
+
+	pw.interfaceMu.Lock()
+	pw.interfaceIDs[request.systemIndex] = pcapInterfaceIDs{
+		ethernet: ethernetID,
+		rawIP:    rawID,
+	}
+	pw.interfaceNames[request.systemIndex] = request.name
+	pw.interfaceMu.Unlock()
+	return nil
 }
 
 // Serve processes packets and keylogs from channels and writes them to the PCAPNG writer.
@@ -214,7 +329,9 @@ func (pw *PcapWriter) Serve() {
 			}
 			// Delay flushing packets until the first DSB is written (or grace period expires).
 			// This ensures the DSB precedes packets in the pcapng file so Wireshark can decrypt.
-			if !pw.firstDSBWritten && time.Now().Before(dsbGraceDeadline) {
+			if pw.expectKeylog.Load() &&
+				!pw.firstDSBWritten &&
+				time.Now().Before(dsbGraceDeadline) {
 				continue
 			}
 			n, e := pw.savePcapng()
@@ -242,6 +359,8 @@ func (pw *PcapWriter) Serve() {
 			}
 			pw.tcPackets = append(pw.tcPackets, packet)
 			i++
+		case request := <-pw.interfaceChan:
+			request.done <- pw.registerInterface(request)
 		case keylogLine, ok := <-pw.keylogChan:
 			if !ok {
 				// Channel closed — nil out to remove from select, preventing CPU spin.

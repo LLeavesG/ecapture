@@ -17,9 +17,11 @@ package openssl
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPacketEventDecodeMetadata(t *testing.T) {
@@ -45,6 +47,7 @@ func TestPacketEventDecodeMetadata(t *testing.T) {
 		}
 	}
 	encoded.Write(packet)
+	encoded.Write(make([]byte, 7)) // perf record-alignment padding
 
 	var event PacketEvent
 	if err := event.DecodeFromBytes(encoded.Bytes()); err != nil {
@@ -65,6 +68,87 @@ func TestPacketEventRejectsLegacyShortHeader(t *testing.T) {
 	var event PacketEvent
 	if err := event.DecodeFromBytes(make([]byte, PacketMetadataLen-1)); err == nil {
 		t.Fatal("DecodeFromBytes() should reject a truncated metadata header")
+	}
+}
+
+func TestPacketEventPreservesOriginalLengthWhenPerfPayloadIsCapped(t *testing.T) {
+	var comm [TaskCommLen]byte
+	copy(comm[:], "com.larus.nova")
+	packet := bytes.Repeat([]byte{0x5a}, 60*1024)
+	const originalLength = uint32(65549)
+	values := []any{
+		uint64(1234),
+		uint32(777),
+		comm,
+		originalLength,
+		uint32(9),
+		uint32(10290),
+		uint32(PacketFlagAttributed | PacketFlagRawIP),
+		uint32(PacketDirectionEgress),
+		uint64(0x11223344),
+		uint64(0x55667788),
+	}
+	var encoded bytes.Buffer
+	for _, value := range values {
+		if err := binary.Write(&encoded, binary.LittleEndian, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	encoded.Write(packet)
+
+	var event PacketEvent
+	if err := event.DecodeFromBytes(encoded.Bytes()); err != nil {
+		t.Fatalf("DecodeFromBytes() error = %v", err)
+	}
+	if got, want := event.PacketLen, originalLength; got != want {
+		t.Fatalf("PacketLen = %d, want %d", got, want)
+	}
+	if got, want := event.CapturedLen, uint32(len(packet)); got != want {
+		t.Fatalf("CapturedLen = %d, want %d", got, want)
+	}
+	if err := event.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
+func TestPacketEventMarshalJSONIncludesWireProvenance(t *testing.T) {
+	packet := ethernetIPv4TCPPacket(
+		t,
+		net.IPv4(10, 0, 0, 1),
+		net.IPv4(10, 0, 0, 2),
+		12345,
+		443,
+		[]byte{1, 2, 3},
+	)
+	event := PacketEvent{
+		Timestamp:  1234,
+		Pid:        42,
+		PacketLen:  uint32(len(packet)),
+		PacketData: packet,
+	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	var envelope struct {
+		EventType    string `json:"eventType"`
+		CaptureLayer string `json:"captureLayer"`
+		Transport    string `json:"transport"`
+		WallTime     string `json:"wallTime"`
+		PacketData   []byte `json:"PacketData"`
+	}
+	if err := json.Unmarshal(encoded, &envelope); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if envelope.EventType != "packet" ||
+		envelope.CaptureLayer != CaptureLayerWire ||
+		envelope.Transport != "tcp" ||
+		!bytes.Equal(envelope.PacketData, packet) {
+		t.Fatalf("unexpected packet envelope: %#v", envelope)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, envelope.WallTime); err != nil {
+		t.Fatalf("wallTime is not an absolute RFC3339 timestamp: %q: %v",
+			envelope.WallTime, err)
 	}
 }
 

@@ -37,14 +37,18 @@ type Summary struct {
 	EventsIgnored   int `json:"eventsIgnored"`
 }
 
-// Call is a normalized plaintext call. It remains below HTTP transaction
-// semantics but preserves enough identity for HTTP/2 and HTTP/3 decoder
-// plugins to multiplex correctly.
+// Call is a normalized boundary call. It can contain wire ciphertext or
+// transport plaintext, remains below HTTP transaction semantics, and preserves
+// enough identity for protocol decoders to multiplex correctly.
 type Call struct {
 	EventType     string      `json:"eventType"`
 	CallID        string      `json:"callId"`
 	SourceType    string      `json:"sourceType"`
+	CaptureLayer  string      `json:"captureLayer"`
+	Transport     string      `json:"transport,omitempty"`
+	BoundaryRole  string      `json:"boundaryRole,omitempty"`
 	Timestamp     uint64      `json:"timestamp"`
+	WallTime      string      `json:"wallTime,omitempty"`
 	Pid           uint32      `json:"pid"`
 	Tid           uint32      `json:"tid"`
 	Comm          string      `json:"comm,omitempty"`
@@ -54,6 +58,8 @@ type Call struct {
 	BufferAddr    uint64      `json:"bufferAddr,omitempty"`
 	ContextID     uint64      `json:"contextId,omitempty"`
 	StreamID      uint64      `json:"streamId,omitempty"`
+	StreamOffset  *uint64     `json:"streamOffset,omitempty"`
+	Fin           *bool       `json:"fin,omitempty"`
 	SSLAddr       uint64      `json:"sslAddr,omitempty"`
 	BIOAddr       uint64      `json:"bioAddr,omitempty"`
 	Fd            uint32      `json:"fd,omitempty"`
@@ -74,29 +80,35 @@ type ByteRange struct {
 }
 
 type structuredChunk struct {
-	EventType    string `json:"eventType"`
-	Timestamp    uint64 `json:"timestamp"`
-	Pid          uint32 `json:"pid"`
-	Tid          uint32 `json:"tid"`
-	Comm         string `json:"comm"`
-	Direction    string `json:"direction"`
-	DataType     int64  `json:"dataType"`
-	HookID       uint32 `json:"hookId"`
-	HookName     string `json:"hookName"`
-	BufferAddr   uint64 `json:"bufferAddr"`
-	ContextID    uint64 `json:"contextId"`
-	StreamID     uint64 `json:"streamId"`
-	SSLAddr      uint64 `json:"sslAddr"`
-	BIOAddr      uint64 `json:"bioAddr"`
-	Fd           uint32 `json:"fd"`
-	Tuple        string `json:"tuple"`
-	Flags        uint32 `json:"flags"`
-	OriginalLen  uint32 `json:"originalLen"`
-	CapturedLen  uint32 `json:"capturedLen"`
-	ChunkOffset  uint32 `json:"chunkOffset"`
-	DataLen      uint32 `json:"dataLen"`
-	DataEncoding string `json:"dataEncoding"`
-	Data         []byte `json:"data"`
+	EventType    string  `json:"eventType"`
+	CaptureLayer string  `json:"captureLayer"`
+	Transport    string  `json:"transport"`
+	BoundaryRole string  `json:"boundaryRole"`
+	Timestamp    uint64  `json:"timestamp"`
+	WallTime     string  `json:"wallTime"`
+	Pid          uint32  `json:"pid"`
+	Tid          uint32  `json:"tid"`
+	Comm         string  `json:"comm"`
+	Direction    string  `json:"direction"`
+	DataType     int64   `json:"dataType"`
+	HookID       uint32  `json:"hookId"`
+	HookName     string  `json:"hookName"`
+	BufferAddr   uint64  `json:"bufferAddr"`
+	ContextID    uint64  `json:"contextId"`
+	StreamID     uint64  `json:"streamId"`
+	StreamOffset *uint64 `json:"streamOffset"`
+	Fin          *bool   `json:"fin"`
+	SSLAddr      uint64  `json:"sslAddr"`
+	BIOAddr      uint64  `json:"bioAddr"`
+	Fd           uint32  `json:"fd"`
+	Tuple        string  `json:"tuple"`
+	Flags        uint32  `json:"flags"`
+	OriginalLen  uint32  `json:"originalLen"`
+	CapturedLen  uint32  `json:"capturedLen"`
+	ChunkOffset  uint32  `json:"chunkOffset"`
+	DataLen      uint32  `json:"dataLen"`
+	DataEncoding string  `json:"dataEncoding"`
+	Data         []byte  `json:"data"`
 }
 
 type activeCall struct {
@@ -107,10 +119,35 @@ type activeCall struct {
 	count    uint32
 }
 
+type Options struct {
+	// IncludeSemantic permits diagnostic application-object and logging
+	// boundaries in reconstructed output. It is deliberately false by default:
+	// communication capture must not silently treat semantic copies as bytes
+	// from a TLS, QUIC, or socket boundary.
+	IncludeSemantic bool
+}
+
 // Reconstruct consumes compact JSON events and writes normalized calls as
 // JSONL. Unknown event types are ignored. Incomplete calls are emitted at EOF
 // with exact missing ranges instead of being silently discarded.
 func Reconstruct(reader io.Reader, writer io.Writer) (Summary, error) {
+	return ReconstructWithOptions(reader, writer, Options{})
+}
+
+func ReconstructWithOptions(
+	reader io.Reader,
+	writer io.Writer,
+	options Options,
+) (Summary, error) {
+	return reconstructWithObserver(reader, writer, options, nil)
+}
+
+func reconstructWithObserver(
+	reader io.Reader,
+	writer io.Writer,
+	options Options,
+	observer func(json.RawMessage),
+) (Summary, error) {
 	var summary Summary
 	if reader == nil {
 		return summary, fmt.Errorf("reconstruction input is nil")
@@ -130,12 +167,28 @@ func Reconstruct(reader io.Reader, writer io.Writer) (Summary, error) {
 			return summary, fmt.Errorf("decode structured capture event: %w", err)
 		}
 		summary.EventsRead++
+		if observer != nil {
+			observer(raw)
+		}
+		var envelope struct {
+			EventType string `json:"eventType"`
+		}
+		if err := json.Unmarshal(raw, &envelope); err != nil {
+			return summary, fmt.Errorf("decode capture event envelope: %w", err)
+		}
+		if envelope.EventType != "tls_plaintext" &&
+			envelope.EventType != "boundary_data" &&
+			envelope.EventType != "application_data" {
+			summary.EventsIgnored++
+			continue
+		}
 		var event structuredChunk
 		if err := json.Unmarshal(raw, &event); err != nil {
-			return summary, fmt.Errorf("decode plaintext chunk event: %w", err)
+			return summary, fmt.Errorf("decode boundary chunk event: %w", err)
 		}
-		if event.EventType != "tls_plaintext" &&
-			event.EventType != "application_data" {
+		normalizeProvenance(&event)
+		if event.CaptureLayer == captureLayerSemantic &&
+			!options.IncludeSemantic {
 			summary.EventsIgnored++
 			continue
 		}
@@ -183,11 +236,94 @@ func Reconstruct(reader io.Reader, writer io.Writer) (Summary, error) {
 	return summary, nil
 }
 
-func validateChunk(event structuredChunk) error {
-	if event.Timestamp == 0 || event.Pid == 0 {
-		return fmt.Errorf("plaintext chunk is missing timestamp or pid")
+const (
+	captureLayerWire      = "wire"
+	captureLayerTransport = "transport"
+	captureLayerSemantic  = "semantic"
+
+	boundaryTLSCiphertext = "tls_ciphertext"
+	boundarySocketPayload = "socket_payload"
+	boundaryFDPayload     = "fd_payload"
+)
+
+func normalizeProvenance(event *structuredChunk) {
+	if event.EventType == "tls_plaintext" {
+		event.CaptureLayer = captureLayerTransport
+		event.Transport = "tls"
+		return
 	}
-	if event.CapturedLen == 0 || event.CapturedLen > maxReconstructedCall {
+	if event.CaptureLayer == "" {
+		// Legacy application_data events did not state where they came from.
+		// Failing closed as semantic prevents old logging/JNI-adjacent profiles
+		// from being presented as communication streams.
+		event.CaptureLayer = captureLayerSemantic
+	}
+}
+
+func validateChunk(event structuredChunk) error {
+	switch event.CaptureLayer {
+	case captureLayerWire:
+		if event.Transport != "tls" &&
+			event.Transport != "socket" &&
+			event.Transport != "fd" {
+			return fmt.Errorf("wire chunk has unsupported transport provenance %q",
+				event.Transport)
+		}
+	case captureLayerTransport:
+		if event.Transport != "tls" && event.Transport != "quic" {
+			return fmt.Errorf(
+				"transport chunk has unsupported transport provenance %q",
+				event.Transport,
+			)
+		}
+	case captureLayerSemantic:
+		if event.Transport != "" {
+			return fmt.Errorf(
+				"semantic chunk cannot claim transport provenance %q",
+				event.Transport,
+			)
+		}
+	default:
+		return fmt.Errorf("unsupported capture layer %q", event.CaptureLayer)
+	}
+	if event.BoundaryRole != "" {
+		requiredTransport := ""
+		switch event.BoundaryRole {
+		case boundaryTLSCiphertext:
+			requiredTransport = "tls"
+		case boundarySocketPayload:
+			requiredTransport = "socket"
+		case boundaryFDPayload:
+			requiredTransport = "fd"
+		default:
+			return fmt.Errorf("unsupported boundary role %q", event.BoundaryRole)
+		}
+		if event.CaptureLayer != captureLayerWire ||
+			event.Transport != requiredTransport {
+			return fmt.Errorf(
+				"boundary role %q requires wire/%s provenance",
+				event.BoundaryRole,
+				requiredTransport,
+			)
+		}
+		if event.ContextID == 0 {
+			return fmt.Errorf("boundary role %q is missing context identity",
+				event.BoundaryRole)
+		}
+	}
+	if event.Timestamp == 0 || event.Pid == 0 {
+		return fmt.Errorf("boundary chunk is missing timestamp or pid")
+	}
+	finOnly := event.CapturedLen == 0 &&
+		event.OriginalLen == 0 &&
+		event.DataLen == 0 &&
+		event.StreamOffset != nil &&
+		event.Fin != nil &&
+		*event.Fin &&
+		event.CaptureLayer == captureLayerTransport &&
+		event.Transport == "quic"
+	if (!finOnly && event.CapturedLen == 0) ||
+		event.CapturedLen > maxReconstructedCall {
 		return fmt.Errorf("invalid captured length %d", event.CapturedLen)
 	}
 	if event.OriginalLen < event.CapturedLen {
@@ -201,7 +337,7 @@ func validateChunk(event structuredChunk) error {
 		return fmt.Errorf("decoded data length %d differs from dataLen %d",
 			len(event.Data), event.DataLen)
 	}
-	if event.DataLen == 0 ||
+	if (!finOnly && event.DataLen == 0) ||
 		uint64(event.ChunkOffset)+uint64(event.DataLen) > uint64(event.CapturedLen) {
 		return fmt.Errorf("chunk range %d..%d exceeds captured length %d",
 			event.ChunkOffset,
@@ -213,12 +349,27 @@ func validateChunk(event structuredChunk) error {
 
 func compatibleChunk(first, next structuredChunk) error {
 	if first.EventType != next.EventType ||
+		first.CaptureLayer != next.CaptureLayer ||
+		first.Transport != next.Transport ||
+		first.BoundaryRole != next.BoundaryRole ||
 		first.CapturedLen != next.CapturedLen ||
 		first.OriginalLen != next.OriginalLen ||
-		first.Flags != next.Flags {
+		first.Flags != next.Flags ||
+		!equalUint64Pointer(first.StreamOffset, next.StreamOffset) ||
+		!equalBoolPointer(first.Fin, next.Fin) {
 		return fmt.Errorf("conflicting metadata for call %q", callKey(first))
 	}
 	return nil
+}
+
+func equalUint64Pointer(first, second *uint64) bool {
+	return (first == nil && second == nil) ||
+		(first != nil && second != nil && *first == *second)
+}
+
+func equalBoolPointer(first, second *bool) bool {
+	return (first == nil && second == nil) ||
+		(first != nil && second != nil && *first == *second)
 }
 
 func (call *activeCall) add(event structuredChunk) error {
@@ -248,7 +399,11 @@ func (call *activeCall) normalized(complete bool) Call {
 		EventType:     "reconstructed_call",
 		CallID:        call.key,
 		SourceType:    event.EventType,
+		CaptureLayer:  event.CaptureLayer,
+		Transport:     event.Transport,
+		BoundaryRole:  event.BoundaryRole,
 		Timestamp:     event.Timestamp,
+		WallTime:      event.WallTime,
 		Pid:           event.Pid,
 		Tid:           event.Tid,
 		Comm:          event.Comm,
@@ -258,6 +413,8 @@ func (call *activeCall) normalized(complete bool) Call {
 		BufferAddr:    event.BufferAddr,
 		ContextID:     event.ContextID,
 		StreamID:      event.StreamID,
+		StreamOffset:  cloneUint64(event.StreamOffset),
+		Fin:           cloneBool(event.Fin),
 		SSLAddr:       event.SSLAddr,
 		BIOAddr:       event.BIOAddr,
 		Fd:            event.Fd,
@@ -271,6 +428,22 @@ func (call *activeCall) normalized(complete bool) Call {
 		DataEncoding:  "base64",
 		Data:          call.data,
 	}
+}
+
+func cloneUint64(value *uint64) *uint64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneBool(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
 }
 
 func callKey(event structuredChunk) string {
@@ -287,7 +460,10 @@ func callKey(event structuredChunk) string {
 		)
 	}
 	return fmt.Sprintf(
-		"app:%d:%d:%d:%d:%x:%x:%x",
+		"app:%s:%s:%s:%d:%d:%d:%d:%x:%x:%x",
+		event.CaptureLayer,
+		event.Transport,
+		event.BoundaryRole,
 		event.Pid,
 		event.Tid,
 		event.Timestamp,

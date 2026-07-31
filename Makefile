@@ -81,6 +81,7 @@ help:
 	@echo ""
 	@echo "# build"
 	@echo "    $$ make all					# build ecapture"
+	@echo "    $$ ANDROID_NDK_HOME=/path/to/ndk make android-arm64-a16	# Android 16 arm64 on Linux/macOS"
 	@echo ""
 	@echo "# build rpm"
 	@echo "    $$ make rpm VERSION=0.0.0 RELEASE=1		# build ecapture rpm"
@@ -103,7 +104,13 @@ prepare:
 		$(CMD_ECHO) "linux source not found with path: $(LINUX_SOURCE_PATH)" || exit 1; \
     fi
 
-.PHONY: clean assets build ebpf
+.PHONY: clean assets build ebpf android-arm64-a16
+
+# Reproducible Android 16/arm64 build from Linux or Apple Silicon hosts.
+# cilium/ebpf must retain GOOS=linux semantics while the resulting PIE targets
+# Android's Bionic linker; the helper also validates the required PT_TLS align.
+android-arm64-a16:
+	./builder/build_android_arm64_a16.sh
 
 .PHONY: clean
 clean:
@@ -335,4 +342,3 @@ build-android-tests:
 .PHONY: setup-android-env
 setup-android-env:
 	bash ./test/e2e/android/setup_android_env.sh
-

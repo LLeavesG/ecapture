@@ -17,6 +17,7 @@ package openssl
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -51,6 +52,36 @@ type QuicEvent struct {
 	Level     uint32            `json:"level"`
 	EventType uint32            `json:"eventType"`
 	Comm      [TaskCommLen]byte `json:"comm"`
+}
+
+func (e QuicEvent) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		EventType     string `json:"eventType"`
+		CaptureLayer  string `json:"captureLayer"`
+		Transport     string `json:"transport"`
+		MetadataType  string `json:"metadataType"`
+		Timestamp     uint64 `json:"timestamp"`
+		SSLAddr       uint64 `json:"sslAddr"`
+		DataLen       uint64 `json:"dataLen"`
+		Pid           uint32 `json:"pid"`
+		Tid           uint32 `json:"tid"`
+		Level         uint32 `json:"level"`
+		QuicEventType uint32 `json:"quicEventType"`
+		Comm          string `json:"comm"`
+	}{
+		EventType:     "quic_metadata",
+		CaptureLayer:  CaptureLayerMetadata,
+		Transport:     CaptureTransportQUIC,
+		MetadataType:  "tls_crypto_input",
+		Timestamp:     e.Timestamp,
+		SSLAddr:       e.SSLAddr,
+		DataLen:       e.DataLen,
+		Pid:           e.Pid,
+		Tid:           e.Tid,
+		Level:         e.Level,
+		QuicEventType: e.EventType,
+		Comm:          e.GetComm(),
+	})
 }
 
 func (e *QuicEvent) DecodeFromBytes(data []byte) error {

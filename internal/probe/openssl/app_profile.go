@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,6 +32,11 @@ const (
 	StrategyTLSPlaintext = "tls_plaintext"
 	StrategyTLSKeys      = "tls_keys"
 	StrategyQUICMetadata = "quic_metadata"
+	// StrategyBoundaryData enables profile-defined hooks that observe bytes at
+	// a wire or TLS/QUIC transport boundary. It is deliberately separate from
+	// application_data so a communication-only profile cannot accidentally
+	// enable request-object, logging, JNI, or serializer hooks.
+	StrategyBoundaryData = "boundary_data"
 	StrategyAppData      = "application_data"
 	StrategyJNIDiscovery = "jni_discovery"
 	// StrategyCronet is retained as a compatibility alias for profiles that
@@ -67,6 +71,7 @@ const (
 	AppDataBufferRaw      = "raw"
 	AppDataBufferLibCXX   = "libcxx_string"
 	AppDataBufferIOVec    = "iovec"
+	AppDataBufferVector   = "vector"
 	AppDataBufferMsgHdr   = "msghdr"
 	AppDataStateSave      = "save"
 	AppDataStateLoad      = "load"
@@ -76,8 +81,29 @@ const (
 	// MaxApplicationArguments covers the full register argument set plus the
 	// first entry-stack arguments on the supported amd64 and arm64 ABIs. QUIC
 	// APIs such as ngtcp2 expose stream buffers beyond argument eight.
-	MaxApplicationArguments = 12
-	MaxJNIRegisterHooks     = 4
+	MaxApplicationArguments    = 12
+	MaxApplicationVectorStride = 256
+	MaxJNIRegisterHooks        = 4
+	MaxJNIConversionHooks      = 4
+	MaxJNIConversionCallers    = 256
+
+	JNIConversionGetStringLength               = "get_string_length"
+	JNIConversionGetStringChars                = "get_string_chars"
+	JNIConversionReleaseStringChars            = "release_string_chars"
+	JNIConversionGetStringUTFLength            = "get_string_utf_length"
+	JNIConversionGetStringUTFChars             = "get_string_utf_chars"
+	JNIConversionReleaseStringUTFChars         = "release_string_utf_chars"
+	JNIConversionGetArrayLength                = "get_array_length"
+	JNIConversionGetByteArrayElements          = "get_byte_array_elements"
+	JNIConversionReleaseByteArrayElements      = "release_byte_array_elements"
+	JNIConversionGetByteArrayRegion            = "get_byte_array_region"
+	JNIConversionSetByteArrayRegion            = "set_byte_array_region"
+	JNIConversionGetPrimitiveArrayCritical     = "get_primitive_array_critical"
+	JNIConversionReleasePrimitiveArrayCritical = "release_primitive_array_critical"
+	JNIConversionGetStringCritical             = "get_string_critical"
+	JNIConversionReleaseStringCritical         = "release_string_critical"
+	JNIConversionGetDirectBufferAddress        = "get_direct_buffer_address"
+	JNIConversionGetDirectBufferCapacity       = "get_direct_buffer_capacity"
 )
 
 var (
@@ -86,6 +112,7 @@ var (
 		StrategyTLSPlaintext: {},
 		StrategyTLSKeys:      {},
 		StrategyQUICMetadata: {},
+		StrategyBoundaryData: {},
 		StrategyAppData:      {},
 		StrategyJNIDiscovery: {},
 		StrategyCronet:       {},
@@ -97,6 +124,25 @@ var (
 		HookSSLSetRFD:      {},
 		HookSSLSetWFD:      {},
 		HookSSLProvideQUIC: {},
+	}
+	supportedJNIConversionRoles = map[string]struct{}{
+		JNIConversionGetStringLength:               {},
+		JNIConversionGetStringChars:                {},
+		JNIConversionReleaseStringChars:            {},
+		JNIConversionGetStringUTFLength:            {},
+		JNIConversionGetStringUTFChars:             {},
+		JNIConversionReleaseStringUTFChars:         {},
+		JNIConversionGetArrayLength:                {},
+		JNIConversionGetByteArrayElements:          {},
+		JNIConversionReleaseByteArrayElements:      {},
+		JNIConversionGetByteArrayRegion:            {},
+		JNIConversionSetByteArrayRegion:            {},
+		JNIConversionGetPrimitiveArrayCritical:     {},
+		JNIConversionReleasePrimitiveArrayCritical: {},
+		JNIConversionGetStringCritical:             {},
+		JNIConversionReleaseStringCritical:         {},
+		JNIConversionGetDirectBufferAddress:        {},
+		JNIConversionGetDirectBufferCapacity:       {},
 	}
 	structOffsetConstants = map[string]string{
 		OffsetSSLRBIO:       "ecapture_offset_ssl_st_rbio",
@@ -176,30 +222,52 @@ type ApplicationCapture struct {
 	PcapFile          string   `json:"pcap_file,omitempty"`
 	KeylogFile        string   `json:"keylog_file,omitempty"`
 	PcapFilter        string   `json:"pcap_filter,omitempty"`
-	PerfReorder       *bool    `json:"perf_reorder,omitempty"`
-	PerfReorderLagMs  uint     `json:"perf_reorder_lag_ms,omitempty"`
+	PerfBufferPages   uint     `json:"perf_buffer_pages,omitempty"`
+	// EmitPacketEvents duplicates raw packets into the structured event sink.
+	// PCAPNG remains authoritative when this is false. The pointer preserves
+	// the historical default for profiles that do not specify the field.
+	EmitPacketEvents *bool `json:"emit_packet_events,omitempty"`
+	PerfReorder      *bool `json:"perf_reorder,omitempty"`
+	PerfReorderLagMs uint  `json:"perf_reorder_lag_ms,omitempty"`
 }
 
 type ApplicationTLS struct {
-	Library         string                 `json:"library,omitempty"`
-	LibraryGlob     string                 `json:"library_glob,omitempty"`
-	BuildID         string                 `json:"build_id,omitempty"`
-	Version         string                 `json:"version,omitempty"`
-	BoringSSL       *bool                  `json:"boring_ssl,omitempty"`
-	MasterHookFuncs []string               `json:"master_hook_funcs,omitempty"`
-	Hooks           map[string]HookProfile `json:"hooks,omitempty"`
+	Library               string                 `json:"library,omitempty"`
+	LibraryGlob           string                 `json:"library_glob,omitempty"`
+	AdditionalLibraries   []string               `json:"additional_libraries,omitempty"`
+	AdditionalLibGlobs    []string               `json:"additional_library_globs,omitempty"`
+	AutoDiscoverLibraries bool                   `json:"auto_discover_libraries,omitempty"`
+	BuildID               string                 `json:"build_id,omitempty"`
+	Version               string                 `json:"version,omitempty"`
+	BoringSSL             *bool                  `json:"boring_ssl,omitempty"`
+	MasterHookFuncs       []string               `json:"master_hook_funcs,omitempty"`
+	Hooks                 map[string]HookProfile `json:"hooks,omitempty"`
 }
 
 // JNIDiscoveryProfile attaches specialized RegisterNatives decoders to ART.
 // The offsets can be found without private symbols by locating the standard
 // JNINativeInterface table (RegisterNatives is entry 215).
 type JNIDiscoveryProfile struct {
-	Library                string        `json:"library,omitempty"`
-	LibraryGlob            string        `json:"library_glob,omitempty"`
-	BuildID                string        `json:"build_id,omitempty"`
-	RegisterNativesOffsets []OffsetValue `json:"register_natives_offsets"`
+	Library                string                   `json:"library,omitempty"`
+	LibraryGlob            string                   `json:"library_glob,omitempty"`
+	BuildID                string                   `json:"build_id,omitempty"`
+	RegisterNativesOffsets []OffsetValue            `json:"register_natives_offsets,omitempty"`
+	ConversionOffsets      map[string][]OffsetValue `json:"conversion_offsets,omitempty"`
+	CallerAllowlist        []JNIConversionCaller    `json:"caller_allowlist,omitempty"`
 
 	resolvedLibrary string
+}
+
+// JNIConversionCaller is an ASLR-stable allowlist entry for one native
+// callsite invoking a standard JNIEnv conversion function. Module matches an
+// ELF basename while ModuleGlob matches the complete path in /proc/PID/maps.
+// BuildID is optional for diagnostics but should be pinned in production.
+type JNIConversionCaller struct {
+	Module     string      `json:"module,omitempty"`
+	ModuleGlob string      `json:"module_glob,omitempty"`
+	BuildID    string      `json:"build_id,omitempty"`
+	Role       string      `json:"role"`
+	Offset     OffsetValue `json:"offset"`
 }
 
 // HookProfile selects either an exported symbol or a file offset for a
@@ -211,38 +279,59 @@ type HookProfile struct {
 }
 
 // ApplicationDataHook describes a generic user-space function whose arguments
-// expose application plaintext. It supports direct pointer/length arguments
-// as well as one level of indirection and structure offsets, which is useful
-// for Cronet buffers and private networking SDKs.
+// expose bytes at a declared capture boundary. It supports direct
+// pointer/length arguments as well as one level of indirection and structure
+// offsets, which is useful for socket APIs, custom BIOs, Cronet buffers, and
+// private networking SDKs.
 type ApplicationDataHook struct {
-	Name           string      `json:"name"`
-	Library        string      `json:"library,omitempty"`
-	LibraryGlob    string      `json:"library_glob,omitempty"`
-	BuildID        string      `json:"build_id,omitempty"`
-	Symbol         string      `json:"symbol,omitempty"`
-	Offset         OffsetValue `json:"offset,omitempty"`
-	Direction      string      `json:"direction"`
-	CaptureOn      string      `json:"capture_on,omitempty"`
-	BufferArg      uint32      `json:"buffer_arg"`
-	BufferFormat   string      `json:"buffer_format,omitempty"`
-	BufferOffset   OffsetValue `json:"buffer_offset,omitempty"`
-	BufferIndirect bool        `json:"buffer_indirect,omitempty"`
-	LengthSource   string      `json:"length_source,omitempty"`
-	LengthArg      uint32      `json:"length_arg,omitempty"`
-	FixedLength    uint32      `json:"fixed_length,omitempty"`
-	LengthOffset   OffsetValue `json:"length_offset,omitempty"`
-	LengthSize     uint32      `json:"length_size,omitempty"`
-	LengthIndirect bool        `json:"length_indirect,omitempty"`
-	MaxBytes       uint32      `json:"max_bytes,omitempty"`
-	ContextArg     uint32      `json:"context_arg,omitempty"`
-	StreamArg      uint32      `json:"stream_arg,omitempty"`
-	VectorCountArg uint32      `json:"vector_count_arg,omitempty"`
-	StateGroup     string      `json:"state_group,omitempty"`
-	StateAction    string      `json:"state_action,omitempty"`
-	StateKeyArg    uint32      `json:"state_key_arg,omitempty"`
-	Disabled       bool        `json:"disabled,omitempty"`
+	Name                   string      `json:"name"`
+	Library                string      `json:"library,omitempty"`
+	LibraryGlob            string      `json:"library_glob,omitempty"`
+	BuildID                string      `json:"build_id,omitempty"`
+	CaptureLayer           string      `json:"capture_layer,omitempty"`
+	Transport              string      `json:"transport,omitempty"`
+	BoundaryRole           string      `json:"boundary_role,omitempty"`
+	Symbol                 string      `json:"symbol,omitempty"`
+	Offset                 OffsetValue `json:"offset,omitempty"`
+	Direction              string      `json:"direction"`
+	CaptureOn              string      `json:"capture_on,omitempty"`
+	BufferArg              uint32      `json:"buffer_arg"`
+	BufferFormat           string      `json:"buffer_format,omitempty"`
+	BufferOffset           OffsetValue `json:"buffer_offset,omitempty"`
+	BufferIndirect         bool        `json:"buffer_indirect,omitempty"`
+	LengthSource           string      `json:"length_source,omitempty"`
+	LengthArg              uint32      `json:"length_arg,omitempty"`
+	FixedLength            uint32      `json:"fixed_length,omitempty"`
+	LengthOffset           OffsetValue `json:"length_offset,omitempty"`
+	LengthSize             uint32      `json:"length_size,omitempty"`
+	LengthIndirect         bool        `json:"length_indirect,omitempty"`
+	MaxBytes               uint32      `json:"max_bytes,omitempty"`
+	ContextArg             uint32      `json:"context_arg,omitempty"`
+	ContextOffset          OffsetValue `json:"context_offset,omitempty"`
+	ContextSize            uint32      `json:"context_size,omitempty"`
+	StreamArg              uint32      `json:"stream_arg,omitempty"`
+	StreamOffset           OffsetValue `json:"stream_offset,omitempty"`
+	StreamSize             uint32      `json:"stream_size,omitempty"`
+	StreamByteOffsetArg    uint32      `json:"stream_byte_offset_arg,omitempty"`
+	StreamByteOffsetOffset OffsetValue `json:"stream_byte_offset_offset,omitempty"`
+	StreamByteOffsetSize   uint32      `json:"stream_byte_offset_size,omitempty"`
+	FinArg                 uint32      `json:"fin_arg,omitempty"`
+	FinOffset              OffsetValue `json:"fin_offset,omitempty"`
+	FinSize                uint32      `json:"fin_size,omitempty"`
+	VectorCountArg         uint32      `json:"vector_count_arg,omitempty"`
+	VectorStride           uint32      `json:"vector_stride,omitempty"`
+	VectorBaseOffset       uint32      `json:"vector_base_offset,omitempty"`
+	VectorLengthOffset     uint32      `json:"vector_length_offset,omitempty"`
+	VectorLengthSize       uint32      `json:"vector_length_size,omitempty"`
+	StateGroup             string      `json:"state_group,omitempty"`
+	StateAction            string      `json:"state_action,omitempty"`
+	StateKeyArg            uint32      `json:"state_key_arg,omitempty"`
+	CollectUserStack       bool        `json:"collect_user_stack,omitempty"`
+	Disabled               bool        `json:"disabled,omitempty"`
 
 	resolvedLibrary string
+	resolvedTarget  libraryTarget
+	resolvedOffset  uint64
 	stateID         uint32
 }
 
@@ -297,9 +386,19 @@ func (p *ApplicationProfile) Validate() error {
 	default:
 		return fmt.Errorf("unsupported unknown_flows policy %q", p.Capture.UnknownFlows)
 	}
+	if p.Capture.PerfBufferPages != 0 &&
+		(p.Capture.PerfBufferPages < 64 ||
+			p.Capture.PerfBufferPages > 16384) {
+		return fmt.Errorf(
+			"perf_buffer_pages must be between 64 and 16384, got %d",
+			p.Capture.PerfBufferPages,
+		)
+	}
 	if p.TLS.Library != "" && p.TLS.LibraryGlob != "" {
 		return fmt.Errorf("tls.library and tls.library_glob are mutually exclusive")
 	}
+	p.TLS.AdditionalLibraries = normalizePaths(p.TLS.AdditionalLibraries)
+	p.TLS.AdditionalLibGlobs = normalizePaths(p.TLS.AdditionalLibGlobs)
 	var err error
 	p.TLS.BuildID, err = normalizeBuildID(p.TLS.BuildID)
 	if err != nil {
@@ -365,8 +464,8 @@ func validateJNIDiscovery(profile *ApplicationProfile) error {
 	if err != nil {
 		return fmt.Errorf("jni_discovery build_id: %w", err)
 	}
-	if len(jni.RegisterNativesOffsets) == 0 {
-		return fmt.Errorf("jni_discovery requires at least one register_natives_offsets entry")
+	if len(jni.RegisterNativesOffsets) == 0 && len(jni.ConversionOffsets) == 0 {
+		return fmt.Errorf("jni_discovery requires RegisterNatives or conversion offsets")
 	}
 	if len(jni.RegisterNativesOffsets) > MaxJNIRegisterHooks {
 		return fmt.Errorf("jni_discovery has %d RegisterNatives offsets, maximum is %d",
@@ -385,6 +484,99 @@ func validateJNIDiscovery(profile *ApplicationProfile) error {
 		normalized = append(normalized, offset)
 	}
 	jni.RegisterNativesOffsets = normalized
+	conversionOffsets := make(map[string][]OffsetValue, len(jni.ConversionOffsets))
+	usedOffsets := make(map[OffsetValue]string)
+	for rawRole, offsets := range jni.ConversionOffsets {
+		role := strings.ToLower(strings.TrimSpace(rawRole))
+		if _, found := supportedJNIConversionRoles[role]; !found {
+			return fmt.Errorf("jni_discovery has unsupported conversion role %q", rawRole)
+		}
+		if len(offsets) == 0 {
+			return fmt.Errorf("jni_discovery conversion role %q has no offsets", role)
+		}
+		if len(offsets) > MaxJNIConversionHooks {
+			return fmt.Errorf("jni_discovery conversion role %q has %d offsets, maximum is %d",
+				role, len(offsets), MaxJNIConversionHooks)
+		}
+		roleSeen := make(map[OffsetValue]struct{}, len(offsets))
+		for _, offset := range offsets {
+			if offset == 0 {
+				return fmt.Errorf("jni_discovery conversion role %q has a zero offset", role)
+			}
+			if _, found := roleSeen[offset]; found {
+				continue
+			}
+			if otherRole, found := usedOffsets[offset]; found && otherRole != role {
+				return fmt.Errorf(
+					"jni_discovery conversion offset %#x is ambiguous between %q and %q",
+					uint64(offset), otherRole, role)
+			}
+			roleSeen[offset] = struct{}{}
+			usedOffsets[offset] = role
+			conversionOffsets[role] = append(conversionOffsets[role], offset)
+		}
+	}
+	jni.ConversionOffsets = conversionOffsets
+	if len(jni.CallerAllowlist) > MaxJNIConversionCallers {
+		return fmt.Errorf(
+			"jni_discovery has %d caller allowlist entries, maximum is %d",
+			len(jni.CallerAllowlist),
+			MaxJNIConversionCallers,
+		)
+	}
+	callers := make([]JNIConversionCaller, 0, len(jni.CallerAllowlist))
+	callerSeen := make(map[string]struct{}, len(jni.CallerAllowlist))
+	for index, caller := range jni.CallerAllowlist {
+		caller.Module = strings.TrimSpace(caller.Module)
+		caller.ModuleGlob = strings.TrimSpace(caller.ModuleGlob)
+		if (caller.Module == "") == (caller.ModuleGlob == "") {
+			return fmt.Errorf(
+				"jni_discovery caller allowlist entry %d requires exactly one of module or module_glob",
+				index,
+			)
+		}
+		if strings.ContainsAny(caller.Module, `/\`) {
+			return fmt.Errorf(
+				"jni_discovery caller allowlist entry %d module must be an ELF basename; use module_glob for paths",
+				index,
+			)
+		}
+		caller.Role = strings.ToLower(strings.TrimSpace(caller.Role))
+		if _, found := supportedJNIConversionRoles[caller.Role]; !found {
+			return fmt.Errorf(
+				"jni_discovery caller allowlist entry %d has unsupported role %q",
+				index,
+				caller.Role,
+			)
+		}
+		if caller.Offset == 0 {
+			return fmt.Errorf(
+				"jni_discovery caller allowlist entry %d has a zero offset",
+				index,
+			)
+		}
+		caller.BuildID, err = normalizeBuildID(caller.BuildID)
+		if err != nil {
+			return fmt.Errorf(
+				"jni_discovery caller allowlist entry %d build_id: %w",
+				index,
+				err,
+			)
+		}
+		key := strings.Join([]string{
+			caller.Module,
+			caller.ModuleGlob,
+			caller.BuildID,
+			caller.Role,
+			fmt.Sprintf("%x", uint64(caller.Offset)),
+		}, "\x00")
+		if _, found := callerSeen[key]; found {
+			continue
+		}
+		callerSeen[key] = struct{}{}
+		callers = append(callers, caller)
+	}
+	jni.CallerAllowlist = callers
 	return nil
 }
 
@@ -417,6 +609,94 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 		hook.BuildID, err = normalizeBuildID(hook.BuildID)
 		if err != nil {
 			return fmt.Errorf("application data hook %q build_id: %w", hook.Name, err)
+		}
+		hook.CaptureLayer = strings.ToLower(strings.TrimSpace(hook.CaptureLayer))
+		hook.Transport = strings.ToLower(strings.TrimSpace(hook.Transport))
+		hook.BoundaryRole = strings.ToLower(strings.TrimSpace(hook.BoundaryRole))
+		if hook.CaptureLayer == "" {
+			// Existing data_hooks predate provenance. Treat them as semantic
+			// rather than claiming that an unknown private ABI is a transport
+			// boundary.
+			hook.CaptureLayer = CaptureLayerSemantic
+		}
+		switch hook.CaptureLayer {
+		case CaptureLayerWire:
+			if hook.Transport == "" {
+				hook.Transport = CaptureTransportSocket
+			}
+			if hook.Transport != CaptureTransportSocket &&
+				hook.Transport != CaptureTransportTLS &&
+				hook.Transport != CaptureTransportFD {
+				return fmt.Errorf(
+					"application data hook %q capture_layer=%s requires transport=tls, socket, or fd",
+					hook.Name,
+					CaptureLayerWire,
+				)
+			}
+		case CaptureLayerTransport:
+			switch hook.Transport {
+			case CaptureTransportTLS, CaptureTransportQUIC:
+			default:
+				return fmt.Errorf(
+					"application data hook %q capture_layer=%s requires transport=tls or transport=quic",
+					hook.Name,
+					CaptureLayerTransport,
+				)
+			}
+		case CaptureLayerSemantic:
+			if hook.Transport != "" {
+				return fmt.Errorf(
+					"application data hook %q capture_layer=%s cannot claim transport=%q",
+					hook.Name,
+					CaptureLayerSemantic,
+					hook.Transport,
+				)
+			}
+		default:
+			return fmt.Errorf(
+				"application data hook %q has unsupported capture_layer %q",
+				hook.Name,
+				hook.CaptureLayer,
+			)
+		}
+		if hook.BoundaryRole != "" {
+			switch hook.BoundaryRole {
+			case CaptureBoundaryTLSCiphertext,
+				CaptureBoundarySocketPayload,
+				CaptureBoundaryFDPayload:
+			default:
+				return fmt.Errorf(
+					"application data hook %q has unsupported boundary_role %q",
+					hook.Name,
+					hook.BoundaryRole,
+				)
+			}
+			requiredTransport := ""
+			switch hook.BoundaryRole {
+			case CaptureBoundaryTLSCiphertext:
+				requiredTransport = CaptureTransportTLS
+			case CaptureBoundarySocketPayload:
+				requiredTransport = CaptureTransportSocket
+			case CaptureBoundaryFDPayload:
+				requiredTransport = CaptureTransportFD
+			}
+			if hook.CaptureLayer != CaptureLayerWire ||
+				hook.Transport != requiredTransport {
+				return fmt.Errorf(
+					"application data hook %q boundary_role=%s requires capture_layer=%s and transport=%s",
+					hook.Name,
+					hook.BoundaryRole,
+					CaptureLayerWire,
+					requiredTransport,
+				)
+			}
+			if hook.ContextArg == 0 {
+				return fmt.Errorf(
+					"application data hook %q boundary_role=%s requires context_arg",
+					hook.Name,
+					hook.BoundaryRole,
+				)
+			}
 		}
 		if hook.Library == "" && hook.LibraryGlob == "" {
 			return fmt.Errorf("application data hook %q requires library or library_glob", hook.Name)
@@ -456,16 +736,111 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 			return fmt.Errorf("application data hook %q context_arg must be between 0 and %d",
 				hook.Name, MaxApplicationArguments)
 		}
+		if uint64(hook.ContextOffset) > 1<<20 {
+			return fmt.Errorf("application data hook %q context_offset is unreasonably large: %#x",
+				hook.Name, uint64(hook.ContextOffset))
+		}
+		if hook.ContextOffset != 0 && hook.ContextSize == 0 {
+			hook.ContextSize = 8
+		}
+		if hook.ContextSize != 0 {
+			if hook.ContextArg == 0 {
+				return fmt.Errorf("application data hook %q context_size requires context_arg",
+					hook.Name)
+			}
+			switch hook.ContextSize {
+			case 1, 2, 4, 8:
+			default:
+				return fmt.Errorf("application data hook %q context_size must be 1, 2, 4, or 8",
+					hook.Name)
+			}
+		}
 		if hook.StreamArg > MaxApplicationArguments {
 			return fmt.Errorf("application data hook %q stream_arg must be between 0 and %d",
 				hook.Name, MaxApplicationArguments)
+		}
+		if uint64(hook.StreamOffset) > 1<<20 {
+			return fmt.Errorf("application data hook %q stream_offset is unreasonably large: %#x",
+				hook.Name, uint64(hook.StreamOffset))
+		}
+		if hook.StreamOffset != 0 && hook.StreamSize == 0 {
+			hook.StreamSize = 8
+		}
+		if hook.StreamSize != 0 {
+			if hook.StreamArg == 0 {
+				return fmt.Errorf("application data hook %q stream_size requires stream_arg",
+					hook.Name)
+			}
+			switch hook.StreamSize {
+			case 1, 2, 4, 8:
+			default:
+				return fmt.Errorf("application data hook %q stream_size must be 1, 2, 4, or 8",
+					hook.Name)
+			}
+		}
+		if hook.StreamByteOffsetArg > MaxApplicationArguments {
+			return fmt.Errorf("application data hook %q stream_byte_offset_arg must be between 0 and %d",
+				hook.Name, MaxApplicationArguments)
+		}
+		if uint64(hook.StreamByteOffsetOffset) > 1<<20 {
+			return fmt.Errorf("application data hook %q stream_byte_offset_offset is unreasonably large: %#x",
+				hook.Name, uint64(hook.StreamByteOffsetOffset))
+		}
+		if hook.StreamByteOffsetOffset != 0 && hook.StreamByteOffsetSize == 0 {
+			hook.StreamByteOffsetSize = 8
+		}
+		if hook.StreamByteOffsetSize != 0 {
+			if hook.StreamByteOffsetArg == 0 {
+				return fmt.Errorf("application data hook %q stream_byte_offset_size requires stream_byte_offset_arg",
+					hook.Name)
+			}
+			switch hook.StreamByteOffsetSize {
+			case 1, 2, 4, 8:
+			default:
+				return fmt.Errorf("application data hook %q stream_byte_offset_size must be 1, 2, 4, or 8",
+					hook.Name)
+			}
+		}
+		if hook.FinArg > MaxApplicationArguments {
+			return fmt.Errorf("application data hook %q fin_arg must be between 0 and %d",
+				hook.Name, MaxApplicationArguments)
+		}
+		if uint64(hook.FinOffset) > 1<<20 {
+			return fmt.Errorf("application data hook %q fin_offset is unreasonably large: %#x",
+				hook.Name, uint64(hook.FinOffset))
+		}
+		if hook.FinOffset != 0 && hook.FinSize == 0 {
+			hook.FinSize = 1
+		}
+		if hook.FinSize != 0 {
+			if hook.FinArg == 0 {
+				return fmt.Errorf("application data hook %q fin_size requires fin_arg",
+					hook.Name)
+			}
+			switch hook.FinSize {
+			case 1, 2, 4, 8:
+			default:
+				return fmt.Errorf("application data hook %q fin_size must be 1, 2, 4, or 8",
+					hook.Name)
+			}
+		}
+		if (hook.StreamByteOffsetArg != 0 || hook.FinArg != 0) &&
+			(hook.CaptureLayer != CaptureLayerTransport ||
+				hook.Transport != CaptureTransportQUIC) {
+			return fmt.Errorf(
+				"application data hook %q stream byte offset and FIN metadata require capture_layer=%s and transport=%s",
+				hook.Name,
+				CaptureLayerTransport,
+				CaptureTransportQUIC,
+			)
 		}
 		hook.BufferFormat = strings.ToLower(strings.TrimSpace(hook.BufferFormat))
 		if hook.BufferFormat == "" {
 			hook.BufferFormat = AppDataBufferRaw
 		}
 		switch hook.BufferFormat {
-		case AppDataBufferRaw, AppDataBufferLibCXX, AppDataBufferIOVec, AppDataBufferMsgHdr:
+		case AppDataBufferRaw, AppDataBufferLibCXX, AppDataBufferIOVec,
+			AppDataBufferVector, AppDataBufferMsgHdr:
 		default:
 			return fmt.Errorf("application data hook %q has unsupported buffer_format %q",
 				hook.Name, hook.BufferFormat)
@@ -481,6 +856,7 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 		hook.StateGroup = strings.ToLower(strings.TrimSpace(hook.StateGroup))
 		hook.StateAction = strings.ToLower(strings.TrimSpace(hook.StateAction))
 		if (hook.BufferFormat == AppDataBufferIOVec ||
+			hook.BufferFormat == AppDataBufferVector ||
 			hook.BufferFormat == AppDataBufferMsgHdr) && hook.StateAction != "" {
 			return fmt.Errorf("application data hook %q buffer_format=%s does not support asynchronous state pairing",
 				hook.Name, hook.BufferFormat)
@@ -528,14 +904,53 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 		}
 
 		hook.LengthSource = strings.ToLower(strings.TrimSpace(hook.LengthSource))
-		if hook.BufferFormat == AppDataBufferIOVec {
+		isArgumentVector := hook.BufferFormat == AppDataBufferIOVec ||
+			hook.BufferFormat == AppDataBufferVector
+		if isArgumentVector {
 			if hook.VectorCountArg < 1 || hook.VectorCountArg > MaxApplicationArguments {
 				return fmt.Errorf("application data hook %q buffer_format=%s requires vector_count_arg between 1 and %d",
-					hook.Name, AppDataBufferIOVec, MaxApplicationArguments)
+					hook.Name, hook.BufferFormat, MaxApplicationArguments)
 			}
 			if hook.BufferOffset != 0 || hook.BufferIndirect {
-				return fmt.Errorf("application data hook %q buffer_format=%s requires a direct iovec pointer",
-					hook.Name, AppDataBufferIOVec)
+				return fmt.Errorf("application data hook %q buffer_format=%s requires a direct vector pointer",
+					hook.Name, hook.BufferFormat)
+			}
+			if hook.BufferFormat == AppDataBufferIOVec {
+				if (hook.VectorStride != 0 && hook.VectorStride != 16) ||
+					hook.VectorBaseOffset != 0 ||
+					(hook.VectorLengthOffset != 0 && hook.VectorLengthOffset != 8) ||
+					(hook.VectorLengthSize != 0 && hook.VectorLengthSize != 8) {
+					return fmt.Errorf("application data hook %q buffer_format=%s has a fixed 64-bit struct iovec layout; use buffer_format=%s for a private layout",
+						hook.Name, AppDataBufferIOVec, AppDataBufferVector)
+				}
+				hook.VectorStride = 16
+				hook.VectorBaseOffset = 0
+				hook.VectorLengthOffset = 8
+				hook.VectorLengthSize = 8
+			} else {
+				if hook.VectorStride == 0 ||
+					hook.VectorStride > MaxApplicationVectorStride {
+					return fmt.Errorf("application data hook %q buffer_format=%s requires vector_stride between 1 and %d",
+						hook.Name, AppDataBufferVector, MaxApplicationVectorStride)
+				}
+				if hook.VectorLengthSize == 0 {
+					hook.VectorLengthSize = 8
+				}
+				switch hook.VectorLengthSize {
+				case 1, 2, 4, 8:
+				default:
+					return fmt.Errorf("application data hook %q vector_length_size must be 1, 2, 4, or 8",
+						hook.Name)
+				}
+				if uint64(hook.VectorBaseOffset)+8 > uint64(hook.VectorStride) {
+					return fmt.Errorf("application data hook %q vector base field exceeds vector_stride",
+						hook.Name)
+				}
+				if uint64(hook.VectorLengthOffset)+uint64(hook.VectorLengthSize) >
+					uint64(hook.VectorStride) {
+					return fmt.Errorf("application data hook %q vector length field exceeds vector_stride",
+						hook.Name)
+				}
 			}
 			switch hook.LengthSource {
 			case "":
@@ -543,31 +958,37 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 					hook.LengthOffset != 0 || hook.LengthSize != 0 ||
 					hook.LengthIndirect {
 					return fmt.Errorf("application data hook %q buffer_format=%s derives lengths from vector entries and the optional function return value",
-						hook.Name, AppDataBufferIOVec)
+						hook.Name, hook.BufferFormat)
 				}
 			case AppDataLengthReturn:
 				if hook.CaptureOn != AppDataCaptureReturn {
 					return fmt.Errorf("application data hook %q buffer_format=%s length_source=return requires capture_on=return",
-						hook.Name, AppDataBufferIOVec)
+						hook.Name, hook.BufferFormat)
 				}
 				if hook.LengthArg != 0 || hook.FixedLength != 0 ||
-					hook.LengthOffset != 0 || hook.LengthSize != 0 ||
-					hook.LengthIndirect {
-					return fmt.Errorf("application data hook %q buffer_format=%s length_source=return does not use length fields",
-						hook.Name, AppDataBufferIOVec)
+					hook.LengthOffset != 0 || hook.LengthIndirect {
+					return fmt.Errorf("application data hook %q buffer_format=%s length_source=return only accepts length_size",
+						hook.Name, hook.BufferFormat)
+				}
+				if hook.LengthSize == 0 {
+					hook.LengthSize = 8
+				}
+				if hook.LengthSize != 4 && hook.LengthSize != 8 {
+					return fmt.Errorf("application data hook %q buffer_format=%s return length_size must be 4 or 8",
+						hook.Name, hook.BufferFormat)
 				}
 			case AppDataLengthMemory:
 				if hook.CaptureOn != AppDataCaptureReturn {
 					return fmt.Errorf("application data hook %q buffer_format=%s length_source=memory requires capture_on=return",
-						hook.Name, AppDataBufferIOVec)
+						hook.Name, hook.BufferFormat)
 				}
 				if hook.LengthArg < 1 || hook.LengthArg > MaxApplicationArguments {
 					return fmt.Errorf("application data hook %q buffer_format=%s length_source=memory requires length_arg between 1 and %d",
-						hook.Name, AppDataBufferIOVec, MaxApplicationArguments)
+						hook.Name, hook.BufferFormat, MaxApplicationArguments)
 				}
 				if hook.FixedLength != 0 {
 					return fmt.Errorf("application data hook %q buffer_format=%s length_source=memory does not use fixed_length",
-						hook.Name, AppDataBufferIOVec)
+						hook.Name, hook.BufferFormat)
 				}
 				if hook.LengthSize == 0 {
 					hook.LengthSize = 8
@@ -580,7 +1001,7 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 				}
 			default:
 				return fmt.Errorf("application data hook %q buffer_format=%s supports only empty, return, or memory length_source",
-					hook.Name, AppDataBufferIOVec)
+					hook.Name, hook.BufferFormat)
 			}
 			if hook.MaxBytes > MaxApplicationData {
 				return fmt.Errorf("application data hook %q max_bytes %d exceeds %d",
@@ -615,6 +1036,17 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 				return fmt.Errorf("application data hook %q buffer_format=%s length_size must be 4 or 8",
 					hook.Name, AppDataBufferMsgHdr)
 			}
+			if (hook.VectorStride != 0 && hook.VectorStride != 16) ||
+				hook.VectorBaseOffset != 0 ||
+				(hook.VectorLengthOffset != 0 && hook.VectorLengthOffset != 8) ||
+				(hook.VectorLengthSize != 0 && hook.VectorLengthSize != 8) {
+				return fmt.Errorf("application data hook %q buffer_format=%s requires standard 64-bit iovec entries",
+					hook.Name, AppDataBufferMsgHdr)
+			}
+			hook.VectorStride = 16
+			hook.VectorBaseOffset = 0
+			hook.VectorLengthOffset = 8
+			hook.VectorLengthSize = 8
 			if hook.MaxBytes > MaxApplicationData {
 				return fmt.Errorf("application data hook %q max_bytes %d exceeds %d",
 					hook.Name, hook.MaxBytes, MaxApplicationData)
@@ -622,8 +1054,13 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 			continue
 		}
 		if hook.VectorCountArg != 0 {
-			return fmt.Errorf("application data hook %q vector_count_arg requires buffer_format=%s",
-				hook.Name, AppDataBufferIOVec)
+			return fmt.Errorf("application data hook %q vector_count_arg requires buffer_format=%s or %s",
+				hook.Name, AppDataBufferIOVec, AppDataBufferVector)
+		}
+		if hook.VectorStride != 0 || hook.VectorBaseOffset != 0 ||
+			hook.VectorLengthOffset != 0 || hook.VectorLengthSize != 0 {
+			return fmt.Errorf("application data hook %q vector layout fields require buffer_format=%s, %s, or %s",
+				hook.Name, AppDataBufferIOVec, AppDataBufferVector, AppDataBufferMsgHdr)
 		}
 		if hook.BufferFormat == AppDataBufferLibCXX {
 			if hook.LengthSource != "" || hook.LengthArg != 0 || hook.FixedLength != 0 ||
@@ -690,6 +1127,18 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 				return fmt.Errorf("application data hook %q length_source=return requires capture_on=return",
 					hook.Name)
 			}
+			if hook.LengthArg != 0 || hook.LengthOffset != 0 ||
+				hook.LengthIndirect {
+				return fmt.Errorf("application data hook %q length_source=return only accepts length_size",
+					hook.Name)
+			}
+			if hook.LengthSize == 0 {
+				hook.LengthSize = 8
+			}
+			if hook.LengthSize != 4 && hook.LengthSize != 8 {
+				return fmt.Errorf("application data hook %q return length_size must be 4 or 8",
+					hook.Name)
+			}
 		default:
 			return fmt.Errorf("application data hook %q has unsupported length_source %q",
 				hook.Name, hook.LengthSource)
@@ -739,6 +1188,23 @@ func normalizeStrings(values []string) []string {
 	return normalized
 }
 
+func normalizePaths(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		normalized = append(normalized, value)
+	}
+	return normalized
+}
+
 func normalizeInterfaceNames(values []string) []string {
 	seen := make(map[string]struct{}, len(values))
 	normalized := make([]string, 0, len(values))
@@ -758,19 +1224,9 @@ func normalizeInterfaceNames(values []string) []string {
 }
 
 func resolveLibraryGlob(pattern string) (string, error) {
-	matches, err := filepath.Glob(pattern)
+	candidates, err := resolveLibrarySpecGlobAll(pattern)
 	if err != nil {
-		return "", fmt.Errorf("invalid library glob %q: %w", pattern, err)
-	}
-	candidates := make([]string, 0, len(matches))
-	for _, match := range matches {
-		info, statErr := os.Stat(match)
-		if statErr == nil && !info.IsDir() {
-			candidates = append(candidates, match)
-		}
-	}
-	if len(candidates) == 0 {
-		return "", fmt.Errorf("library glob %q did not match a file", pattern)
+		return "", err
 	}
 	sort.Strings(candidates)
 	return candidates[len(candidates)-1], nil

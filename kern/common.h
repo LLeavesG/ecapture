@@ -58,7 +58,14 @@
 #define TC_ACT_OK 0
 #define ETH_P_IP 0x0800 /* Internet Protocol packet        */
 #define ETH_P_IPV6 0x86DD
-#define SKB_MAX_DATA_SIZE 2048
+/*
+ * perf_event_header.size is a u16.  TC's BPF_F_CTXLEN_MASK appends skb bytes
+ * to the 64-byte metadata payload in one PERF_RECORD_SAMPLE, so forwarding a
+ * 64 KiB GSO/loopback skb can overflow the record boundary and desynchronise
+ * the userspace perf reader.  Keep enough headroom for the perf sample
+ * headers while retaining almost all ordinary/GSO packet data.
+ */
+#define SKB_MAX_DATA_SIZE (60 * 1024)
 
 // .rodata section bug via : https://github.com/gojue/ecapture/issues/39
 
@@ -72,6 +79,15 @@ const volatile u64 target_errno = BASH_ERRNO_DEFAULT;
 // bpf_get_current_cgroup_id() requires kernel >= 4.18
 const volatile u64 target_cgroup_id = 0;
 
+// Additional Android process UIDs which belong to the selected package, such
+// as isolated WebView/Chrome renderer services. The primary package UID stays
+// in target_uid; user space keeps this bounded allowlist synchronized.
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 64);
+    __type(key, u32);
+    __type(value, u8);
+} target_related_uids SEC(".maps");
 
 
 // fix  4.19.91-27.7.al7.x86_64/source/include/linux/kernel.h:140:9: warning: 'roundup' macro redefined

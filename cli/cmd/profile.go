@@ -20,23 +20,33 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"github.com/gojue/ecapture/internal/probe/openssl"
 	"github.com/gojue/ecapture/internal/profileinspector"
 	"github.com/spf13/cobra"
 )
 
 var (
-	profileInspectLibraries []string
-	profileInspectOutput    string
-	profileScaffoldOutput   string
-	profileScaffoldName     string
-	profileScaffoldPackage  string
-	profileScaffoldMaxHooks int
-	profileRecipeCatalog    string
-	profileLearnJNIInput    string
-	profileLearnJNIOutput   string
-	profileLearnJNIMinScore int
-	profileLearnJNIMax      int
+	profileInspectLibraries           []string
+	profileInspectOutput              string
+	profileScaffoldOutput             string
+	profileScaffoldName               string
+	profileScaffoldPackage            string
+	profileScaffoldMaxHooks           int
+	profileScaffoldCollectUserStacks  bool
+	profileIncludeSemanticDiagnostics bool
+	profileRecipeCatalog              string
+	profileLearnJNIInput              string
+	profileLearnJNIOutput             string
+	profileLearnJNIMinScore           int
+	profileLearnJNIMax                int
+	profileLearnJNIProfile            string
+	profileLearnJNIProfileOutput      string
+	profileLearnJNIConversionMinScore int
+	profileLearnJNIConversionMax      int
+	profileLearnJNIConversionModules  []string
+	profileLearnJNIMarkers            []string
 )
 
 var profileCmd = &cobra.Command{
@@ -46,13 +56,14 @@ var profileCmd = &cobra.Command{
 
 var profileInspectCmd = &cobra.Command{
 	Use:         "inspect",
-	Short:       "Inventory ELF libraries and rank reusable plaintext hook candidates.",
+	Short:       "Inventory ELF libraries and rank reusable communication-boundary candidates.",
 	Annotations: map[string]string{skipEnvDetection: "true"},
 	Long: `Inspects executable ELF mappings from --pid and any explicit --library values.
 The JSON report distinguishes reusable public-ABI hooks from hints that still
-need static or marker-based runtime validation. With --scaffold, it also emits
-a diagnostic application profile containing raw packet capture and at most
---max-hooks direct-buffer candidates.`,
+need static or controlled-traffic runtime validation. With --scaffold, it emits
+a communication-only profile containing raw packet capture and at most
+--max-hooks boundary candidates. Semantic/JNI diagnostics are excluded unless
+--include-semantic-diagnostics is explicitly set.`,
 	Example: `ecapture profile inspect --pid 3423 --output report.json
 ecapture profile inspect --pid 3423 --scaffold app-discovery.json
 ecapture profile inspect --library /data/local/tmp/libcronet.so
@@ -63,17 +74,23 @@ ecapture profile inspect --library libprivate.so --recipe-catalog private-abi.js
 
 var profileLearnJNICmd = &cobra.Command{
 	Use:         "learn-jni",
-	Short:       "Rank dynamic JNI native methods as plaintext-boundary candidates.",
+	Short:       "Rank dynamic JNI methods as optional semantic diagnostics.",
 	Annotations: map[string]string{skipEnvDetection: "true"},
-	Long: `Consumes RegisterNatives events emitted by a jni_discovery profile.
+	Long: `Consumes RegisterNatives and managed-reference conversion events emitted by a jni_discovery profile.
 Both --event-format=json output and historical plain event logs are accepted.
 The report ranks methods by payload-bearing JNI signatures and semantic names,
-but never treats managed JNI references as native byte pointers.`,
+and ranks ASLR-stable native conversion callsites carrying text or arbitrary
+binary payloads. With --profile and --profile-output, the selected conversion
+callsites are written into a new profile for exact kernel-side filtering.`,
 	Example: `ecapture tls --profile app-discovery.json \
   --event-format=json --eventaddr=/data/local/tmp/jni-events.jsonl
 ecapture profile learn-jni \
   --input /data/local/tmp/jni-events.jsonl \
-  --output /data/local/tmp/jni-candidates.json`,
+  --output /data/local/tmp/jni-candidates.json \
+  --marker EBPFDISCOVERY-7f91 \
+  --conversion-module 'lib*cronet*.so' \
+  --profile app-discovery.json \
+  --profile-output app-filtered.json`,
 	Args: cobra.NoArgs,
 	RunE: runProfileLearnJNI,
 }
@@ -95,7 +112,7 @@ func init() {
 		&profileScaffoldOutput,
 		"scaffold",
 		"",
-		"write a diagnostic application profile assembled from known direct-buffer ABIs.",
+		"write a communication profile assembled from known boundary ABIs.",
 	)
 	profileInspectCmd.Flags().StringVar(
 		&profileScaffoldName,
@@ -113,7 +130,19 @@ func init() {
 		&profileScaffoldMaxHooks,
 		"max-hooks",
 		8,
-		"maximum number of ranked direct-buffer hooks in the generated profile.",
+		"maximum number of ranked communication-boundary hooks in the generated profile.",
+	)
+	profileInspectCmd.Flags().BoolVar(
+		&profileScaffoldCollectUserStacks,
+		"collect-user-stacks",
+		false,
+		"capture bounded user call chains for scaffold hooks (discovery only; disabled by default).",
+	)
+	profileInspectCmd.Flags().BoolVar(
+		&profileIncludeSemanticDiagnostics,
+		"include-semantic-diagnostics",
+		false,
+		"include optional semantic/JNI reverse-engineering diagnostics in the scaffold.",
 	)
 	profileInspectCmd.Flags().StringVar(
 		&profileRecipeCatalog,
@@ -125,7 +154,7 @@ func init() {
 		&profileLearnJNIInput,
 		"input",
 		"-",
-		"RegisterNatives event log; use - for stdin.",
+		"RegisterNatives/JNI conversion event log; use - for stdin.",
 	)
 	profileLearnJNICmd.Flags().StringVar(
 		&profileLearnJNIOutput,
@@ -144,6 +173,42 @@ func init() {
 		"max-candidates",
 		100,
 		"maximum number of ranked candidates; 0 keeps every candidate.",
+	)
+	profileLearnJNICmd.Flags().IntVar(
+		&profileLearnJNIConversionMinScore,
+		"min-conversion-score",
+		70,
+		"exclude JNI conversion callsites below this score.",
+	)
+	profileLearnJNICmd.Flags().IntVar(
+		&profileLearnJNIConversionMax,
+		"max-conversion-callers",
+		64,
+		"maximum conversion callsites in the report/profile; 0 keeps every callsite.",
+	)
+	profileLearnJNICmd.Flags().StringSliceVar(
+		&profileLearnJNIConversionModules,
+		"conversion-module",
+		nil,
+		"keep conversion callers from matching module basenames or paths (repeatable; shell globs accepted).",
+	)
+	profileLearnJNICmd.Flags().StringSliceVar(
+		&profileLearnJNIMarkers,
+		"marker",
+		nil,
+		"keep conversion callers whose payload contains an injected marker (repeatable).",
+	)
+	profileLearnJNICmd.Flags().StringVar(
+		&profileLearnJNIProfile,
+		"profile",
+		"",
+		"diagnostic application profile to refine with learned conversion callers.",
+	)
+	profileLearnJNICmd.Flags().StringVar(
+		&profileLearnJNIProfileOutput,
+		"profile-output",
+		"",
+		"write a new profile with the learned kernel caller allowlist.",
 	)
 	profileCmd.AddCommand(profileInspectCmd)
 	profileCmd.AddCommand(profileLearnJNICmd)
@@ -187,11 +252,13 @@ func runProfileInspect(command *cobra.Command, _ []string) error {
 		return nil
 	}
 	profile, err := profileinspector.ScaffoldProfile(report, profileinspector.ScaffoldOptions{
-		Name:     profileScaffoldName,
-		Package:  profileScaffoldPackage,
-		UID:      globalConf.Uid,
-		PID:      globalConf.Pid,
-		MaxHooks: profileScaffoldMaxHooks,
+		Name:                       profileScaffoldName,
+		Package:                    profileScaffoldPackage,
+		UID:                        globalConf.Uid,
+		PID:                        globalConf.Pid,
+		MaxHooks:                   profileScaffoldMaxHooks,
+		CollectUserStacks:          profileScaffoldCollectUserStacks,
+		IncludeSemanticDiagnostics: profileIncludeSemanticDiagnostics,
 	})
 	if err != nil {
 		return err
@@ -209,22 +276,21 @@ func runProfileLearnJNI(command *cobra.Command, _ []string) error {
 	if profileLearnJNIMax < 0 {
 		return fmt.Errorf("--max-candidates must be non-negative")
 	}
+	if profileLearnJNIConversionMinScore < 0 {
+		return fmt.Errorf("--min-conversion-score must be non-negative")
+	}
+	if profileLearnJNIConversionMax < 0 {
+		return fmt.Errorf("--max-conversion-callers must be non-negative")
+	}
+	if (profileLearnJNIProfile == "") != (profileLearnJNIProfileOutput == "") {
+		return fmt.Errorf("--profile and --profile-output must be used together")
+	}
+	if err := validateProfileLearningPaths(); err != nil {
+		return err
+	}
 	var input io.Reader = command.InOrStdin()
 	var inputFile *os.File
 	if profileLearnJNIInput != "" && profileLearnJNIInput != "-" {
-		if profileLearnJNIOutput != "" {
-			inputPath, inputErr := filepath.Abs(profileLearnJNIInput)
-			outputPath, outputErr := filepath.Abs(profileLearnJNIOutput)
-			if inputErr != nil {
-				return fmt.Errorf("resolve JNI learning input: %w", inputErr)
-			}
-			if outputErr != nil {
-				return fmt.Errorf("resolve JNI learning output: %w", outputErr)
-			}
-			if filepath.Clean(inputPath) == filepath.Clean(outputPath) {
-				return fmt.Errorf("--input and --output must name different files")
-			}
-		}
 		var err error
 		inputFile, err = os.Open(profileLearnJNIInput)
 		if err != nil {
@@ -233,7 +299,17 @@ func runProfileLearnJNI(command *cobra.Command, _ []string) error {
 		defer inputFile.Close()
 		input = inputFile
 	}
-	report, err := profileinspector.LearnJNI(input)
+	markers := make([][]byte, 0, len(profileLearnJNIMarkers))
+	for _, marker := range profileLearnJNIMarkers {
+		if marker = strings.TrimSpace(marker); marker == "" {
+			return fmt.Errorf("--marker contains an empty value")
+		}
+		markers = append(markers, []byte(marker))
+	}
+	report, err := profileinspector.LearnJNIWithOptions(
+		input,
+		profileinspector.JNILearningOptions{Markers: markers},
+	)
 	if err != nil {
 		return err
 	}
@@ -251,8 +327,127 @@ func runProfileLearnJNI(command *cobra.Command, _ []string) error {
 	for index := range report.Candidates {
 		report.Candidates[index].Rank = index + 1
 	}
+	conversions := report.ConversionCandidates[:0]
+	for _, candidate := range report.ConversionCandidates {
+		if candidate.Score < profileLearnJNIConversionMinScore {
+			continue
+		}
+		if len(markers) != 0 && candidate.MarkerHits == 0 {
+			continue
+		}
+		matched, err := matchesJNIConversionModule(
+			candidate.ModulePath,
+			candidate.ProfileRule.Module,
+			profileLearnJNIConversionModules,
+		)
+		if err != nil {
+			return err
+		}
+		if !matched {
+			continue
+		}
+		conversions = append(conversions, candidate)
+		if profileLearnJNIConversionMax != 0 &&
+			len(conversions) == profileLearnJNIConversionMax {
+			break
+		}
+	}
+	report.ConversionCandidates = conversions
+	for index := range report.ConversionCandidates {
+		report.ConversionCandidates[index].Rank = index + 1
+	}
+	var refined *openssl.ApplicationProfile
+	if profileLearnJNIProfile != "" {
+		refined, err = openssl.LoadApplicationProfile(profileLearnJNIProfile)
+		if err != nil {
+			return err
+		}
+		if err := profileinspector.PromoteJNIConversionCallers(
+			refined,
+			report.ConversionCandidates,
+		); err != nil {
+			return fmt.Errorf("promote JNI conversion callers: %w", err)
+		}
+	}
 	if err := writeIndentedJSON(command.OutOrStdout(), profileLearnJNIOutput, report); err != nil {
 		return fmt.Errorf("write JNI learning report: %w", err)
+	}
+	if refined != nil {
+		if err := writeIndentedJSON(
+			io.Discard,
+			profileLearnJNIProfileOutput,
+			refined,
+		); err != nil {
+			return fmt.Errorf("write refined application profile: %w", err)
+		}
+	}
+	return nil
+}
+
+func matchesJNIConversionModule(
+	modulePath string,
+	moduleBase string,
+	selectors []string,
+) (bool, error) {
+	if len(selectors) == 0 {
+		return true, nil
+	}
+	for _, selector := range selectors {
+		selector = strings.TrimSpace(selector)
+		if selector == "" {
+			return false, fmt.Errorf("--conversion-module contains an empty selector")
+		}
+		baseMatched, err := filepath.Match(selector, moduleBase)
+		if err != nil {
+			return false, fmt.Errorf(
+				"invalid --conversion-module pattern %q: %w",
+				selector,
+				err,
+			)
+		}
+		pathMatched := selector == modulePath
+		if !pathMatched {
+			pathMatched, err = filepath.Match(selector, modulePath)
+			if err != nil {
+				return false, fmt.Errorf(
+					"invalid --conversion-module pattern %q: %w",
+					selector,
+					err,
+				)
+			}
+		}
+		if baseMatched || pathMatched {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func validateProfileLearningPaths() error {
+	type namedPath struct {
+		flag string
+		path string
+	}
+	values := []namedPath{
+		{flag: "--input", path: profileLearnJNIInput},
+		{flag: "--output", path: profileLearnJNIOutput},
+		{flag: "--profile", path: profileLearnJNIProfile},
+		{flag: "--profile-output", path: profileLearnJNIProfileOutput},
+	}
+	resolved := make(map[string]string)
+	for _, value := range values {
+		if value.path == "" || value.path == "-" {
+			continue
+		}
+		absolute, err := filepath.Abs(value.path)
+		if err != nil {
+			return fmt.Errorf("resolve %s path: %w", value.flag, err)
+		}
+		absolute = filepath.Clean(absolute)
+		if previous, found := resolved[absolute]; found {
+			return fmt.Errorf("%s and %s must name different files", previous, value.flag)
+		}
+		resolved[absolute] = value.flag
 	}
 	return nil
 }

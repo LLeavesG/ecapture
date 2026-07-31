@@ -36,7 +36,9 @@ func TestPcapWriterUsesRawIPInterfaceAndTimestamp(t *testing.T) {
 	}
 	wantTime := time.Unix(1_800_000_000, 123456789)
 	packet := []byte{0x45, 0, 0, 20}
-	if err := writer.WritePacketForInterface(packet, wantTime, 999999, true); err != nil {
+	if err := writer.WritePacketForInterface(
+		packet, wantTime, 999999, true, uint32(len(packet)),
+	); err != nil {
 		t.Fatalf("WritePacketForInterface() error = %v", err)
 	}
 	if err := writer.Close(); err != nil {
@@ -65,5 +67,94 @@ func TestPcapWriterUsesRawIPInterfaceAndTimestamp(t *testing.T) {
 	}
 	if iface.LinkType != layers.LinkTypeRaw {
 		t.Fatalf("link type = %v, want raw IP", iface.LinkType)
+	}
+}
+
+func TestPcapWriterRegistersRuntimeInterface(t *testing.T) {
+	var output bytes.Buffer
+	writer, err := NewPcapWriterInterfaces(
+		&output, 65535, []string{"initial-test-interface"}, "",
+		logger.New(io.Discard, false),
+	)
+	if err != nil {
+		t.Fatalf("NewPcapWriterInterfaces() error = %v", err)
+	}
+	const systemIndex = uint32(424242)
+	if err := writer.RegisterInterface("runtime-tun", systemIndex); err != nil {
+		t.Fatalf("RegisterInterface() error = %v", err)
+	}
+	packet := []byte{
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+		0x08, 0x00, 0x45, 0, 0, 20,
+	}
+	if err := writer.WritePacketForInterface(
+		packet, time.Unix(1_800_000_001, 0), systemIndex, false,
+		uint32(len(packet)),
+	); err != nil {
+		t.Fatalf("WritePacketForInterface() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	reader, err := pcapgo.NewNgReader(
+		bytes.NewReader(output.Bytes()),
+		pcapgo.NgReaderOptions{WantMixedLinkType: true},
+	)
+	if err != nil {
+		t.Fatalf("NewNgReader() error = %v", err)
+	}
+	_, captureInfo, err := reader.ReadPacketData()
+	if err != nil {
+		t.Fatalf("ReadPacketData() error = %v", err)
+	}
+	iface, err := reader.Interface(captureInfo.InterfaceIndex)
+	if err != nil {
+		t.Fatalf("Interface() error = %v", err)
+	}
+	if iface.Name != "runtime-tun" {
+		t.Fatalf("interface name = %q, want runtime-tun", iface.Name)
+	}
+	if iface.LinkType != layers.LinkTypeEthernet {
+		t.Fatalf("link type = %v, want Ethernet", iface.LinkType)
+	}
+}
+
+func TestPcapWriterPreservesTruncatedPacketOriginalLength(t *testing.T) {
+	var output bytes.Buffer
+	writer, err := NewPcapWriterInterfaces(
+		&output, 65535, []string{"unit-test-interface"}, "",
+		logger.New(io.Discard, false),
+	)
+	if err != nil {
+		t.Fatalf("NewPcapWriterInterfaces() error = %v", err)
+	}
+	packet := bytes.Repeat([]byte{0x5a}, 60*1024)
+	const originalLength = uint32(65549)
+	if err := writer.WritePacketForInterface(
+		packet, time.Unix(1_800_000_002, 0), 0, false, originalLength,
+	); err != nil {
+		t.Fatalf("WritePacketForInterface() error = %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	reader, err := pcapgo.NewNgReader(
+		bytes.NewReader(output.Bytes()),
+		pcapgo.NgReaderOptions{WantMixedLinkType: true},
+	)
+	if err != nil {
+		t.Fatalf("NewNgReader() error = %v", err)
+	}
+	gotPacket, captureInfo, err := reader.ReadPacketData()
+	if err != nil {
+		t.Fatalf("ReadPacketData() error = %v", err)
+	}
+	if got, want := len(gotPacket), len(packet); got != want {
+		t.Fatalf("captured length = %d, want %d", got, want)
+	}
+	if got, want := captureInfo.Length, int(originalLength); got != want {
+		t.Fatalf("original length = %d, want %d", got, want)
 	}
 }

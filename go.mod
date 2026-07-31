@@ -8,6 +8,7 @@ require (
 	github.com/gojue/ebpfmanager v0.5.0
 	github.com/google/gopacket v1.1.19
 	github.com/jschwinger233/elibpcap v1.1.0
+	github.com/quic-go/qpack v0.6.0
 	github.com/rs/zerolog v1.34.0
 	github.com/shuLhan/go-bindata v4.0.0+incompatible
 	github.com/spf13/cobra v1.9.1

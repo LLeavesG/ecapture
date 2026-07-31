@@ -26,11 +26,13 @@ import (
 const defaultScaffoldMaxHooks = 8
 
 type ScaffoldOptions struct {
-	Name     string
-	Package  string
-	UID      uint64
-	PID      uint64
-	MaxHooks int
+	Name                       string
+	Package                    string
+	UID                        uint64
+	PID                        uint64
+	MaxHooks                   int
+	CollectUserStacks          bool
+	IncludeSemanticDiagnostics bool
 }
 
 // ScaffoldProfile turns only candidates with a known direct-buffer ABI into a
@@ -77,6 +79,11 @@ func ScaffoldProfile(report *Report, options ScaffoldOptions) (*openssl.Applicat
 			if candidate.Recipe == nil {
 				continue
 			}
+			if !options.IncludeSemanticDiagnostics &&
+				candidate.Layer != LayerPlaintext &&
+				candidate.Layer != LayerTransport {
+				continue
+			}
 			ranked = append(ranked, rankedCandidate{library: library, candidate: candidate})
 		}
 	}
@@ -103,25 +110,48 @@ func ScaffoldProfile(report *Report, options ScaffoldOptions) (*openssl.Applicat
 		recipe := candidate.Recipe
 		name := uniqueHookName(sanitizeName(candidate.Family+"-"+candidate.Role), names)
 		hook := openssl.ApplicationDataHook{
-			Name:           name,
-			Library:        current.library.Path,
-			BuildID:        current.library.BuildID,
-			Direction:      recipe.Direction,
-			CaptureOn:      recipe.CaptureOn,
-			BufferArg:      recipe.BufferArg,
-			BufferOffset:   openssl.OffsetValue(recipe.BufferOffset),
-			BufferIndirect: recipe.BufferIndirect,
-			LengthSource:   recipe.LengthSource,
-			LengthArg:      recipe.LengthArg,
-			FixedLength:    recipe.FixedLength,
-			LengthOffset:   openssl.OffsetValue(recipe.LengthOffset),
-			LengthSize:     recipe.LengthSize,
-			LengthIndirect: recipe.LengthIndirect,
-			MaxBytes:       recipe.MaxBytes,
-			ContextArg:     recipe.ContextArg,
-			StreamArg:      recipe.StreamArg,
-			BufferFormat:   recipe.BufferFormat,
-			VectorCountArg: recipe.VectorCountArg,
+			Name:                   name,
+			Library:                current.library.Path,
+			BuildID:                current.library.BuildID,
+			Direction:              recipe.Direction,
+			CaptureOn:              recipe.CaptureOn,
+			BufferArg:              recipe.BufferArg,
+			BufferOffset:           openssl.OffsetValue(recipe.BufferOffset),
+			BufferIndirect:         recipe.BufferIndirect,
+			LengthSource:           recipe.LengthSource,
+			LengthArg:              recipe.LengthArg,
+			FixedLength:            recipe.FixedLength,
+			LengthOffset:           openssl.OffsetValue(recipe.LengthOffset),
+			LengthSize:             recipe.LengthSize,
+			LengthIndirect:         recipe.LengthIndirect,
+			MaxBytes:               recipe.MaxBytes,
+			ContextArg:             recipe.ContextArg,
+			ContextOffset:          openssl.OffsetValue(recipe.ContextOffset),
+			ContextSize:            recipe.ContextSize,
+			StreamArg:              recipe.StreamArg,
+			StreamOffset:           openssl.OffsetValue(recipe.StreamOffset),
+			StreamSize:             recipe.StreamSize,
+			StreamByteOffsetArg:    recipe.StreamByteOffsetArg,
+			StreamByteOffsetOffset: openssl.OffsetValue(recipe.StreamByteOffsetOffset),
+			StreamByteOffsetSize:   recipe.StreamByteOffsetSize,
+			FinArg:                 recipe.FinArg,
+			FinOffset:              openssl.OffsetValue(recipe.FinOffset),
+			FinSize:                recipe.FinSize,
+			BufferFormat:           recipe.BufferFormat,
+			VectorCountArg:         recipe.VectorCountArg,
+			VectorStride:           recipe.VectorStride,
+			VectorBaseOffset:       recipe.VectorBaseOffset,
+			VectorLengthOffset:     recipe.VectorLengthOffset,
+			VectorLengthSize:       recipe.VectorLengthSize,
+			CollectUserStack:       options.CollectUserStacks,
+		}
+		hook.CaptureLayer, hook.Transport = hookProvenance(candidate)
+		if hook.CaptureLayer == openssl.CaptureLayerWire &&
+			strings.HasPrefix(strings.ToLower(candidate.Role), "socket-") {
+			hook.BoundaryRole = openssl.CaptureBoundarySocketPayload
+		} else if hook.CaptureLayer == openssl.CaptureLayerWire &&
+			strings.HasPrefix(strings.ToLower(candidate.Role), "fd-") {
+			hook.BoundaryRole = openssl.CaptureBoundaryFDPayload
 		}
 		if candidate.SymbolSource == "dynamic" {
 			hook.Symbol = candidate.Symbol
@@ -140,34 +170,78 @@ func ScaffoldProfile(report *Report, options ScaffoldOptions) (*openssl.Applicat
 	strategies := []string{openssl.StrategyRawPackets}
 	var jniDiscovery *openssl.JNIDiscoveryProfile
 	for _, library := range report.Libraries {
+		if !options.IncludeSemanticDiagnostics {
+			break
+		}
 		var offsets []openssl.OffsetValue
+		conversionOffsets := make(map[string][]openssl.OffsetValue)
+		offsetRoles := make(map[openssl.OffsetValue]string)
+		ambiguousOffsets := make(map[openssl.OffsetValue]struct{})
 		for _, candidate := range library.Candidates {
-			if candidate.Family != "art-jni" || candidate.Role != "register-natives" ||
-				candidate.FileOffset == "" {
+			if candidate.Family != "art-jni" || candidate.FileOffset == "" {
 				continue
 			}
 			var offset openssl.OffsetValue
 			if err := offset.UnmarshalJSON([]byte(fmt.Sprintf("%q", candidate.FileOffset))); err != nil {
-				return nil, fmt.Errorf("parse JNI RegisterNatives offset %q: %w",
+				return nil, fmt.Errorf("parse JNI function offset %q: %w",
 					candidate.FileOffset, err)
 			}
-			offsets = append(offsets, offset)
-			if len(offsets) == openssl.MaxJNIRegisterHooks {
-				break
+			if candidate.Role == "register-natives" {
+				if len(offsets) < openssl.MaxJNIRegisterHooks {
+					offsets = append(offsets, offset)
+				}
+				continue
+			}
+			if otherRole, found := offsetRoles[offset]; found && otherRole != candidate.Role {
+				ambiguousOffsets[offset] = struct{}{}
+				continue
+			}
+			offsetRoles[offset] = candidate.Role
+			if len(conversionOffsets[candidate.Role]) < openssl.MaxJNIConversionHooks {
+				conversionOffsets[candidate.Role] = append(
+					conversionOffsets[candidate.Role],
+					offset,
+				)
 			}
 		}
-		if len(offsets) == 0 {
+		for role, roleOffsets := range conversionOffsets {
+			filtered := roleOffsets[:0]
+			for _, offset := range roleOffsets {
+				if _, ambiguous := ambiguousOffsets[offset]; !ambiguous {
+					filtered = append(filtered, offset)
+				}
+			}
+			if len(filtered) == 0 {
+				delete(conversionOffsets, role)
+			} else {
+				conversionOffsets[role] = filtered
+			}
+		}
+		if len(offsets) == 0 && len(conversionOffsets) == 0 {
 			continue
 		}
 		jniDiscovery = &openssl.JNIDiscoveryProfile{
 			Library:                library.Path,
 			BuildID:                library.BuildID,
 			RegisterNativesOffsets: offsets,
+			ConversionOffsets:      conversionOffsets,
 		}
 		strategies = append(strategies, openssl.StrategyJNIDiscovery)
 		break
 	}
-	if len(hooks) != 0 {
+	hasBoundaryHooks := false
+	hasSemanticHooks := false
+	for _, hook := range hooks {
+		if hook.CaptureLayer == openssl.CaptureLayerSemantic {
+			hasSemanticHooks = true
+		} else {
+			hasBoundaryHooks = true
+		}
+	}
+	if hasBoundaryHooks {
+		strategies = append(strategies, openssl.StrategyBoundaryData)
+	}
+	if hasSemanticHooks {
 		strategies = append(strategies, openssl.StrategyAppData)
 	}
 	matchPID := options.PID
@@ -198,14 +272,41 @@ func ScaffoldProfile(report *Report, options ScaffoldOptions) (*openssl.Applicat
 		JNI:       jniDiscovery,
 		Metadata: map[string]string{
 			"generated_by": "ecapture profile inspect",
-			"validation":   "diagnostic scaffold; inject a unique marker and validate every hook before production use",
-			"coverage":     "raw TCP/UDP packets plus direct-buffer candidates with known public ABIs",
+			"validation":   "communication scaffold; validate every boundary ABI and correlate it with controlled packet traffic before production use",
+			"coverage":     "raw TCP/UDP packets plus communication-boundary candidates with known public ABIs",
 		},
+	}
+	if options.IncludeSemanticDiagnostics {
+		profile.Metadata["semantic_diagnostics"] = "explicitly enabled; not communication evidence"
+	}
+	if options.CollectUserStacks {
+		profile.Metadata["user_stacks"] = "discovery only; remove collect_user_stack after hook locations are validated"
 	}
 	if err := profile.Validate(); err != nil {
 		return nil, fmt.Errorf("validate generated profile: %w", err)
 	}
 	return profile, nil
+}
+
+func hookProvenance(candidate HookCandidate) (string, string) {
+	switch candidate.Layer {
+	case LayerTransport:
+		if strings.HasPrefix(strings.ToLower(candidate.Role), "fd-") {
+			return openssl.CaptureLayerWire, openssl.CaptureTransportFD
+		}
+		return openssl.CaptureLayerWire, openssl.CaptureTransportSocket
+	case LayerPlaintext:
+		family := strings.ToLower(candidate.Family)
+		role := strings.ToLower(candidate.Role)
+		if strings.Contains(family, "quic") ||
+			family == "ngtcp2" ||
+			strings.HasPrefix(role, "quic-") {
+			return openssl.CaptureLayerTransport, openssl.CaptureTransportQUIC
+		}
+		return openssl.CaptureLayerTransport, openssl.CaptureTransportTLS
+	default:
+		return openssl.CaptureLayerSemantic, ""
+	}
 }
 
 var nonNameCharacters = regexp.MustCompile(`[^a-z0-9._-]+`)

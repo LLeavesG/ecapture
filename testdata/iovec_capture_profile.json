@@ -7,6 +7,7 @@
   },
   "capture": {
     "strategies": [
+      "boundary_data",
       "application_data"
     ]
   },
@@ -91,6 +92,34 @@
       "length_size": 8,
       "context_arg": 1,
       "stream_arg": 9,
+      "max_bytes": 131072
+    },
+    {
+      "name": "fixture-private-quic-vector",
+      "library": "/tmp/ecapture-iovec-helper",
+      "symbol": "ecapture_test_private_vector",
+      "capture_layer": "transport",
+      "transport": "quic",
+      "direction": "write",
+      "capture_on": "entry",
+      "buffer_arg": 2,
+      "buffer_format": "vector",
+      "vector_count_arg": 3,
+      "vector_stride": 24,
+      "vector_base_offset": 8,
+      "vector_length_offset": 16,
+      "vector_length_size": 8,
+      "context_arg": 1,
+      "context_size": 8,
+      "stream_arg": 1,
+      "stream_offset": 8,
+      "stream_size": 4,
+      "stream_byte_offset_arg": 1,
+      "stream_byte_offset_offset": 16,
+      "stream_byte_offset_size": 8,
+      "fin_arg": 1,
+      "fin_offset": 24,
+      "fin_size": 1,
       "max_bytes": 131072
     }
   ],

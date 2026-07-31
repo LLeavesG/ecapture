@@ -43,6 +43,11 @@ func TestScanJNIFunctionTableData(t *testing.T) {
 	if got[0].tableAddress != 0xa00000 || got[0].registerAddress != wantRegister {
 		t.Fatalf("unexpected JNI table = %#v", got[0])
 	}
+	wantUTFChars := uint64(0x1000 + 169*16)
+	if got[0].entries[169] != wantUTFChars {
+		t.Fatalf("GetStringUTFChars address = %#x, want %#x",
+			got[0].entries[169], wantUTFChars)
+	}
 
 	// An arbitrary sparse pointer array must not be classified as JNI.
 	for index := 4; index < jniFunctionTableEntries; index += 2 {
@@ -55,6 +60,26 @@ func TestScanJNIFunctionTableData(t *testing.T) {
 		func(address uint64) bool { return address >= 0x1000 && address < 0x100000 },
 	); len(sparse) != 0 {
 		t.Fatalf("sparse table was accepted: %#v", sparse)
+	}
+}
+
+func TestIsARTLibraryPath(t *testing.T) {
+	for _, path := range []string{
+		"/apex/com.android.art/lib64/libart.so",
+		"/system/lib64/libartd.so",
+		"/data/app/base.apk!/lib/arm64-v8a/libart.so",
+	} {
+		if !isARTLibraryPath(path) {
+			t.Fatalf("isARTLibraryPath(%q) = false", path)
+		}
+	}
+	for _, path := range []string{
+		"/data/app/base.apk!/lib/arm64-v8a/libwebviewchromium.so",
+		"/system/lib64/libnativehelper.so",
+	} {
+		if isARTLibraryPath(path) {
+			t.Fatalf("isARTLibraryPath(%q) = true", path)
+		}
 	}
 }
 
@@ -217,8 +242,54 @@ func TestScaffoldProfileRanksKnownABIs(t *testing.T) {
 	}
 	if len(profile.Capture.Strategies) != 2 ||
 		profile.Capture.Strategies[0] != openssl.StrategyRawPackets ||
-		profile.Capture.Strategies[1] != openssl.StrategyAppData {
+		profile.Capture.Strategies[1] != openssl.StrategyBoundaryData {
 		t.Fatalf("capture strategies = %#v", profile.Capture.Strategies)
+	}
+}
+
+func TestScaffoldProfileCollectsUserStacksOnlyWhenRequested(t *testing.T) {
+	report := &Report{
+		PID: 42,
+		Libraries: []LibraryReport{{
+			Path:    "/system/lib64/libc.so",
+			BuildID: "0123456789abcdef",
+			Candidates: []HookCandidate{{
+				Family:       "libc",
+				Role:         "socket-write",
+				Symbol:       "write",
+				SymbolSource: "dynamic",
+				Layer:        LayerTransport,
+				Priority:     100,
+				Recipe: &HookRecipe{
+					Direction:    openssl.AppDataDirectionWrite,
+					BufferArg:    2,
+					LengthSource: openssl.AppDataLengthArgument,
+					LengthArg:    3,
+					ContextArg:   1,
+					MaxBytes:     4096,
+				},
+			}},
+		}},
+	}
+	plain, err := ScaffoldProfile(report, ScaffoldOptions{MaxHooks: 1})
+	if err != nil {
+		t.Fatalf("ScaffoldProfile() error = %v", err)
+	}
+	stacked, err := ScaffoldProfile(
+		report,
+		ScaffoldOptions{MaxHooks: 1, CollectUserStacks: true},
+	)
+	if err != nil {
+		t.Fatalf("ScaffoldProfile(stack) error = %v", err)
+	}
+	if plain.DataHooks[0].CollectUserStack {
+		t.Fatal("default scaffold unexpectedly enables user stacks")
+	}
+	if !stacked.DataHooks[0].CollectUserStack {
+		t.Fatal("stack discovery scaffold did not enable user stacks")
+	}
+	if stacked.Metadata["user_stacks"] == "" {
+		t.Fatal("stack discovery metadata is missing")
 	}
 }
 
@@ -351,12 +422,23 @@ func TestScaffoldProfileAddsJNIDiscoveryAndDropsRestartPID(t *testing.T) {
 					Confidence:   ConfidenceExact,
 					Priority:     100,
 				},
+				{
+					Family:       "art-jni",
+					Layer:        LayerPlaintext,
+					Role:         openssl.JNIConversionGetStringUTFChars,
+					Symbol:       "JNINativeInterface.GetStringUTFChars",
+					SymbolSource: "jni-table",
+					FileOffset:   "0x3452b8",
+					Confidence:   ConfidenceExact,
+					Priority:     98,
+				},
 			},
 		}},
 	}
 	profile, err := ScaffoldProfile(report, ScaffoldOptions{
-		Package: "com.example.app",
-		PID:     4242,
+		Package:                    "com.example.app",
+		PID:                        4242,
+		IncludeSemanticDiagnostics: true,
 	})
 	if err != nil {
 		t.Fatalf("ScaffoldProfile() error = %v", err)
@@ -366,11 +448,42 @@ func TestScaffoldProfileAddsJNIDiscoveryAndDropsRestartPID(t *testing.T) {
 	}
 	if profile.JNI == nil ||
 		len(profile.JNI.RegisterNativesOffsets) != 2 ||
-		uint64(profile.JNI.RegisterNativesOffsets[0]) != 0x4d1ef4 {
+		uint64(profile.JNI.RegisterNativesOffsets[0]) != 0x4d1ef4 ||
+		len(profile.JNI.ConversionOffsets[openssl.JNIConversionGetStringUTFChars]) != 1 {
 		t.Fatalf("JNI discovery profile = %#v", profile.JNI)
 	}
 	if len(profile.Capture.Strategies) != 2 ||
 		profile.Capture.Strategies[1] != openssl.StrategyJNIDiscovery {
 		t.Fatalf("capture strategies = %#v", profile.Capture.Strategies)
+	}
+}
+
+func TestScaffoldProfileExcludesJNIDiagnosticsByDefault(t *testing.T) {
+	report := &Report{
+		Version: ReportVersion,
+		PID:     4242,
+		Libraries: []LibraryReport{{
+			Path:    "/apex/com.android.art/lib64/libart.so",
+			BuildID: "aabbccdd",
+			Candidates: []HookCandidate{{
+				Family:       "art-jni",
+				Layer:        LayerSemantic,
+				Role:         "register-natives",
+				Symbol:       "JNINativeInterface.RegisterNatives",
+				SymbolSource: "function-table",
+				FileOffset:   "0x4d1ef4",
+				Confidence:   ConfidenceExact,
+				Priority:     100,
+			}},
+		}},
+	}
+	profile, err := ScaffoldProfile(report, ScaffoldOptions{})
+	if err != nil {
+		t.Fatalf("ScaffoldProfile() error = %v", err)
+	}
+	if profile.JNI != nil ||
+		len(profile.Capture.Strategies) != 1 ||
+		profile.Capture.Strategies[0] != openssl.StrategyRawPackets {
+		t.Fatalf("default scaffold enabled semantic diagnostics: %#v", profile)
 	}
 }

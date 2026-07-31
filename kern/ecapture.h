@@ -89,6 +89,13 @@ struct ipv6hdr {
 
 #include "common.h"
 
+static __always_inline bool target_uid_matches(u32 uid) {
+    if (target_uid == 0 || target_uid == uid) {
+        return true;
+    }
+    u8 *allowed = bpf_map_lookup_elem(&target_related_uids, &uid);
+    return allowed != NULL;
+}
 
 // filter_rejects_base checks PID and UID only.
 // Safe to call from any BPF program type (TC, uprobe, kprobe).
@@ -100,7 +107,7 @@ static __always_inline bool filter_rejects_base(u32 pid, u32 uid) {
     if (target_pid != 0 && target_pid != pid) {
         return true;
     }
-    if (target_uid != 0 && target_uid != uid) {
+    if (!target_uid_matches(uid)) {
         return true;
     }
     return false;

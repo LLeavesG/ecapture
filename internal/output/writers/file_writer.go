@@ -54,6 +54,9 @@ func NewFileWriter(config FileWriterConfig) (*FileWriter, error) {
 	}
 
 	if config.EnableRotate && (config.MaxSizeMB > 0 || config.MaxInterval > 0) {
+		if err := hardenExistingCaptureFile(config.Path); err != nil {
+			return nil, err
+		}
 		// Use rotating file logger
 		fw.rotateLog = &roratelog.Logger{
 			Filename:    config.Path,
@@ -71,9 +74,13 @@ func NewFileWriter(config FileWriterConfig) (*FileWriter, error) {
 	} else {
 		flags |= os.O_APPEND
 	}
-	file, err := os.OpenFile(config.Path, flags, 0644)
+	file, err := os.OpenFile(config.Path, flags, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file %s: %w", config.Path, err)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("failed to protect file %s: %w", config.Path, err)
 	}
 
 	fw.file = file
@@ -84,6 +91,19 @@ func NewFileWriter(config FileWriterConfig) (*FileWriter, error) {
 	}
 
 	return fw, nil
+}
+
+func hardenExistingCaptureFile(path string) error {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to inspect file %s: %w", path, err)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		return fmt.Errorf("failed to protect file %s: %w", path, err)
+	}
+	return nil
 }
 
 // Write writes data to the file.

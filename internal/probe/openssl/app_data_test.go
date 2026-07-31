@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	manager "github.com/gojue/ebpfmanager"
 )
@@ -62,8 +63,8 @@ func TestApplicationDataHookValidationAndBPFConfig(t *testing.T) {
 	}
 
 	got := hook.bpfConfig()
-	if size := binary.Size(got); size != 64 {
-		t.Fatalf("applicationDataBPFConfig size = %d, want 64", size)
+	if size := binary.Size(got); size != 136 {
+		t.Fatalf("applicationDataBPFConfig size = %d, want 136", size)
 	}
 	wantFlags := uint32(appDataFlagBufferIndirect |
 		appDataFlagLengthMemory |
@@ -75,6 +76,47 @@ func TestApplicationDataHookValidationAndBPFConfig(t *testing.T) {
 	if got.Direction != DataTypeWrite || got.BufferArg != 2 || got.LengthSize != 4 ||
 		got.ContextArg != 1 || got.StreamArg != 4 {
 		t.Fatalf("unexpected BPF config: %#v", got)
+	}
+}
+
+func TestApplicationDataHookReturnWidth(t *testing.T) {
+	newProfile := func(lengthSize uint32) *ApplicationProfile {
+		return &ApplicationProfile{
+			Version: ApplicationProfileVersion,
+			Name:    "return-width",
+			Match:   ApplicationMatch{UID: 10001},
+			Capture: ApplicationCapture{Strategies: []string{StrategyAppData}},
+			DataHooks: []ApplicationDataHook{{
+				Name:         "bio-read",
+				Library:      "/data/app/libcronet.so",
+				Offset:       0x1234,
+				Direction:    AppDataDirectionRead,
+				CaptureOn:    AppDataCaptureReturn,
+				BufferArg:    2,
+				LengthSource: AppDataLengthReturn,
+				LengthSize:   lengthSize,
+			}},
+		}
+	}
+
+	profile := newProfile(4)
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("Validate(32-bit return) error = %v", err)
+	}
+	if got := profile.DataHooks[0].bpfConfig().LengthSize; got != 4 {
+		t.Fatalf("32-bit return length size = %d, want 4", got)
+	}
+
+	profile = newProfile(0)
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("Validate(default return) error = %v", err)
+	}
+	if got := profile.DataHooks[0].bpfConfig().LengthSize; got != 8 {
+		t.Fatalf("default return length size = %d, want 8", got)
+	}
+
+	if err := newProfile(2).Validate(); err == nil {
+		t.Fatal("Validate() should reject a 2-byte function return")
 	}
 }
 
@@ -106,12 +148,98 @@ func TestApplicationDataHookIOVecBPFConfig(t *testing.T) {
 		t.Fatalf("iovec hook was normalized incorrectly: %#v", hook)
 	}
 	got := hook.bpfConfig()
-	if size := binary.Size(got); size != 64 {
-		t.Fatalf("applicationDataBPFConfig size = %d, want 64", size)
+	if size := binary.Size(got); size != 136 {
+		t.Fatalf("applicationDataBPFConfig size = %d, want 136", size)
 	}
 	if got.Flags != appDataFlagBufferIOVec || got.BufferArg != 2 ||
-		got.VectorCountArg != 3 || got.ContextArg != 1 {
+		got.VectorCountArg != 3 || got.ContextArg != 1 ||
+		got.VectorStride != 16 || got.VectorBaseOffset != 0 ||
+		got.VectorLengthOffset != 8 || got.VectorLengthSize != 8 {
 		t.Fatalf("unexpected iovec BPF config: %#v", got)
+	}
+}
+
+func TestApplicationDataHookPrivateVectorAndObjectIdentityBPFConfig(t *testing.T) {
+	profile := &ApplicationProfile{
+		Version: ApplicationProfileVersion,
+		Name:    "quiche-mem-slice-capture",
+		Match:   ApplicationMatch{UID: 10001},
+		Capture: ApplicationCapture{Strategies: []string{StrategyBoundaryData}},
+		DataHooks: []ApplicationDataHook{{
+			Name:                   "quiche-write-mem-slices",
+			Library:                "/data/app/libcronet.so",
+			Offset:                 0x61e13c,
+			CaptureLayer:           CaptureLayerTransport,
+			Transport:              CaptureTransportQUIC,
+			Direction:              AppDataDirectionWrite,
+			CaptureOn:              AppDataCaptureEntry,
+			BufferArg:              2,
+			BufferFormat:           AppDataBufferVector,
+			VectorCountArg:         3,
+			VectorStride:           24,
+			VectorBaseOffset:       8,
+			VectorLengthOffset:     16,
+			VectorLengthSize:       8,
+			ContextArg:             1,
+			StreamArg:              1,
+			StreamOffset:           0x1d8,
+			StreamSize:             4,
+			StreamByteOffsetArg:    2,
+			StreamByteOffsetOffset: 0x10,
+			StreamByteOffsetSize:   8,
+			FinArg:                 2,
+			FinOffset:              1,
+			FinSize:                1,
+			MaxBytes:               MaxApplicationData,
+		}},
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+
+	hook := profile.DataHooks[0]
+	got := hook.bpfConfig()
+	if got.Flags != appDataFlagBufferIOVec ||
+		got.VectorStride != 24 || got.VectorBaseOffset != 8 ||
+		got.VectorLengthOffset != 16 || got.VectorLengthSize != 8 ||
+		got.ContextArg != 1 || got.ContextSize != 0 ||
+		got.StreamArg != 1 || got.StreamOffset != 0x1d8 ||
+		got.StreamSize != 4 ||
+		got.StreamByteOffsetArg != 2 ||
+		got.StreamByteOffsetOffset != 0x10 ||
+		got.StreamByteOffsetSize != 8 ||
+		got.FinArg != 2 || got.FinOffset != 1 || got.FinSize != 1 {
+		t.Fatalf("unexpected private-vector BPF config: %#v", got)
+	}
+}
+
+func TestApplicationDataHookIdentityOffsetDefaultsToPointerWidth(t *testing.T) {
+	profile := &ApplicationProfile{
+		Version: ApplicationProfileVersion,
+		Name:    "identity-offset-default",
+		Match:   ApplicationMatch{UID: 10001},
+		Capture: ApplicationCapture{Strategies: []string{StrategyBoundaryData}},
+		DataHooks: []ApplicationDataHook{{
+			Name:          "quic-recv",
+			Library:       "/data/app/libcronet.so",
+			Offset:        0x1234,
+			CaptureLayer:  CaptureLayerTransport,
+			Transport:     CaptureTransportQUIC,
+			Direction:     AppDataDirectionRead,
+			BufferArg:     2,
+			LengthArg:     3,
+			ContextArg:    1,
+			ContextOffset: 0x20,
+			StreamArg:     1,
+			StreamOffset:  0x1d8,
+		}},
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	hook := profile.DataHooks[0]
+	if hook.ContextSize != 8 || hook.StreamSize != 8 {
+		t.Fatalf("identity field widths were not defaulted: %#v", hook)
 	}
 }
 
@@ -344,7 +472,47 @@ func TestApplicationDataHookValidationErrors(t *testing.T) {
 		{"two targets", func(h *ApplicationDataHook) { h.Offset = 0x10 }},
 		{"bad buffer arg", func(h *ApplicationDataHook) { h.BufferArg = 13 }},
 		{"bad context arg", func(h *ApplicationDataHook) { h.ContextArg = 13 }},
+		{"context memory without arg", func(h *ApplicationDataHook) {
+			h.ContextSize = 8
+		}},
+		{"bad context size", func(h *ApplicationDataHook) {
+			h.ContextArg = 1
+			h.ContextSize = 3
+		}},
 		{"bad stream arg", func(h *ApplicationDataHook) { h.StreamArg = 13 }},
+		{"stream memory without arg", func(h *ApplicationDataHook) {
+			h.StreamSize = 4
+		}},
+		{"bad stream size", func(h *ApplicationDataHook) {
+			h.StreamArg = 1
+			h.StreamSize = 3
+		}},
+		{"bad stream byte offset arg", func(h *ApplicationDataHook) {
+			h.StreamByteOffsetArg = 13
+		}},
+		{"stream byte offset memory without arg", func(h *ApplicationDataHook) {
+			h.StreamByteOffsetSize = 8
+		}},
+		{"bad stream byte offset size", func(h *ApplicationDataHook) {
+			h.StreamByteOffsetArg = 1
+			h.StreamByteOffsetSize = 3
+		}},
+		{"stream byte offset on non-QUIC hook", func(h *ApplicationDataHook) {
+			h.StreamByteOffsetArg = 1
+		}},
+		{"bad fin arg", func(h *ApplicationDataHook) {
+			h.FinArg = 13
+		}},
+		{"fin memory without arg", func(h *ApplicationDataHook) {
+			h.FinSize = 1
+		}},
+		{"bad fin size", func(h *ApplicationDataHook) {
+			h.FinArg = 1
+			h.FinSize = 3
+		}},
+		{"FIN on non-QUIC hook", func(h *ApplicationDataHook) {
+			h.FinArg = 1
+		}},
 		{"return length at entry", func(h *ApplicationDataHook) {
 			h.LengthSource = AppDataLengthReturn
 		}},
@@ -394,8 +562,42 @@ func TestApplicationDataHookValidationErrors(t *testing.T) {
 			h.LengthArg = 0
 			h.BufferIndirect = true
 		}},
+		{"iovec with private stride", func(h *ApplicationDataHook) {
+			h.BufferFormat = AppDataBufferIOVec
+			h.VectorCountArg = 3
+			h.LengthSource = ""
+			h.LengthArg = 0
+			h.VectorStride = 24
+		}},
+		{"vector missing stride", func(h *ApplicationDataHook) {
+			h.BufferFormat = AppDataBufferVector
+			h.VectorCountArg = 3
+			h.LengthSource = ""
+			h.LengthArg = 0
+		}},
+		{"vector base outside stride", func(h *ApplicationDataHook) {
+			h.BufferFormat = AppDataBufferVector
+			h.VectorCountArg = 3
+			h.LengthSource = ""
+			h.LengthArg = 0
+			h.VectorStride = 24
+			h.VectorBaseOffset = 20
+			h.VectorLengthOffset = 16
+		}},
+		{"vector length outside stride", func(h *ApplicationDataHook) {
+			h.BufferFormat = AppDataBufferVector
+			h.VectorCountArg = 3
+			h.LengthSource = ""
+			h.LengthArg = 0
+			h.VectorStride = 24
+			h.VectorLengthOffset = 20
+			h.VectorLengthSize = 8
+		}},
 		{"raw buffer with vector count", func(h *ApplicationDataHook) {
 			h.VectorCountArg = 3
+		}},
+		{"raw buffer with vector layout", func(h *ApplicationDataHook) {
+			h.VectorStride = 16
 		}},
 		{"msghdr with vector count argument", func(h *ApplicationDataHook) {
 			h.BufferFormat = AppDataBufferMsgHdr
@@ -494,6 +696,10 @@ func TestApplicationDataEventDecode(t *testing.T) {
 		uint64(0xabcdef),
 		uint64(0x1234),
 		uint64(7),
+		uint64(4096),
+		uint32(AppDataStreamFlagOffsetValid |
+			AppDataStreamFlagFinValid |
+			AppDataStreamFlagFin),
 		uint32(42),
 		uint32(43),
 		uint32(1),
@@ -504,6 +710,9 @@ func TestApplicationDataEventDecode(t *testing.T) {
 		uint32(0),
 		uint32(19),
 		comm,
+		int32(0),
+		uint32(0),
+		[AppDataMaxStackDepth]uint64{},
 		payload,
 	}
 	var raw bytes.Buffer
@@ -512,10 +721,15 @@ func TestApplicationDataEventDecode(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// C rounds the structure size up to its eight-byte alignment.
-	raw.Write(make([]byte, 4))
-
-	decoder := &applicationDataEventDecoder{hookNames: []string{"unused", "request-body"}}
+	decoder := &applicationDataEventDecoder{hooks: []ApplicationDataHook{
+		{Name: "unused", CaptureLayer: CaptureLayerSemantic},
+		{
+			Name:         "request-body",
+			CaptureLayer: CaptureLayerTransport,
+			Transport:    CaptureTransportQUIC,
+			BoundaryRole: "",
+		},
+	}}
 	decoded, err := decoder.Decode(nil, raw.Bytes())
 	if err != nil {
 		t.Fatalf("Decode() error = %v", err)
@@ -527,36 +741,204 @@ func TestApplicationDataEventDecode(t *testing.T) {
 	if event.HookName != "request-body" || string(event.GetData()) != `{"message":"hello"}` {
 		t.Fatalf("decoded event = %#v data=%q", event, event.GetData())
 	}
+	if event.CaptureLayer != CaptureLayerTransport ||
+		event.Transport != CaptureTransportQUIC {
+		t.Fatalf("capture provenance was not applied: %#v", event)
+	}
 	if event.PerfMonoNs() != 123456 || event.IsTruncated() {
 		t.Fatalf("unexpected event metadata: %#v", event)
 	}
 	if event.ContextID != 0x1234 || event.StreamID != 7 ||
-		!strings.Contains(event.String(), "Context:0x1234 Stream:7") {
+		!event.HasStreamOffset() || event.StreamOffset != 4096 ||
+		!event.HasFin() || !event.IsFin() ||
+		!strings.Contains(event.String(),
+			"Context:0x1234 Stream:7 Offset:4096 FIN:true") {
 		t.Fatalf("correlation metadata was not preserved: %#v", event)
+	}
+}
+
+func TestApplicationDataEventDecodeCompactPayloadAndStack(t *testing.T) {
+	var comm [TaskCommLen]byte
+	copy(comm[:], "stack-test")
+	var stack [AppDataMaxStackDepth]uint64
+	stack[0] = 0x123456
+	stack[1] = 0xabcdef
+	values := []any{
+		uint64(123456),
+		uint64(0xabcdef),
+		uint64(0x1234),
+		uint64(7),
+		uint64(0),
+		uint32(0),
+		uint32(42),
+		uint32(43),
+		uint32(0),
+		uint32(DataTypeWrite),
+		uint32(0),
+		uint32(7),
+		uint32(7),
+		uint32(0),
+		uint32(7),
+		comm,
+		int32(16),
+		uint32(2),
+		stack,
+		[]byte("payload"),
+	}
+	var raw bytes.Buffer
+	for _, value := range values {
+		if err := binary.Write(&raw, binary.LittleEndian, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	event := &ApplicationDataEvent{}
+	if err := event.DecodeFromBytes(raw.Bytes()); err != nil {
+		t.Fatalf("DecodeFromBytes() error = %v", err)
+	}
+	if got := string(event.GetData()); got != "payload" {
+		t.Fatalf("payload = %q", got)
+	}
+	if event.UserStackStatus != 16 || event.UserStackDepth != 2 ||
+		event.UserStack[0] != 0x123456 || event.UserStack[1] != 0xabcdef {
+		t.Fatalf("stack metadata = %#v", event)
+	}
+}
+
+func TestApplicationDataBPFConfigEnablesUserStackExplicitly(t *testing.T) {
+	withoutStack := ApplicationDataHook{}.bpfConfig()
+	withStack := ApplicationDataHook{CollectUserStack: true}.bpfConfig()
+	if withoutStack.Flags&appDataFlagUserStack != 0 {
+		t.Fatalf("user stacks unexpectedly enabled by default: %#x", withoutStack.Flags)
+	}
+	if withStack.Flags&appDataFlagUserStack == 0 {
+		t.Fatalf("user stack flag missing: %#x", withStack.Flags)
 	}
 }
 
 func TestApplicationDataEventMarshalJSONIsCompact(t *testing.T) {
 	event := &ApplicationDataEvent{
-		Timestamp:   1,
-		ContextID:   0x1234,
-		StreamID:    7,
-		Pid:         42,
-		HookID:      1,
-		Direction:   DataTypeWrite,
-		OriginalLen: 7,
-		CapturedLen: 7,
-		DataLen:     7,
-		HookName:    "quic-send",
+		Timestamp:    1,
+		ContextID:    0x1234,
+		StreamID:     7,
+		StreamOffset: 0,
+		StreamFlags: AppDataStreamFlagOffsetValid |
+			AppDataStreamFlagFinValid,
+		Pid:          42,
+		HookID:       1,
+		Direction:    DataTypeWrite,
+		OriginalLen:  7,
+		CapturedLen:  7,
+		DataLen:      7,
+		HookName:     "quic-send",
+		CaptureLayer: CaptureLayerTransport,
+		Transport:    CaptureTransportQUIC,
 	}
 	copy(event.Data[:], "payload")
 	data, err := json.Marshal(event)
 	if err != nil {
 		t.Fatalf("Marshal() error = %v", err)
 	}
-	if len(data) > 1000 || !bytes.Contains(data, []byte(`"eventType":"application_data"`)) ||
+	if len(data) > 1000 || !bytes.Contains(data, []byte(`"eventType":"boundary_data"`)) ||
+		!bytes.Contains(data, []byte(`"captureLayer":"transport"`)) ||
+		!bytes.Contains(data, []byte(`"transport":"quic"`)) ||
 		!bytes.Contains(data, []byte(`"data":"cGF5bG9hZA=="`)) ||
-		!bytes.Contains(data, []byte(`"streamId":7`)) {
+		!bytes.Contains(data, []byte(`"streamId":7`)) ||
+		!bytes.Contains(data, []byte(`"streamOffset":0`)) ||
+		!bytes.Contains(data, []byte(`"fin":false`)) {
 		t.Fatalf("unexpected structured event: %s", data)
+	}
+	var envelope struct {
+		WallTime string `json:"wallTime"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, envelope.WallTime); err != nil {
+		t.Fatalf("wallTime is not an absolute RFC3339 timestamp: %q: %v",
+			envelope.WallTime, err)
+	}
+}
+
+func TestApplicationDataEventAllowsQUICFinOnlyMetadata(t *testing.T) {
+	event := &ApplicationDataEvent{
+		Timestamp:    101,
+		ContextID:    0x1234,
+		StreamID:     9,
+		StreamOffset: 57,
+		StreamFlags: AppDataStreamFlagOffsetValid |
+			AppDataStreamFlagFinValid |
+			AppDataStreamFlagFin,
+		Pid:          42,
+		Tid:          43,
+		HookID:       1,
+		Direction:    DataTypeRead,
+		CaptureLayer: CaptureLayerTransport,
+		Transport:    CaptureTransportQUIC,
+	}
+	if err := event.Validate(); err != nil {
+		t.Fatalf("Validate() rejected FIN-only QUIC event: %v", err)
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range [][]byte{
+		[]byte(`"streamOffset":57`),
+		[]byte(`"fin":true`),
+		[]byte(`"capturedLen":0`),
+		[]byte(`"dataLen":0`),
+		[]byte(`"data":""`),
+	} {
+		if !bytes.Contains(data, field) {
+			t.Fatalf("FIN-only JSON %s is missing %s", data, field)
+		}
+	}
+}
+
+func TestApplicationDataEventKeepsSemanticEventTypeSeparate(t *testing.T) {
+	event := &ApplicationDataEvent{
+		Timestamp:    1,
+		Pid:          42,
+		HookID:       1,
+		Direction:    DataTypeWrite,
+		OriginalLen:  4,
+		CapturedLen:  4,
+		DataLen:      4,
+		HookName:     "request-object",
+		CaptureLayer: CaptureLayerSemantic,
+	}
+	copy(event.Data[:], "diag")
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !bytes.Contains(data, []byte(`"eventType":"application_data"`)) ||
+		bytes.Contains(data, []byte(`"eventType":"boundary_data"`)) {
+		t.Fatalf("semantic event was not isolated: %s", data)
+	}
+}
+
+func TestApplicationDataEventMarshalJSONIncludesWireBoundaryRole(t *testing.T) {
+	event := &ApplicationDataEvent{
+		Timestamp:    1,
+		ContextID:    0xb10,
+		Pid:          42,
+		HookID:       1,
+		Direction:    DataTypeWrite,
+		OriginalLen:  7,
+		CapturedLen:  7,
+		DataLen:      7,
+		HookName:     "bio-ciphertext-write",
+		CaptureLayer: CaptureLayerWire,
+		Transport:    CaptureTransportTLS,
+		BoundaryRole: CaptureBoundaryTLSCiphertext,
+	}
+	copy(event.Data[:], "payload")
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !bytes.Contains(data, []byte(`"boundaryRole":"tls_ciphertext"`)) {
+		t.Fatalf("wire boundary role missing from event: %s", data)
 	}
 }

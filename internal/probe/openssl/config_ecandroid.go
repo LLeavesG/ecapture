@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -89,6 +90,31 @@ func (c *Config) detectOS() error {
 		return fmt.Errorf("detect Android version: %w", err)
 	}
 
+	return nil
+}
+
+func (c *Config) discoverPlatformTLSLibraries() []string {
+	var candidates []string
+	switch runtime.GOARCH {
+	case "arm64", "amd64":
+		candidates = []string{
+			"/apex/com.android.conscrypt/lib64/libssl.so",
+			"/system/lib64/libssl.so",
+		}
+	default:
+		candidates = []string{
+			"/apex/com.android.conscrypt/lib/libssl.so",
+			"/system/lib/libssl.so",
+		}
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			// APEX and /system commonly expose aliases of the same provider.
+			// One successfully resolved path is sufficient for an inode-based
+			// uprobe and avoids duplicate events or redundant links.
+			return []string{candidate}
+		}
+	}
 	return nil
 }
 

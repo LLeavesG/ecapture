@@ -102,7 +102,10 @@ endif
 #SNAPSHOT_VERSION ?= $(shell git rev-parse HEAD)
 BUILD_DATE := $(shell date +%Y-%m-%d)
 
-HOST_ARCH := $(shell uname -m)
+HOST_ARCH_RAW := $(shell uname -m)
+# GNU/Linux reports arm64 as aarch64, while Apple Silicon reports arm64.
+# Normalize both before selecting eBPF headers and Go target architecture.
+HOST_ARCH := $(if $(filter arm64,$(HOST_ARCH_RAW)),aarch64,$(HOST_ARCH_RAW))
 UNAME_R := $(shell uname -r)
 HOST_VERSION_SHORT := $(shell uname -r | cut -d'-' -f 1)
 LINUX_SOURCE_FILE := $(shell find /usr/src -maxdepth 1 -name "*linux-source*.tar.bz2")

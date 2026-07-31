@@ -19,6 +19,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -51,6 +52,8 @@ type BaseProbe struct {
 	config       domain.Configuration
 	dispatcher   domain.EventDispatcher
 	isRunning    atomic.Bool
+	readerStats  readerStatsCounters
+	nextStatsAt  atomic.Uint64
 	readers      []io.Closer
 	closers      []closer
 	readerLoopsW sync.WaitGroup // perf/ringbuf read goroutines; see GoReaderLoop
@@ -63,11 +66,13 @@ type closer interface {
 
 // NewBaseProbe creates a new BaseProbe instance.
 func NewBaseProbe(name string) *BaseProbe {
-	return &BaseProbe{
+	probe := &BaseProbe{
 		name:    name,
 		readers: make([]io.Closer, 0),
 		closers: make([]closer, 0),
 	}
+	probe.nextStatsAt.Store(readerStatsEmitEveryRecords)
+	return probe
 }
 
 // Initialize sets up the probe with configuration and dependencies.
@@ -132,6 +137,26 @@ func (p *BaseProbe) Initialize(ctx context.Context, cfg domain.Configuration) er
 		}
 	}
 	textHandler := handlers.NewEncodedTextHandler(textWriter, eventEncoder)
+	if provider, ok := p.config.(interface{ GetCaptureMode() string }); ok {
+		mode := strings.ToLower(strings.TrimSpace(provider.GetCaptureMode()))
+		eventAddr := strings.TrimSpace(p.config.GetEventCollectorAddr())
+		hasExplicitEventSink := p.config.GetEventWriter() != nil ||
+			(eventAddr != "" && eventAddr != "stdout")
+		emitPacketEvents := true
+		if packetPolicy, ok := p.config.(interface {
+			GetEmitPacketEvents() bool
+		}); ok {
+			emitPacketEvents = packetPolicy.GetEmitPacketEvents()
+		}
+		if handlers.IsModePcapng(mode) &&
+			(!hasExplicitEventSink || !emitPacketEvents) {
+			textHandler.SuppressPacketEvents()
+			p.Logger().Info().
+				Bool("explicit_event_sink", hasExplicitEventSink).
+				Bool("emit_packet_events", emitPacketEvents).
+				Msg("Structured packet duplication suppressed; PCAPNG remains active")
+		}
+	}
 	if err := dispatcher.Register(textHandler); err != nil {
 		_ = textWriter.Close()
 		return fmt.Errorf("failed to register text handler: %w", err)
@@ -151,6 +176,7 @@ func (p *BaseProbe) Start(ctx context.Context) error {
 	}
 
 	p.isRunning.Store(true)
+	p.startReaderStatsReporter()
 	p.logger.Info().Msg("Probe started")
 	return nil
 }
@@ -199,6 +225,7 @@ func (p *BaseProbe) Close() error {
 	// Reader Close() unblocks rd.Read(); read loops may still run deferred work
 	// (e.g. userland perf reorder flush) that calls Dispatch. Wait before closing dispatcher.
 	p.readerLoopsW.Wait()
+	p.dispatchReaderStats(true)
 
 	for _, cler := range p.closers {
 		if err := cler.Close(); err != nil {
@@ -363,16 +390,19 @@ func (p *BaseProbe) perfEventLoop(rd *perf.Reader, em *ebpf.Map, decoder domain.
 			if stderrors.Is(err, perf.ErrClosed) {
 				return
 			}
+			p.readerStats.readErrors.Add(1)
 			p.logger.Warn().Err(err).Msg("Error reading from perf buffer")
 			continue
 		}
 
 		if record.LostSamples != 0 {
+			p.readerStats.lostSamples.Add(record.LostSamples)
 			p.logger.Warn().
 				Uint64("lost_samples", record.LostSamples).
 				Msg("Perf buffer full, samples lost")
 			continue
 		}
+		p.noteReaderRecord(false, len(record.RawSample))
 		event, err := decoder.Decode(em, record.RawSample)
 		if err != nil {
 			if stderrors.Is(err, errors.ErrEventNotReady) {
@@ -380,6 +410,7 @@ func (p *BaseProbe) perfEventLoop(rd *perf.Reader, em *ebpf.Map, decoder domain.
 				// Skip incomplete events silently
 				continue
 			}
+			p.readerStats.decodeErrors.Add(1)
 			p.logger.Warn().Err(err).Msg("Failed to decode event")
 			continue
 		}
@@ -389,6 +420,7 @@ func (p *BaseProbe) perfEventLoop(rd *perf.Reader, em *ebpf.Map, decoder domain.
 			p.logPerfDispatchDebug("no reorder", mn)
 		}
 		if err := p.dispatcher.Dispatch(event); err != nil {
+			p.readerStats.dispatchErrors.Add(1)
 			p.logger.Warn().Err(err).Msg("Failed to dispatch event")
 		}
 	}
@@ -407,6 +439,7 @@ func (p *BaseProbe) perfEventLoopOrdered(rd *perf.Reader, em *ebpf.Map, decoder 
 				p.logPerfDispatchDebug("after reorder", mn)
 			}
 			if err := p.dispatcher.Dispatch(ev); err != nil {
+				p.readerStats.dispatchErrors.Add(1)
 				p.logger.Warn().Err(err).Msg("Failed to dispatch reordered event")
 			}
 		}
@@ -425,22 +458,26 @@ func (p *BaseProbe) perfEventLoopOrdered(rd *perf.Reader, em *ebpf.Map, decoder 
 			if stderrors.Is(err, perf.ErrClosed) {
 				return
 			}
+			p.readerStats.readErrors.Add(1)
 			p.logger.Warn().Err(err).Msg("Error reading from perf buffer")
 			continue
 		}
 
 		if record.LostSamples != 0 {
+			p.readerStats.lostSamples.Add(record.LostSamples)
 			p.logger.Warn().
 				Uint64("lost_samples", record.LostSamples).
 				Msg("Perf buffer full, samples lost")
 			continue
 		}
+		p.noteReaderRecord(false, len(record.RawSample))
 		event, err := decoder.Decode(em, record.RawSample)
 		if err != nil {
 			if stderrors.Is(err, errors.ErrEventNotReady) {
 				p.logger.Debug().Msg("Event not ready, skipping")
 				continue
 			}
+			p.readerStats.decodeErrors.Add(1)
 			p.logger.Warn().Err(err).Msg("Failed to decode event")
 			continue
 		}
@@ -449,6 +486,7 @@ func (p *BaseProbe) perfEventLoopOrdered(rd *perf.Reader, em *ebpf.Map, decoder 
 		mn, ok := domain.AsMonoNsEvent(event)
 		if !ok {
 			if err := p.dispatcher.Dispatch(event); err != nil {
+				p.readerStats.dispatchErrors.Add(1)
 				p.logger.Warn().Err(err).Msg("Failed to dispatch event")
 			}
 			continue
@@ -459,6 +497,7 @@ func (p *BaseProbe) perfEventLoopOrdered(rd *perf.Reader, em *ebpf.Map, decoder 
 				p.logPerfDispatchDebug("after reorder", out)
 			}
 			if err := p.dispatcher.Dispatch(ev); err != nil {
+				p.readerStats.dispatchErrors.Add(1)
 				p.logger.Warn().Err(err).Msg("Failed to dispatch reordered event")
 			}
 		}
@@ -504,17 +543,21 @@ func (p *BaseProbe) ringbufEventLoop(rd *ringbuf.Reader, em *ebpf.Map, decoder d
 			if stderrors.Is(err, ringbuf.ErrClosed) {
 				return
 			}
+			p.readerStats.readErrors.Add(1)
 			p.logger.Warn().Err(err).Msg("Error reading from ringbuf")
 			continue
 		}
 
+		p.noteReaderRecord(true, len(record.RawSample))
 		event, err := decoder.Decode(em, record.RawSample)
 		if err != nil {
+			p.readerStats.decodeErrors.Add(1)
 			p.logger.Warn().Err(err).Msg("Failed to decode event")
 			continue
 		}
 
 		if err := p.dispatcher.Dispatch(event); err != nil {
+			p.readerStats.dispatchErrors.Add(1)
 			p.logger.Warn().Err(err).Msg("Failed to dispatch event")
 		}
 	}

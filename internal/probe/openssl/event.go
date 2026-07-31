@@ -19,6 +19,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -43,6 +45,12 @@ const (
 	// EventFlagTruncated means OriginalLen exceeded the bounded per-call
 	// capture ceiling and CapturedLen bytes were emitted.
 	EventFlagTruncated = 1
+)
+
+var (
+	captureClockOffsetOnce sync.Once
+	captureClockOffsetNs   int64
+	captureClockOffsetErr  error
 )
 
 type AttachType int64
@@ -140,9 +148,12 @@ func (e Event) MarshalJSON() ([]byte, error) {
 	}
 	return json.Marshal(struct {
 		EventType    string `json:"eventType"`
+		CaptureLayer string `json:"captureLayer"`
+		Transport    string `json:"transport"`
 		DataType     int64  `json:"dataType"`
 		Direction    string `json:"direction"`
 		Timestamp    uint64 `json:"timestamp"`
+		WallTime     string `json:"wallTime,omitempty"`
 		Pid          uint32 `json:"pid"`
 		Tid          uint32 `json:"tid"`
 		Comm         string `json:"comm"`
@@ -162,9 +173,12 @@ func (e Event) MarshalJSON() ([]byte, error) {
 		Data         []byte `json:"data"`
 	}{
 		EventType:    "tls_plaintext",
+		CaptureLayer: CaptureLayerTransport,
+		Transport:    CaptureTransportTLS,
 		DataType:     e.DataType,
 		Direction:    direction,
 		Timestamp:    e.Timestamp,
+		WallTime:     wallTimeFromMonotonic(e.Timestamp),
 		Pid:          e.Pid,
 		Tid:          e.Tid,
 		Comm:         e.GetComm(),
@@ -558,4 +572,25 @@ func getClockOffset() (int64, error) {
 	monoNs := tsMono.Sec*1e9 + tsMono.Nsec
 
 	return realNs - monoNs, nil
+}
+
+// wallTimeFromMonotonic returns an absolute timestamp only when the conversion
+// can be measured. Keeping this separate from eventTime's display fallback
+// prevents structured output from labeling a bare monotonic timestamp as Unix
+// time when the host clock query fails.
+func wallTimeFromMonotonic(timestamp uint64) string {
+	if timestamp > math.MaxInt64 {
+		return ""
+	}
+	captureClockOffsetOnce.Do(func() {
+		captureClockOffsetNs, captureClockOffsetErr = getClockOffset()
+	})
+	if captureClockOffsetErr != nil ||
+		captureClockOffsetNs > 0 &&
+			int64(timestamp) > math.MaxInt64-captureClockOffsetNs {
+		return ""
+	}
+	return time.Unix(0, int64(timestamp)+captureClockOffsetNs).
+		UTC().
+		Format(time.RFC3339Nano)
 }

@@ -41,8 +41,20 @@ func TestEventMarshalJSONIsCompact(t *testing.T) {
 		t.Fatalf("Marshal() error = %v", err)
 	}
 	if len(data) > 1000 || !bytes.Contains(data, []byte(`"eventType":"tls_plaintext"`)) ||
+		!bytes.Contains(data, []byte(`"captureLayer":"transport"`)) ||
+		!bytes.Contains(data, []byte(`"transport":"tls"`)) ||
 		!bytes.Contains(data, []byte(`"data":"cGF5bG9hZA=="`)) {
 		t.Fatalf("unexpected structured event: %s", data)
+	}
+	var envelope struct {
+		WallTime string `json:"wallTime"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, envelope.WallTime); err != nil {
+		t.Fatalf("wallTime is not an absolute RFC3339 timestamp: %q: %v",
+			envelope.WallTime, err)
 	}
 }
 

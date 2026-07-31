@@ -174,6 +174,7 @@ func (h *PcapHandler) Handle(event domain.Event) error {
 	// Write packet to pcapng file
 	err := h.pcapWriter.WritePacketForInterface(
 		packetData, timestamp, pktEvent.GetInterfaceIndex(), rawIP,
+		pktEvent.GetPacketLen(),
 	)
 	if err != nil {
 		return errors.Wrap(errors.ErrCodeEventDispatch, "failed to write packet to pcapng", err)

@@ -13,10 +13,10 @@
 // limitations under the License.
 
 // Package profileinspector inventories a process's ELF libraries and ranks
-// reusable plaintext hook candidates. It deliberately does not claim that an
-// exported-looking function is active: candidates still need a marker-based
-// runtime validation before they are promoted into a pinned application
-// profile.
+// reusable communication-boundary candidates. It deliberately does not claim
+// that an exported-looking function is active: candidates still need
+// controlled-traffic runtime validation before they are promoted into a
+// Build-ID-pinned profile.
 package profileinspector
 
 import (
@@ -32,6 +32,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/gojue/ecapture/internal/probe/openssl"
 )
 
 const (
@@ -52,6 +54,37 @@ const (
 	jniRegisterNativesIndex = 215
 	jniFunctionTableEntries = 233
 )
+
+type jniFunctionSpec struct {
+	index int
+	role  string
+	name  string
+	abi   string
+	notes string
+}
+
+// These indices are fixed by the public JNI ABI. Locating the table therefore
+// works even when Android's ART implementation is stripped and its private
+// C++ symbols change between releases.
+var jniConversionFunctions = []jniFunctionSpec{
+	{164, "get_string_length", "GetStringLength", "jsize(JNIEnv *, jstring)", "Caches the UTF-16 element count for a later char-pointer conversion."},
+	{165, "get_string_chars", "GetStringChars", "const jchar *(JNIEnv *, jstring, jboolean *)", "Returns a native UTF-16 pointer; pair with GetStringLength."},
+	{166, "release_string_chars", "ReleaseStringChars", "void(JNIEnv *, jstring, const jchar *)", "Marks the end of a GetStringChars mapping."},
+	{168, "get_string_utf_length", "GetStringUTFLength", "jsize(JNIEnv *, jstring)", "Caches the modified UTF-8 byte count."},
+	{169, "get_string_utf_chars", "GetStringUTFChars", "const char *(JNIEnv *, jstring, jboolean *)", "Returns a native modified UTF-8 pointer and can be bounded with a string read."},
+	{170, "release_string_utf_chars", "ReleaseStringUTFChars", "void(JNIEnv *, jstring, const char *)", "Marks the end of a GetStringUTFChars mapping."},
+	{171, "get_array_length", "GetArrayLength", "jsize(JNIEnv *, jarray)", "Caches an array element count; it is a byte count only for jbyteArray."},
+	{184, "get_byte_array_elements", "GetByteArrayElements", "jbyte *(JNIEnv *, jbyteArray, jboolean *)", "Returns a native byte-array pointer; pair with GetArrayLength."},
+	{192, "release_byte_array_elements", "ReleaseByteArrayElements", "void(JNIEnv *, jbyteArray, jbyte *, jint)", "Captures the mapped byte array again before release."},
+	{200, "get_byte_array_region", "GetByteArrayRegion", "void(JNIEnv *, jbyteArray, jsize, jsize, jbyte *)", "Copies a byte-array region into a native buffer with an explicit byte length."},
+	{208, "set_byte_array_region", "SetByteArrayRegion", "void(JNIEnv *, jbyteArray, jsize, jsize, const jbyte *)", "Copies a native buffer into a byte-array region with an explicit byte length."},
+	{222, "get_primitive_array_critical", "GetPrimitiveArrayCritical", "void *(JNIEnv *, jarray, jboolean *)", "Returns a primitive-array pointer; element width must be inferred from the JNI signature."},
+	{223, "release_primitive_array_critical", "ReleasePrimitiveArrayCritical", "void(JNIEnv *, jarray, void *, jint)", "Marks the end of a primitive critical mapping."},
+	{224, "get_string_critical", "GetStringCritical", "const jchar *(JNIEnv *, jstring, jboolean *)", "Returns a native UTF-16 pointer; pair with GetStringLength."},
+	{225, "release_string_critical", "ReleaseStringCritical", "void(JNIEnv *, jstring, const jchar *)", "Marks the end of a string critical mapping."},
+	{230, "get_direct_buffer_address", "GetDirectBufferAddress", "void *(JNIEnv *, jobject)", "Returns the native base of a direct ByteBuffer."},
+	{231, "get_direct_buffer_capacity", "GetDirectBufferCapacity", "jlong(JNIEnv *, jobject)", "Returns the byte capacity needed to bound a direct ByteBuffer mapping."},
+}
 
 // Report is deterministic so it can be checked into a reverse-engineering
 // workspace and compared after an application update.
@@ -100,22 +133,36 @@ type HookCandidate struct {
 // HookRecipe is the subset of an application-data profile hook that can be
 // inferred safely from a stable public C ABI.
 type HookRecipe struct {
-	Direction      string `json:"direction"`
-	CaptureOn      string `json:"capture_on"`
-	BufferArg      uint32 `json:"buffer_arg"`
-	BufferOffset   uint64 `json:"buffer_offset,omitempty"`
-	BufferIndirect bool   `json:"buffer_indirect,omitempty"`
-	LengthSource   string `json:"length_source,omitempty"`
-	LengthArg      uint32 `json:"length_arg,omitempty"`
-	FixedLength    uint32 `json:"fixed_length,omitempty"`
-	LengthOffset   uint64 `json:"length_offset,omitempty"`
-	LengthSize     uint32 `json:"length_size,omitempty"`
-	LengthIndirect bool   `json:"length_indirect,omitempty"`
-	MaxBytes       uint32 `json:"max_bytes,omitempty"`
-	ContextArg     uint32 `json:"context_arg,omitempty"`
-	StreamArg      uint32 `json:"stream_arg,omitempty"`
-	BufferFormat   string `json:"buffer_format,omitempty"`
-	VectorCountArg uint32 `json:"vector_count_arg,omitempty"`
+	Direction              string `json:"direction"`
+	CaptureOn              string `json:"capture_on"`
+	BufferArg              uint32 `json:"buffer_arg"`
+	BufferOffset           uint64 `json:"buffer_offset,omitempty"`
+	BufferIndirect         bool   `json:"buffer_indirect,omitempty"`
+	LengthSource           string `json:"length_source,omitempty"`
+	LengthArg              uint32 `json:"length_arg,omitempty"`
+	FixedLength            uint32 `json:"fixed_length,omitempty"`
+	LengthOffset           uint64 `json:"length_offset,omitempty"`
+	LengthSize             uint32 `json:"length_size,omitempty"`
+	LengthIndirect         bool   `json:"length_indirect,omitempty"`
+	MaxBytes               uint32 `json:"max_bytes,omitempty"`
+	ContextArg             uint32 `json:"context_arg,omitempty"`
+	ContextOffset          uint64 `json:"context_offset,omitempty"`
+	ContextSize            uint32 `json:"context_size,omitempty"`
+	StreamArg              uint32 `json:"stream_arg,omitempty"`
+	StreamOffset           uint64 `json:"stream_offset,omitempty"`
+	StreamSize             uint32 `json:"stream_size,omitempty"`
+	StreamByteOffsetArg    uint32 `json:"stream_byte_offset_arg,omitempty"`
+	StreamByteOffsetOffset uint64 `json:"stream_byte_offset_offset,omitempty"`
+	StreamByteOffsetSize   uint32 `json:"stream_byte_offset_size,omitempty"`
+	FinArg                 uint32 `json:"fin_arg,omitempty"`
+	FinOffset              uint64 `json:"fin_offset,omitempty"`
+	FinSize                uint32 `json:"fin_size,omitempty"`
+	BufferFormat           string `json:"buffer_format,omitempty"`
+	VectorCountArg         uint32 `json:"vector_count_arg,omitempty"`
+	VectorStride           uint32 `json:"vector_stride,omitempty"`
+	VectorBaseOffset       uint32 `json:"vector_base_offset,omitempty"`
+	VectorLengthOffset     uint32 `json:"vector_length_offset,omitempty"`
+	VectorLengthSize       uint32 `json:"vector_length_size,omitempty"`
 }
 
 type symbolRecipe struct {
@@ -197,6 +244,7 @@ var knownSymbolRecipes = map[string]symbolRecipe{
 			MaxBytes:     131072,
 			ContextArg:   1,
 			StreamArg:    2,
+			FinArg:       5,
 		},
 		notes: "Captures QUIC stream plaintext before packet protection.",
 	},
@@ -495,6 +543,7 @@ func msgHdrRecipe(
 func transportWriteRecipe(family, role string, priority int, abi string) symbolRecipe {
 	recipe := directWriteRecipe(family, role, priority, abi)
 	recipe.layer = LayerTransport
+	recipe.hook.ContextArg = 1
 	recipe.notes = "Captures the serialized socket/file bytes; they may already be encrypted by a higher layer."
 	return recipe
 }
@@ -502,6 +551,7 @@ func transportWriteRecipe(family, role string, priority int, abi string) symbolR
 func transportReadRecipe(family, role string, priority int, abi string) symbolRecipe {
 	recipe := directReadRecipe(family, role, priority, abi)
 	recipe.layer = LayerTransport
+	recipe.hook.ContextArg = 1
 	recipe.notes = "Captures the serialized socket/file bytes; they may still be encrypted by a higher layer."
 	return recipe
 }
@@ -527,6 +577,23 @@ func InspectWithCatalog(
 			report.Errors = append(report.Errors, err.Error())
 		} else {
 			paths = append(paths, mapped...)
+		}
+		archives := openssl.MappedArchiveLibrarySpecsForPID(pid)
+		if len(archives) != 0 {
+			archivePaths := make(map[string]struct{}, len(archives))
+			for _, spec := range archives {
+				if index := strings.Index(spec, "!/"); index > 0 {
+					archivePaths[spec[:index]] = struct{}{}
+				}
+			}
+			filtered := paths[:0]
+			for _, path := range paths {
+				if _, replaced := archivePaths[path]; replaced {
+					continue
+				}
+				filtered = append(filtered, path)
+			}
+			paths = append(filtered, archives...)
 		}
 	}
 	paths = uniqueSortedPaths(paths)
@@ -598,13 +665,22 @@ func InspectLibrary(path string) LibraryReport {
 
 func InspectLibraryWithCatalog(path string, catalog *RecipeCatalog) LibraryReport {
 	report := LibraryReport{Path: path}
-	file, err := elf.Open(path)
+	err := openssl.WithLibraryELF(path, func(file *elf.File) error {
+		report = inspectOpenLibrary(path, file, catalog)
+		return nil
+	})
 	if err != nil {
 		report.Error = err.Error()
-		return report
 	}
-	defer file.Close()
+	return report
+}
 
+func inspectOpenLibrary(
+	path string,
+	file *elf.File,
+	catalog *RecipeCatalog,
+) LibraryReport {
+	report := LibraryReport{Path: path}
 	report.ELFType = file.Type.String()
 	report.Class = file.Class.String()
 	report.Machine = file.Machine.String()
@@ -673,7 +749,15 @@ func InspectLibraryWithCatalog(path string, catalog *RecipeCatalog) LibraryRepor
 			})
 		}
 	}
-	report.Candidates = append(report.Candidates, inspectJNIFunctionTables(file)...)
+	// JNINativeInterface is owned by ART. Scanning every writable pointer-like
+	// section produces large false-positive sets in Chromium and other images
+	// whose executable PT_LOAD starts at virtual address zero.
+	if isARTLibraryPath(path) {
+		report.Candidates = append(
+			report.Candidates,
+			inspectJNIFunctionTables(file)...,
+		)
+	}
 
 	report.Signals = append(report.Signals, scanSignals(file)...)
 	families := make(map[string]struct{})
@@ -699,6 +783,18 @@ func InspectLibraryWithCatalog(path string, catalog *RecipeCatalog) LibraryRepor
 	return report
 }
 
+func isARTLibraryPath(path string) bool {
+	if _, member, archive := strings.Cut(path, "!/"); archive {
+		path = member
+	}
+	switch filepath.Base(path) {
+	case "libart.so", "libartd.so":
+		return true
+	default:
+		return false
+	}
+}
+
 func isExecutableFileOffset(file *elf.File, offset uint64) bool {
 	for _, program := range file.Progs {
 		if program.Type != elf.PT_LOAD || program.Flags&elf.PF_X == 0 ||
@@ -716,6 +812,7 @@ type jniTableCandidate struct {
 	tableAddress    uint64
 	registerAddress uint64
 	validEntries    int
+	entries         [jniFunctionTableEntries]uint64
 }
 
 // inspectJNIFunctionTables locates JNINativeInterface tables without relying
@@ -738,6 +835,7 @@ func inspectJNIFunctionTables(file *elf.File) []HookCandidate {
 		return false
 	}
 	seen := make(map[uint64]struct{})
+	conversionSeen := make(map[string]struct{})
 	var result []HookCandidate
 	for _, section := range file.Sections {
 		if section.Type != elf.SHT_PROGBITS || section.Flags&elf.SHF_ALLOC == 0 ||
@@ -776,6 +874,35 @@ func inspectJNIFunctionTables(file *elf.File) []HookCandidate {
 					jniFunctionTableEntries-4,
 				),
 			})
+			for _, conversion := range jniConversionFunctions {
+				address := table.entries[conversion.index]
+				if !isExecutable(address) {
+					continue
+				}
+				key := fmt.Sprintf("%s:%x", conversion.role, address)
+				if _, found := conversionSeen[key]; found {
+					continue
+				}
+				conversionSeen[key] = struct{}{}
+				result = append(result, HookCandidate{
+					Family:         "art-jni",
+					Layer:          LayerPlaintext,
+					Role:           conversion.role,
+					Symbol:         "JNINativeInterface." + conversion.name,
+					SymbolSource:   "jni-table",
+					VirtualAddress: hexUint64(address),
+					FileOffset:     hexUint64(symbolFileOffset(file, address)),
+					Confidence:     ConfidenceExact,
+					Priority:       98,
+					ABI:            conversion.abi,
+					Notes: fmt.Sprintf(
+						"JNI table %s entry %d. %s",
+						hexUint64(table.tableAddress),
+						conversion.index,
+						conversion.notes,
+					),
+				})
+			}
 		}
 	}
 	return result
@@ -797,9 +924,11 @@ func scanJNIFunctionTableData(
 			continue
 		}
 		valid := 0
+		var entries [jniFunctionTableEntries]uint64
 		for index := 4; index < jniFunctionTableEntries; index++ {
 			start := offset + index*8
-			if isExecutable(byteOrder.Uint64(data[start : start+8])) {
+			entries[index] = byteOrder.Uint64(data[start : start+8])
+			if isExecutable(entries[index]) {
 				valid++
 			}
 		}
@@ -817,6 +946,7 @@ func scanJNIFunctionTableData(
 			tableAddress:    sectionAddress + uint64(offset),
 			registerAddress: registerAddress,
 			validEntries:    valid,
+			entries:         entries,
 		})
 	}
 	return result

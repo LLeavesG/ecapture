@@ -96,6 +96,10 @@ func (c *Config) detectOS() error {
 	return nil
 }
 
+func (c *Config) discoverPlatformTLSLibraries() []string {
+	return nil
+}
+
 // Linux-specific default interface (no-op)
 func (c *Config) setDefaultIfname() {
 	// Linux doesn't need a default interface
