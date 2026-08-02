@@ -35,6 +35,11 @@ type ScaffoldOptions struct {
 	IncludeSemanticDiagnostics bool
 }
 
+type scaffoldCandidate struct {
+	library   LibraryReport
+	candidate HookCandidate
+}
+
 // ScaffoldProfile turns only candidates with a known direct-buffer ABI into a
 // diagnostic profile. The output intentionally keeps unknown raw flows and
 // must be marker-validated before production use.
@@ -66,11 +71,7 @@ func ScaffoldProfile(report *Report, options ScaffoldOptions) (*openssl.Applicat
 		}
 	}
 
-	type rankedCandidate struct {
-		library   LibraryReport
-		candidate HookCandidate
-	}
-	var ranked []rankedCandidate
+	var ranked []scaffoldCandidate
 	for _, library := range report.Libraries {
 		if library.Error != "" {
 			continue
@@ -84,7 +85,7 @@ func ScaffoldProfile(report *Report, options ScaffoldOptions) (*openssl.Applicat
 				candidate.Layer != LayerTransport {
 				continue
 			}
-			ranked = append(ranked, rankedCandidate{library: library, candidate: candidate})
+			ranked = append(ranked, scaffoldCandidate{library: library, candidate: candidate})
 		}
 	}
 	sort.SliceStable(ranked, func(i, j int) bool {
@@ -99,6 +100,11 @@ func ScaffoldProfile(report *Report, options ScaffoldOptions) (*openssl.Applicat
 		}
 		return ranked[i].candidate.Symbol < ranked[j].candidate.Symbol
 	})
+	ranked = prioritizeDiscoveryCoverage(
+		ranked,
+		options.Package,
+		options.MaxHooks,
+	)
 
 	hooks := make([]openssl.ApplicationDataHook, 0, min(options.MaxHooks, len(ranked)))
 	names := make(map[string]int)
@@ -107,7 +113,7 @@ func ScaffoldProfile(report *Report, options ScaffoldOptions) (*openssl.Applicat
 			break
 		}
 		candidate := current.candidate
-		recipe := candidate.Recipe
+		recipe := effectiveScaffoldRecipe(candidate)
 		name := uniqueHookName(sanitizeName(candidate.Family+"-"+candidate.Role), names)
 		hook := openssl.ApplicationDataHook{
 			Name:                   name,
@@ -274,6 +280,7 @@ func ScaffoldProfile(report *Report, options ScaffoldOptions) (*openssl.Applicat
 			"generated_by": "ecapture profile inspect",
 			"validation":   "communication scaffold; validate every boundary ABI and correlate it with controlled packet traffic before production use",
 			"coverage":     "raw TCP/UDP packets plus communication-boundary candidates with known public ABIs",
+			"selection":    "prefer proven public QUIC, one app-affine TLS provider, then paired datagram and vectored socket boundaries before filling remaining slots",
 		},
 	}
 	if options.IncludeSemanticDiagnostics {
@@ -286,6 +293,175 @@ func ScaffoldProfile(report *Report, options ScaffoldOptions) (*openssl.Applicat
 		return nil, fmt.Errorf("validate generated profile: %w", err)
 	}
 	return profile, nil
+}
+
+func effectiveScaffoldRecipe(candidate HookCandidate) *HookRecipe {
+	if candidate.SymbolSource == "dynamic" {
+		if known, found := candidateForSymbol(candidate.Symbol); found &&
+			known.hook != nil {
+			return cloneHookRecipe(known.hook)
+		}
+	}
+	return candidate.Recipe
+}
+
+func prioritizeDiscoveryCoverage(
+	ranked []scaffoldCandidate,
+	packageName string,
+	maxHooks int,
+) []scaffoldCandidate {
+	if maxHooks <= 0 || len(ranked) <= maxHooks {
+		return ranked
+	}
+
+	selected := make([]scaffoldCandidate, 0, maxHooks)
+	seen := make(map[string]struct{}, maxHooks)
+	key := func(current scaffoldCandidate) string {
+		return strings.Join([]string{
+			current.library.Path,
+			current.candidate.Role,
+			current.candidate.Symbol,
+			current.candidate.FileOffset,
+		}, "\x00")
+	}
+	appendFirst := func(match func(scaffoldCandidate) bool) {
+		if len(selected) == maxHooks {
+			return
+		}
+		for _, current := range ranked {
+			if !match(current) {
+				continue
+			}
+			currentKey := key(current)
+			if _, found := seen[currentKey]; found {
+				continue
+			}
+			seen[currentKey] = struct{}{}
+			selected = append(selected, current)
+			return
+		}
+	}
+
+	// A public QUIC stream ABI is the most direct reusable application
+	// transport boundary. Reserve one slot per direction when present.
+	for _, direction := range []string{
+		openssl.AppDataDirectionRead,
+		openssl.AppDataDirectionWrite,
+	} {
+		direction := direction
+		appendFirst(func(current scaffoldCandidate) bool {
+			layer, transport := hookProvenance(current.candidate)
+			return layer == openssl.CaptureLayerTransport &&
+				transport == openssl.CaptureTransportQUIC &&
+				current.candidate.Recipe.Direction == direction
+		})
+	}
+
+	// Multiple platform TLS providers otherwise consume all eight slots before
+	// a single outbound socket hook is reached. Start with the provider most
+	// closely owned by the package, while raw packets retain visibility into
+	// every other provider for later staged inspection.
+	tlsProvider := preferredTLSProvider(ranked, packageName)
+	if tlsProvider != "" {
+		for _, direction := range []string{
+			openssl.AppDataDirectionRead,
+			openssl.AppDataDirectionWrite,
+		} {
+			direction := direction
+			appendFirst(func(current scaffoldCandidate) bool {
+				layer, transport := hookProvenance(current.candidate)
+				return current.library.Path == tlsProvider &&
+					layer == openssl.CaptureLayerTransport &&
+					transport == openssl.CaptureTransportTLS &&
+					current.candidate.Recipe.Direction == direction
+			})
+		}
+	}
+
+	// Keep paired receive/send forms together. The ordering covers direct
+	// datagrams, message-vector datagrams, then scatter/gather I/O before the
+	// more generic stream wrappers.
+	for _, roles := range [][]string{
+		{"socket-recvfrom", "socket-sendto"},
+		{"socket-recvmsg", "socket-sendmsg"},
+		{"fd-readv", "fd-writev"},
+		{"socket-recv", "socket-send"},
+		{"fd-read", "fd-write"},
+	} {
+		for _, role := range roles {
+			role := role
+			appendFirst(func(current scaffoldCandidate) bool {
+				return strings.EqualFold(current.candidate.Role, role)
+			})
+		}
+	}
+
+	for _, current := range ranked {
+		current := current
+		appendFirst(func(candidate scaffoldCandidate) bool {
+			return key(candidate) == key(current)
+		})
+	}
+	return selected
+}
+
+func preferredTLSProvider(
+	ranked []scaffoldCandidate,
+	packageName string,
+) string {
+	type providerScore struct {
+		path       string
+		affinity   int
+		directions map[string]struct{}
+		count      int
+	}
+	providers := make(map[string]*providerScore)
+	for _, current := range ranked {
+		layer, transport := hookProvenance(current.candidate)
+		if layer != openssl.CaptureLayerTransport ||
+			transport != openssl.CaptureTransportTLS {
+			continue
+		}
+		score := providers[current.library.Path]
+		if score == nil {
+			affinity := 0
+			if packageName != "" &&
+				strings.Contains(current.library.Path, packageName) {
+				affinity = 2
+			} else if strings.HasPrefix(current.library.Path, "/data/app/") ||
+				strings.Contains(current.library.Path, ".apk!/") {
+				affinity = 1
+			}
+			score = &providerScore{
+				path:       current.library.Path,
+				affinity:   affinity,
+				directions: make(map[string]struct{}),
+			}
+			providers[current.library.Path] = score
+		}
+		score.count++
+		score.directions[current.candidate.Recipe.Direction] = struct{}{}
+	}
+	var best *providerScore
+	for _, candidate := range providers {
+		if best == nil ||
+			candidate.affinity > best.affinity ||
+			(candidate.affinity == best.affinity &&
+				len(candidate.directions) > len(best.directions)) ||
+			(candidate.affinity == best.affinity &&
+				len(candidate.directions) == len(best.directions) &&
+				candidate.count > best.count) ||
+			(candidate.affinity == best.affinity &&
+				len(candidate.directions) == len(best.directions) &&
+				candidate.count == best.count &&
+				candidate.path < best.path) {
+			best = candidate
+		}
+	}
+	if best == nil {
+		return ""
+	}
+	return best.path
 }
 
 func hookProvenance(candidate HookCandidate) (string, string) {

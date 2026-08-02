@@ -181,7 +181,7 @@ var knownSymbolRecipes = map[string]symbolRecipe{
 		"openssl", "tls-write", 100,
 		"int SSL_write(SSL *ssl, const void *buf, int num)",
 	),
-	"SSL_read": directReadRecipe(
+	"SSL_read": intReadRecipe(
 		"openssl", "tls-read", 100,
 		"int SSL_read(SSL *ssl, void *buf, int num)",
 	),
@@ -201,7 +201,7 @@ var knownSymbolRecipes = map[string]symbolRecipe{
 		"mbedtls", "tls-write", 100,
 		"int mbedtls_ssl_write(ctx, const unsigned char *buf, size_t len)",
 	),
-	"mbedtls_ssl_read": directReadRecipe(
+	"mbedtls_ssl_read": intReadRecipe(
 		"mbedtls", "tls-read", 100,
 		"int mbedtls_ssl_read(ctx, unsigned char *buf, size_t len)",
 	),
@@ -209,7 +209,7 @@ var knownSymbolRecipes = map[string]symbolRecipe{
 		"wolfssl", "tls-write", 100,
 		"int wolfSSL_write(ssl, const void *data, int sz)",
 	),
-	"wolfSSL_read": directReadRecipe(
+	"wolfSSL_read": intReadRecipe(
 		"wolfssl", "tls-read", 100,
 		"int wolfSSL_read(ssl, void *data, int sz)",
 	),
@@ -217,7 +217,7 @@ var knownSymbolRecipes = map[string]symbolRecipe{
 		"nspr", "record-write", 98,
 		"PRInt32 PR_Write(PRFileDesc *fd, const void *buf, PRInt32 amount)",
 	),
-	"PR_Read": directReadRecipe(
+	"PR_Read": intReadRecipe(
 		"nspr", "record-read", 98,
 		"PRInt32 PR_Read(PRFileDesc *fd, void *buf, PRInt32 amount)",
 	),
@@ -225,7 +225,7 @@ var knownSymbolRecipes = map[string]symbolRecipe{
 		"nspr", "record-send", 96,
 		"PRInt32 PR_Send(PRFileDesc *fd, const void *buf, PRInt32 amount, ...)",
 	),
-	"PR_Recv": directReadRecipe(
+	"PR_Recv": intReadRecipe(
 		"nspr", "record-recv", 96,
 		"PRInt32 PR_Recv(PRFileDesc *fd, void *buf, PRInt32 amount, ...)",
 	),
@@ -444,6 +444,16 @@ func directReadRecipe(family, role string, priority int, abi string) symbolRecip
 			MaxBytes:     131072,
 		},
 	}
+}
+
+func intReadRecipe(family, role string, priority int, abi string) symbolRecipe {
+	recipe := directReadRecipe(family, role, priority, abi)
+	// AArch64 leaves the upper half of x0 unspecified for a C int return.
+	// Recording all eight bytes can turn -1 into 0x00000000ffffffff and
+	// incorrectly emit a stale, maximum-sized buffer. Four bytes lets the
+	// eBPF return handler sign-extend the actual API result.
+	recipe.hook.LengthSize = 4
+	return recipe
 }
 
 func contextualRecipe(recipe symbolRecipe, contextArg uint32) symbolRecipe {

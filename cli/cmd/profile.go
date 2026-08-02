@@ -29,6 +29,7 @@ import (
 
 var (
 	profileInspectLibraries           []string
+	profileValidateInput              string
 	profileInspectOutput              string
 	profileScaffoldOutput             string
 	profileScaffoldName               string
@@ -72,6 +73,15 @@ ecapture profile inspect --library libprivate.so --recipe-catalog private-abi.js
 	RunE: runProfileInspect,
 }
 
+var profileValidateCmd = &cobra.Command{
+	Use:         "validate",
+	Short:       "Validate a profile and every data hook for activation readiness.",
+	Annotations: map[string]string{skipEnvDetection: "true"},
+	Example:     `ecapture profile validate --profile app-candidate.json`,
+	Args:        cobra.NoArgs,
+	RunE:        runProfileValidate,
+}
+
 var profileLearnJNICmd = &cobra.Command{
 	Use:         "learn-jni",
 	Short:       "Rank dynamic JNI methods as optional semantic diagnostics.",
@@ -96,6 +106,12 @@ ecapture profile learn-jni \
 }
 
 func init() {
+	profileValidateCmd.Flags().StringVar(
+		&profileValidateInput,
+		"profile",
+		"",
+		"application profile JSON to validate for activation.",
+	)
 	profileInspectCmd.Flags().StringSliceVar(
 		&profileInspectLibraries,
 		"library",
@@ -211,8 +227,30 @@ func init() {
 		"write a new profile with the learned kernel caller allowlist.",
 	)
 	profileCmd.AddCommand(profileInspectCmd)
+	profileCmd.AddCommand(profileValidateCmd)
 	profileCmd.AddCommand(profileLearnJNICmd)
 	rootCmd.AddCommand(profileCmd)
+}
+
+func runProfileValidate(command *cobra.Command, _ []string) error {
+	path := strings.TrimSpace(profileValidateInput)
+	if path == "" {
+		return fmt.Errorf("--profile is required")
+	}
+	profile, err := openssl.LoadApplicationProfile(path)
+	if err != nil {
+		return err
+	}
+	if err := profile.ValidateActivationReadiness(); err != nil {
+		return err
+	}
+	return writeIndentedJSON(command.OutOrStdout(), "", map[string]any{
+		"schema_version":   1,
+		"profile":          path,
+		"name":             profile.Name,
+		"data_hook_count":  len(profile.DataHooks),
+		"activation_ready": true,
+	})
 }
 
 func runProfileInspect(command *cobra.Command, _ []string) error {

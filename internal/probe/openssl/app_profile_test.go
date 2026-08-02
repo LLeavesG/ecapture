@@ -182,6 +182,40 @@ func TestApplicationDataHookProvenanceValidation(t *testing.T) {
 	}
 }
 
+func TestApplicationProfileActivationReadinessValidatesDisabledHooks(t *testing.T) {
+	profile := &ApplicationProfile{
+		Version: ApplicationProfileVersion,
+		Name:    "disabled-candidate",
+		Match:   ApplicationMatch{PID: 1},
+		DataHooks: []ApplicationDataHook{{
+			Name:         "quic-write",
+			Library:      "/tmp/libquic.so",
+			Offset:       0x1234,
+			CaptureLayer: CaptureLayerTransport,
+			Transport:    CaptureTransportQUIC,
+			BoundaryRole: "quic-stream-write",
+			Direction:    AppDataDirectionWrite,
+			BufferArg:    2,
+			LengthSource: AppDataLengthArgument,
+			LengthArg:    3,
+			Disabled:     true,
+		}},
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("Validate(disabled candidate) error = %v", err)
+	}
+	if err := profile.ValidateActivationReadiness(); err == nil {
+		t.Fatal("activation readiness should validate the disabled hook ABI")
+	}
+	profile.DataHooks[0].BoundaryRole = ""
+	if err := profile.ValidateActivationReadiness(); err != nil {
+		t.Fatalf("ValidateActivationReadiness(valid candidate) error = %v", err)
+	}
+	if !profile.DataHooks[0].Disabled {
+		t.Fatal("activation readiness changed the configured disabled state")
+	}
+}
+
 func TestApplicationProfileValidatesJNIDiscovery(t *testing.T) {
 	profile := &ApplicationProfile{
 		Version: ApplicationProfileVersion,

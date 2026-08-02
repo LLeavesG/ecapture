@@ -152,6 +152,15 @@ func TestCandidateForKnownAndCronetSymbols(t *testing.T) {
 		sendmsg.hook.BufferArg != 2 || sendmsg.hook.ContextArg != 1 {
 		t.Fatalf("sendmsg recipe = %#v", sendmsg.hook)
 	}
+	sslRead, _ := candidateForSymbol("SSL_read")
+	if sslRead.hook.LengthSize != 4 {
+		t.Fatalf("SSL_read return width = %d, want 4", sslRead.hook.LengthSize)
+	}
+	gnutlsRead, _ := candidateForSymbol("gnutls_record_recv")
+	if gnutlsRead.hook.LengthSize != 0 {
+		t.Fatalf("gnutls_record_recv explicit return width = %d, want default ssize_t",
+			gnutlsRead.hook.LengthSize)
+	}
 	ngtcp2, _ := candidateForSymbol("ngtcp2_conn_writev_stream_versioned")
 	if ngtcp2.hook.BufferFormat != openssl.AppDataBufferIOVec ||
 		ngtcp2.hook.BufferArg != 10 || ngtcp2.hook.VectorCountArg != 11 ||
@@ -159,6 +168,104 @@ func TestCandidateForKnownAndCronetSymbols(t *testing.T) {
 		ngtcp2.hook.LengthArg != 7 || ngtcp2.hook.ContextArg != 1 ||
 		ngtcp2.hook.StreamArg != 9 {
 		t.Fatalf("ngtcp2 recipe = %#v", ngtcp2.hook)
+	}
+}
+
+func TestScaffoldProfileBalancesAppTLSAndSocketDiscovery(t *testing.T) {
+	candidate := func(symbol string) HookCandidate {
+		recipe, found := candidateForSymbol(symbol)
+		if !found || recipe.hook == nil {
+			t.Fatalf("candidateForSymbol(%q) is unavailable", symbol)
+		}
+		return HookCandidate{
+			Family:       recipe.family,
+			Layer:        recipe.layer,
+			Role:         recipe.role,
+			Symbol:       symbol,
+			SymbolSource: "dynamic",
+			Confidence:   recipe.confidence,
+			Priority:     recipe.priority,
+			ABI:          recipe.abi,
+			Recipe:       cloneHookRecipe(recipe.hook),
+		}
+	}
+	tlsCandidates := func() []HookCandidate {
+		return []HookCandidate{
+			candidate("SSL_read"),
+			candidate("SSL_write"),
+		}
+	}
+	report := &Report{
+		Version: ReportVersion,
+		PID:     4242,
+		Libraries: []LibraryReport{
+			{
+				Path:       "/apex/com.android.conscrypt/lib64/libssl.so",
+				BuildID:    "1111111111111111",
+				Candidates: tlsCandidates(),
+			},
+			{
+				Path:       "/apex/com.android.tethering/lib64/stable_cronet_libssl.so",
+				BuildID:    "2222222222222222",
+				Candidates: tlsCandidates(),
+			},
+			{
+				Path:       "/data/app/hash/com.example.app-hash/lib/arm64/libprivate_ssl.so",
+				BuildID:    "3333333333333333",
+				Candidates: tlsCandidates(),
+			},
+			{
+				Path:    "/apex/com.android.runtime/lib64/bionic/libc.so",
+				BuildID: "4444444444444444",
+				Candidates: []HookCandidate{
+					candidate("recv"),
+					candidate("send"),
+					candidate("recvfrom"),
+					candidate("sendto"),
+					candidate("recvmsg"),
+					candidate("sendmsg"),
+					candidate("readv"),
+					candidate("writev"),
+				},
+			},
+		},
+	}
+	// Simulate a report generated before the SSL_read int-width fix.
+	report.Libraries[2].Candidates[0].Recipe.LengthSize = 0
+	profile, err := ScaffoldProfile(report, ScaffoldOptions{
+		Package:  "com.example.app",
+		MaxHooks: 8,
+	})
+	if err != nil {
+		t.Fatalf("ScaffoldProfile() error = %v", err)
+	}
+	if len(profile.DataHooks) != 8 {
+		t.Fatalf("data hooks = %#v", profile.DataHooks)
+	}
+	wantSymbols := []string{
+		"SSL_read",
+		"SSL_write",
+		"recvfrom",
+		"sendto",
+		"recvmsg",
+		"sendmsg",
+		"readv",
+		"writev",
+	}
+	for index, want := range wantSymbols {
+		if profile.DataHooks[index].Symbol != want {
+			t.Fatalf("hook[%d] symbol = %q, want %q; hooks=%#v",
+				index, profile.DataHooks[index].Symbol, want, profile.DataHooks)
+		}
+	}
+	for _, hook := range profile.DataHooks[:2] {
+		if !strings.Contains(hook.Library, "com.example.app") {
+			t.Fatalf("TLS hook used non-app provider: %#v", hook)
+		}
+	}
+	if profile.DataHooks[0].LengthSize != 4 {
+		t.Fatalf("SSL_read length_size = %d, want 4",
+			profile.DataHooks[0].LengthSize)
 	}
 }
 

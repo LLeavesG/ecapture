@@ -359,6 +359,24 @@ func LoadApplicationProfile(path string) (*ApplicationProfile, error) {
 	return &profile, nil
 }
 
+// ValidateActivationReadiness applies the enabled-hook runtime contract to
+// every data hook while preserving the profile's configured disabled state.
+// Discovery systems use this before promoting disabled static candidates into
+// a live probe.
+func (p *ApplicationProfile) ValidateActivationReadiness() error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	hooks := append([]ApplicationDataHook(nil), p.DataHooks...)
+	for i := range hooks {
+		hooks[i].Disabled = false
+	}
+	if err := validateApplicationDataHooks(hooks); err != nil {
+		return fmt.Errorf("data hook activation readiness: %w", err)
+	}
+	return nil
+}
+
 func (p *ApplicationProfile) Validate() error {
 	if p == nil {
 		return fmt.Errorf("application profile is nil")
