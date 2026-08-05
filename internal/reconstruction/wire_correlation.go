@@ -104,6 +104,11 @@ type wirePacketCandidate struct {
 	match  wireMatch
 }
 
+type wireDirectionKey struct {
+	pid       uint32
+	direction string
+}
+
 // CorrelateWire consumes structured capture events and first attempts to match
 // custom TLS BIO ciphertext directly to reassembled TCP/UDP packet payloads.
 // Generic fd hooks are retained only as explicitly unverified fallback
@@ -211,22 +216,12 @@ func CorrelateWire(
 	})
 
 	encoder := json.NewEncoder(writer)
+	packetCandidatesBySource := correlatePacketCandidates(
+		sources,
+		packetRuns,
+	)
 	for _, source := range sources {
-		var packetCandidates []wirePacketCandidate
-		for index := range packetRuns {
-			target := &packetRuns[index]
-			if source.key.pid != target.key.pid ||
-				source.key.direction != target.key.direction {
-				continue
-			}
-			match := longestExactWireMatch(source.data, target.data)
-			if match.length >= wireCorrelationMinimum {
-				packetCandidates = append(
-					packetCandidates,
-					wirePacketCandidate{target: target, match: match},
-				)
-			}
-		}
+		packetCandidates := packetCandidatesBySource[source]
 		sort.Slice(packetCandidates, func(i, j int) bool {
 			if packetCandidates[i].match.length ==
 				packetCandidates[j].match.length {
@@ -353,6 +348,53 @@ func CorrelateWire(
 	return summary, nil
 }
 
+// correlatePacketCandidates indexes each packet run once and evaluates every
+// BIO stream with the same process and direction while that compact index is
+// resident. The previous source-first loop rebuilt the same byte index for
+// every BIO stream, which dominated large all-traffic checkpoints.
+func correlatePacketCandidates(
+	sources []*wireSequence,
+	packetRuns []wirePacketRun,
+) map[*wireSequence][]wirePacketCandidate {
+	result := make(map[*wireSequence][]wirePacketCandidate)
+	groups := make(map[wireDirectionKey][]*wireSequence)
+	for _, source := range sources {
+		key := wireDirectionKey{
+			pid:       source.key.pid,
+			direction: source.key.direction,
+		}
+		groups[key] = append(groups[key], source)
+	}
+	for index := range packetRuns {
+		target := &packetRuns[index]
+		key := wireDirectionKey{
+			pid:       target.key.pid,
+			direction: target.key.direction,
+		}
+		relevant := groups[key]
+		if len(relevant) == 0 ||
+			len(target.data) < wireCorrelationAnchor {
+			continue
+		}
+		anchorIndex := buildExactWireIndex(target.data)
+		for _, source := range relevant {
+			match := longestExactWireMatchIndexed(
+				source.data,
+				target.data,
+				anchorIndex,
+			)
+			if match.length < wireCorrelationMinimum {
+				continue
+			}
+			result[source] = append(
+				result[source],
+				wirePacketCandidate{target: target, match: match},
+			)
+		}
+	}
+	return result
+}
+
 func correlationTimeBounds(
 	sourceFirst uint64,
 	sourceLast uint64,
@@ -375,6 +417,16 @@ func longestExactWireMatch(source, target []byte) wireMatch {
 		len(target) < wireCorrelationAnchor {
 		return wireMatch{}
 	}
+	return longestExactWireMatchIndexed(
+		source,
+		target,
+		buildExactWireIndex(target),
+	)
+}
+
+func buildExactWireIndex(
+	target []byte,
+) map[[wireCorrelationAnchor]byte][]int {
 	index := make(map[[wireCorrelationAnchor]byte][]int)
 	for offset := 0; offset+wireCorrelationAnchor <= len(target); offset++ {
 		var anchor [wireCorrelationAnchor]byte
@@ -384,7 +436,18 @@ func longestExactWireMatch(source, target []byte) wireMatch {
 			index[anchor] = append(positions, offset)
 		}
 	}
+	return index
+}
 
+func longestExactWireMatchIndexed(
+	source []byte,
+	target []byte,
+	index map[[wireCorrelationAnchor]byte][]int,
+) wireMatch {
+	if len(source) < wireCorrelationAnchor ||
+		len(target) < wireCorrelationAnchor {
+		return wireMatch{}
+	}
 	var best wireMatch
 	for sourceOffset := 0; sourceOffset+wireCorrelationAnchor <= len(source); sourceOffset += wireCorrelationAnchor / 2 {
 		var anchor [wireCorrelationAnchor]byte

@@ -48,12 +48,24 @@ func collectTLSCalls(reader io.Reader) (Summary, []Call, error) {
 				err,
 			)
 		}
-		if call.SourceType != "tls_plaintext" ||
+		genericTLSBoundary := call.SourceType == "boundary_data" &&
+			call.CaptureLayer == captureLayerTransport &&
+			call.Transport == "tls"
+		if call.SourceType != "tls_plaintext" && !genericTLSBoundary ||
 			call.CaptureLayer != captureLayerTransport ||
 			call.Transport != "tls" ||
 			!call.Complete ||
 			call.Truncated {
 			continue
+		}
+		if genericTLSBoundary {
+			if call.ContextID == 0 {
+				continue
+			}
+			// Generic SSL_read/SSL_write hooks preserve SSL* as ContextID.
+			// Normalize it into the identity consumed by HTTP/1, HTTP/2, and
+			// WebSocket grouping without changing the captured byte layer.
+			call.SSLAddr = call.ContextID
 		}
 		calls = append(calls, call)
 	}

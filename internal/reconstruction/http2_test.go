@@ -119,6 +119,55 @@ func TestReconstructHTTP2TransactionFromSplitTLSCalls(t *testing.T) {
 	}
 }
 
+func TestReconstructHTTP2FromGenericTLSBoundaryHooks(t *testing.T) {
+	requestHeaders := encodeHPACKHeaders(t,
+		hpack.HeaderField{Name: ":method", Value: "GET"},
+		hpack.HeaderField{Name: ":scheme", Value: "https"},
+		hpack.HeaderField{Name: ":authority", Value: "config.example.test"},
+		hpack.HeaderField{Name: ":path", Value: "/settings/v3"},
+	)
+	responseHeaders := encodeHPACKHeaders(t,
+		hpack.HeaderField{Name: ":status", Value: "200"},
+	)
+	writeBytes := append([]byte(nil), http2ClientPreface...)
+	writeBytes = append(writeBytes, makeHTTP2Frame(
+		http2FrameHeaders,
+		http2FlagEndHeaders|http2FlagEndStream,
+		1,
+		requestHeaders,
+	)...)
+	readBytes := makeHTTP2Frame(
+		http2FrameHeaders,
+		http2FlagEndHeaders|http2FlagEndStream,
+		1,
+		responseHeaders,
+	)
+	input := strings.Join([]string{
+		marshalTLSBoundaryEvent(t, 200, "WRITE", 0x5678, writeBytes),
+		marshalTLSBoundaryEvent(t, 201, "READ", 0x5678, readBytes),
+	}, "\n")
+
+	var output bytes.Buffer
+	summary, err := ReconstructHTTP2(strings.NewReader(input), &output)
+	if err != nil {
+		t.Fatalf("ReconstructHTTP2() error = %v", err)
+	}
+	if summary.Transactions != 1 {
+		t.Fatalf("unexpected summary: %#v output=%s", summary, output.String())
+	}
+	var transaction HTTP2Transaction
+	if err := json.Unmarshal(output.Bytes(), &transaction); err != nil {
+		t.Fatalf("decode transaction: %v", err)
+	}
+	if transaction.Path != "/settings/v3" ||
+		transaction.Status != "200" ||
+		transaction.SSLAddr != 0x5678 ||
+		transaction.CaptureLayer != captureLayerTransport ||
+		transaction.Transport != "tls" {
+		t.Fatalf("unexpected transaction: %#v", transaction)
+	}
+}
+
 func encodeHPACKHeaders(t *testing.T, fields ...hpack.HeaderField) []byte {
 	t.Helper()
 	var buffer bytes.Buffer
@@ -195,6 +244,31 @@ func marshalTLSCaptureEvent(
 		DataEncoding: "base64",
 		Data:         data,
 	}
+	encoded, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
+}
+
+func marshalTLSBoundaryEvent(
+	t *testing.T,
+	timestamp uint64,
+	direction string,
+	contextID uint64,
+	data []byte,
+) string {
+	t.Helper()
+	var event map[string]any
+	if err := json.Unmarshal([]byte(marshalTLSCaptureEvent(
+		t, timestamp, direction, data,
+	)), &event); err != nil {
+		t.Fatal(err)
+	}
+	event["eventType"] = "boundary_data"
+	event["contextId"] = contextID
+	event["hookName"] = "generic-tls-" + strings.ToLower(direction)
+	delete(event, "sslAddr")
 	encoded, err := json.Marshal(event)
 	if err != nil {
 		t.Fatal(err)
