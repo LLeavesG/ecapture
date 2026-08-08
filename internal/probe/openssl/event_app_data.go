@@ -61,6 +61,7 @@ type ApplicationDataEvent struct {
 	UserStackStatus int32                        `json:"userStackStatus"`
 	UserStackDepth  uint32                       `json:"userStackDepth"`
 	UserStack       [AppDataMaxStackDepth]uint64 `json:"userStack"`
+	UserStackMode   string                       `json:"userStackMode,omitempty"`
 	Data            [MaxDataSize]byte            `json:"data"`
 	HookName        string                       `json:"hookName,omitempty"`
 	CaptureLayer    string                       `json:"captureLayer,omitempty"`
@@ -123,6 +124,7 @@ func (e ApplicationDataEvent) MarshalJSON() ([]byte, error) {
 		Comm            string                      `json:"comm"`
 		UserStackStatus int32                       `json:"userStackStatus,omitempty"`
 		UserStackDepth  uint32                      `json:"userStackDepth,omitempty"`
+		UserStackMode   string                      `json:"userStackMode,omitempty"`
 		StackFrames     []ApplicationDataStackFrame `json:"userStack,omitempty"`
 		DataEncoding    string                      `json:"dataEncoding"`
 		Data            []byte                      `json:"data"`
@@ -151,6 +153,7 @@ func (e ApplicationDataEvent) MarshalJSON() ([]byte, error) {
 		Comm:            commToString(e.Comm[:]),
 		UserStackStatus: e.UserStackStatus,
 		UserStackDepth:  e.UserStackDepth,
+		UserStackMode:   e.UserStackMode,
 		StackFrames:     e.StackFrames,
 		DataEncoding:    "base64",
 		Data:            e.GetData(),

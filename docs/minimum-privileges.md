@@ -119,17 +119,26 @@ docker run --rm \
 
 ## How eCapture Checks Capabilities
 
-eCapture performs runtime capability detection at startup (see [`cli/cmd/env_detection.go`](../cli/cmd/env_detection.go)):
+Standard Linux builds perform runtime capability detection at startup (see
+[`cli/cmd/env_detection.go`](../cli/cmd/env_detection.go)):
 
 1. **Kernel version check**: Verifies minimum kernel version (x86_64: 4.18+, aarch64: 5.5+). These requirements apply per CPU architecture for both Linux and Android GKI.
-2. **Capability check**: Verifies the process has `CAP_BPF` (kernel >= 5.8) or `CAP_SYS_ADMIN` (kernel < 5.8)
+2. **Capability check**: Verifies the effective set contains both `CAP_BPF`
+   and `CAP_PERFMON`, or the legacy `CAP_SYS_ADMIN` capability.
 
 If capabilities are insufficient, eCapture exits with a clear error message:
 
 ```
-the current user does not have CAP_BPF to load bpf programs. 
-Please run as root or use sudo or add the --privileged=true flag for Docker
+the current process is missing effective eBPF capabilities: require
+CAP_BPF+CAP_PERFMON or CAP_SYS_ADMIN; UID 0 is insufficient after its
+capabilities are dropped
 ```
+
+The Android build does not reject a process from `capget` alone. Root managers
+such as Magisk may authorize BPF through kernel policy while `/proc/self/status`
+still reports `CapEff=0` and a bounding set without `CAP_BPF`/`CAP_PERFMON`.
+On Android, the real BPF program load and perf-event attach are authoritative;
+their kernel errors are returned if that root environment is not sufficient.
 
 ## Security Best Practices
 
@@ -150,4 +159,3 @@ sudo chmod 750 /usr/local/bin/ecapture
 - [Defense and Detection Guide](./defense-detection.md) — Detecting unauthorized eBPF tool usage
 - [Linux Capabilities Manual](https://man7.org/linux/man-pages/man7/capabilities.7.html)
 - [Docker Security Best Practices](https://docs.docker.com/engine/security/)
-

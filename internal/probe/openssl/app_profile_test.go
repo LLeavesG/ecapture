@@ -144,6 +144,30 @@ func TestApplicationDataHookProvenanceValidation(t *testing.T) {
 		t.Fatalf("legacy hook provenance = %#v", profile.DataHooks[0])
 	}
 
+	dwarf := base
+	dwarf.StackMode = AppDataStackDWARF
+	if err := validate(dwarf); err != nil {
+		t.Fatalf("DWARF stack hook validation error = %v", err)
+	}
+	dwarfProfile := &ApplicationProfile{
+		Version:   ApplicationProfileVersion,
+		Name:      "dwarf-stack",
+		Match:     ApplicationMatch{PID: 1},
+		DataHooks: []ApplicationDataHook{dwarf},
+	}
+	if err := dwarfProfile.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if !dwarfProfile.DataHooks[0].CollectUserStack {
+		t.Fatal("stack_mode=dwarf should imply collect_user_stack")
+	}
+
+	invalidStack := base
+	invalidStack.StackMode = "userspace"
+	if err := validate(invalidStack); err == nil {
+		t.Fatal("unsupported stack mode should be rejected")
+	}
+
 	transport := base
 	transport.CaptureLayer = CaptureLayerTransport
 	transport.Transport = CaptureTransportQUIC

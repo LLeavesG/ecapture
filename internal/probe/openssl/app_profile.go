@@ -75,6 +75,8 @@ const (
 	AppDataBufferMsgHdr   = "msghdr"
 	AppDataStateSave      = "save"
 	AppDataStateLoad      = "load"
+	AppDataStackKernel    = "kernel"
+	AppDataStackDWARF     = "dwarf"
 
 	MaxApplicationHooks = 8
 	MaxApplicationData  = 8 * MaxDataSize
@@ -327,6 +329,7 @@ type ApplicationDataHook struct {
 	StateAction            string      `json:"state_action,omitempty"`
 	StateKeyArg            uint32      `json:"state_key_arg,omitempty"`
 	CollectUserStack       bool        `json:"collect_user_stack,omitempty"`
+	StackMode              string      `json:"stack_mode,omitempty"`
 	Disabled               bool        `json:"disabled,omitempty"`
 
 	resolvedLibrary string
@@ -745,6 +748,18 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 		default:
 			return fmt.Errorf("application data hook %q has unsupported capture_on %q",
 				hook.Name, hook.CaptureOn)
+		}
+		hook.StackMode = strings.ToLower(strings.TrimSpace(hook.StackMode))
+		switch hook.StackMode {
+		case "":
+			if hook.CollectUserStack {
+				hook.StackMode = AppDataStackKernel
+			}
+		case AppDataStackKernel, AppDataStackDWARF:
+			hook.CollectUserStack = true
+		default:
+			return fmt.Errorf("application data hook %q has unsupported stack_mode %q",
+				hook.Name, hook.StackMode)
 		}
 		if hook.BufferArg < 1 || hook.BufferArg > MaxApplicationArguments {
 			return fmt.Errorf("application data hook %q buffer_arg must be between 1 and %d",

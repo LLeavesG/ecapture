@@ -27,6 +27,7 @@ const (
 	appDataFlagBufferIOVec
 	appDataFlagBufferMsgHdr
 	appDataFlagUserStack
+	appDataFlagDwarfStack
 )
 
 // applicationDataBPFConfig must stay byte-for-byte compatible with
@@ -99,6 +100,9 @@ func (h ApplicationDataHook) bpfConfig() applicationDataBPFConfig {
 	}
 	if h.CollectUserStack {
 		flags |= appDataFlagUserStack
+	}
+	if h.StackMode == AppDataStackDWARF {
+		flags |= appDataFlagUserStack | appDataFlagDwarfStack
 	}
 
 	direction := uint32(DataTypeRead)

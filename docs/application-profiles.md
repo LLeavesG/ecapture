@@ -238,11 +238,41 @@ included in text/JSON events so different application strategies can be
 correlated without rebuilding eCapture.
 
 `collect_user_stack: true` adds a bounded 16-address user call chain to each
-event. This is a discovery switch, not a production default. Its first purpose
-is library attribution: group resolved frames by GNU Build ID to determine
-which exact Cronet, Chromium/WebView, QUIC, TLS, or proprietary image owns an
-observed boundary. Only then use return PCs inside the selected module as
-static-analysis anchors. Generate a stack-enabled scaffold with:
+event. `stack_mode` selects the eBPF collection backend:
+
+- `kernel` calls `bpf_get_stack(BPF_F_USER_STACK)`. This remains the default
+  when an existing profile only sets `collect_user_stack: true`.
+- `dwarf` parses arm64 ELF `.eh_frame`/`.debug_frame` at startup, compiles the
+  supported CFI rows into compact PID-scoped BPF maps, and unwinds by reading
+  user memory from the probe. Directly mapped, uncompressed (`ZIP STORE`)
+  native libraries in base or split APKs are parsed in place through their
+  archive-member ranges; no temporary extraction is performed. It requires
+  one explicit target PID through `match.pid` or `--pid`; system-wide DWARF
+  collection is rejected.
+
+For a large process, DWARF mode performs one startup scan of its executable
+mappings. The loader uses compact four-byte page transitions, removes repeated
+writes and adjacent equivalent rules, and packs two transitions into each
+eight-byte BPF array value. Temporary parse and upload tables are released
+after the maps are populated. The startup log reports both `source_deltas` and
+the compacted `deltas`/`delta_pairs` counts so the actual reduction is visible
+for each app; map sizes are set to those prepared counts rather than the fixed
+compile-time maxima.
+
+For example:
+
+```json
+{
+  "collect_user_stack": true,
+  "stack_mode": "dwarf"
+}
+```
+
+Stack collection is a discovery switch, not a production default. Its first
+purpose is library attribution: group resolved frames by GNU Build ID to
+determine which exact Cronet, Chromium/WebView, QUIC, TLS, or proprietary
+image owns an observed boundary. Only then use return PCs inside the selected
+module as static-analysis anchors. Generate a stack-enabled scaffold with:
 
 ```sh
 ecapture profile inspect \
@@ -259,13 +289,20 @@ not a proven uprobe. Promote only a known public/catalog ABI or a disassembled
 and marker-validated private buffer ABI into the production profile, then
 remove `collect_user_stack`.
 
-User unwinding is best effort. Frame-pointer omission, inlining, tail calls,
-JIT code, unreadable mappings, and kernel unwind support can make a stack
-shallow or incomplete. An empty or partial stack is not evidence that no caller
-exists, and a frame hit alone does not prove the buffer/length ABI. A discovery
-backend may instead record bounded user registers and raw stack bytes and use
-DWARF/libunwindstack offline; recovered frames must be normalized to the same
-module Build-ID and ELF-offset form before attribution.
+User unwinding is best effort. Inlining, tail calls, JIT code, unreadable ELF
+mappings, compressed archive members, unsupported CFI expressions, and
+libraries loaded after startup can make a stack shallow or incomplete. DWARF
+mode normalizes AArch64 PAC/TBI return addresses only when the resulting PC
+belongs to a preloaded CFI page. `userStackStatus` is positive on success;
+negative values report a missing rule (`-2`), user-memory fault (`-14`),
+invalid rule (`-22`), or unsupported architecture/expression (`-95`). An empty
+or partial stack is not evidence that no caller exists, and a frame hit alone
+does not prove the buffer/length ABI. Recovered frames use the same module
+Build-ID and ELF-offset normalization as kernel-mode stacks.
+
+The rule table is also scoped to the startup PID. Restart the capture after an
+app-process replacement; the current implementation does not silently reuse
+the old PID's CFI for the replacement process.
 
 Perf output includes only the fixed event header plus `data_len` bytes. It no
 longer transfers an otherwise empty 16 KiB payload area for every small event;

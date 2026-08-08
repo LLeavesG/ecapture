@@ -66,6 +66,7 @@ type Probe struct {
 	isBoringSSL     bool
 	masterHookFuncs []string
 	archiveUprobes  []archiveUprobeSpec
+	dwarfUnwind     *appDwarfPreparedUnwind
 }
 
 // NewProbe creates a new OpenSSL probe instance.
@@ -139,6 +140,9 @@ func (p *Probe) Start(ctx context.Context) error {
 	if err := p.setupManager(); err != nil {
 		return err
 	}
+	if err := p.prepareDwarfUnwind(); err != nil {
+		return errors.NewConfigurationError("prepare DWARF user-stack unwinding", err)
+	}
 
 	// Initialize eBPF manager
 	if err := p.bpfManager.InitWithOptions(bytes.NewReader(byteBuf), p.getManagerOptions()); err != nil {
@@ -146,6 +150,9 @@ func (p *Probe) Start(ctx context.Context) error {
 	}
 	if err := p.configureApplicationDataHooks(); err != nil {
 		return errors.NewConfigurationError("configure application data hooks", err)
+	}
+	if err := p.configureDwarfUnwind(); err != nil {
+		return errors.NewConfigurationError("configure DWARF user-stack unwinding", err)
 	}
 	if err := p.configureJNIConversionCallerFilter(); err != nil {
 		return errors.NewConfigurationError("configure JNI conversion caller filter", err)
@@ -1030,6 +1037,9 @@ func (p *Probe) appendApplicationDataProbes(
 		&manager.Map{Name: "app_hook_states"},
 		&manager.Map{Name: "app_data_buffer_heap"},
 		&manager.Map{Name: "app_iovec_state_heap"},
+		&manager.Map{Name: "app_dwarf_unwind_pages"},
+		&manager.Map{Name: "app_dwarf_unwind_deltas"},
+		&manager.Map{Name: "app_dwarf_unwind_infos"},
 	)
 	p.mapNameToDecoder["app_data_events"] = &applicationDataEventDecoder{
 		hooks: append([]ApplicationDataHook(nil), hooks...),
@@ -1270,6 +1280,28 @@ func (p *Probe) getManagerOptions() manager.Options {
 			Max: math.MaxUint64,
 		},
 	}
+	pageEntries := uint32(1)
+	deltaEntries := uint32(1)
+	infoEntries := uint32(1)
+	if p.dwarfUnwind != nil {
+		pageEntries = uint32(len(p.dwarfUnwind.pages))
+		deltaEntries = uint32(len(p.dwarfUnwind.deltas))
+		infoEntries = uint32(len(p.dwarfUnwind.infos))
+	}
+	opts.MapSpecEditors = map[string]manager.MapSpecEditor{
+		"app_dwarf_unwind_pages": {
+			MaxEntries: pageEntries,
+			EditorFlag: manager.EditMaxEntries,
+		},
+		"app_dwarf_unwind_deltas": {
+			MaxEntries: deltaEntries,
+			EditorFlag: manager.EditMaxEntries,
+		},
+		"app_dwarf_unwind_infos": {
+			MaxEntries: infoEntries,
+			EditorFlag: manager.EditMaxEntries,
+		},
+	}
 
 	// Add constant editors if kernel supports global variables
 	if p.config.EnableGlobalVar() {
@@ -1437,6 +1469,7 @@ func (d *applicationDataEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.E
 		event.CaptureLayer = hook.CaptureLayer
 		event.Transport = hook.Transport
 		event.BoundaryRole = hook.BoundaryRole
+		event.UserStackMode = hook.StackMode
 	}
 	if event.UserStackDepth > 0 {
 		if d.resolver == nil {

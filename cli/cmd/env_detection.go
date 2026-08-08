@@ -20,6 +20,8 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/gojue/ecapture/internal/config"
+	pkgebpf "github.com/gojue/ecapture/pkg/util/ebpf"
 	"github.com/gojue/ecapture/pkg/util/kernel"
 )
 
@@ -53,14 +55,46 @@ func detectBpfCap() error {
 		return fmt.Errorf("failed to get the capabilities of the current process: %w", err)
 	}
 
-	capBpfMask := uint32(1 << (unix.CAP_BPF - 32))
-	capSysAdminMask := uint32(1 << unix.CAP_SYS_ADMIN)
-	haveBpfCap := (data[1].Permitted&capBpfMask != 0) || (data[0].Permitted&capSysAdminMask != 0)
-	if !haveBpfCap {
-		return fmt.Errorf("the current user does not have CAP_BPF to load bpf programs. Please run as root or use sudo or add the --privileged=true flag for Docker")
+	if !hasEffectiveBpfCapabilities(data) {
+		return fmt.Errorf("the current process is missing effective eBPF capabilities: require CAP_BPF+CAP_PERFMON or CAP_SYS_ADMIN; UID 0 is insufficient after its capabilities are dropped")
 	}
 
 	return nil
+}
+
+func hasEffectiveCapability(data [2]unix.CapUserData, capability int) bool {
+	word := capability / 32
+	if word < 0 || word >= len(data) {
+		return false
+	}
+	mask := uint32(1) << uint(capability%32)
+	return data[word].Effective&mask != 0
+}
+
+func hasEffectiveBpfCapabilities(data [2]unix.CapUserData) bool {
+	if hasEffectiveCapability(data, unix.CAP_SYS_ADMIN) {
+		return true
+	}
+	return hasEffectiveCapability(data, unix.CAP_BPF) &&
+		hasEffectiveCapability(data, unix.CAP_PERFMON)
+}
+
+func validateBpfAccess(enforceCapabilityBits bool, detect func() error) error {
+	if !enforceCapabilityBits {
+		return nil
+	}
+	return detect()
+}
+
+func resolveBTFMode(mode uint8, detect func() (bool, error)) uint8 {
+	if mode != config.BTFModeAutoDetect {
+		return mode
+	}
+	enabled, err := detect()
+	if err == nil && enabled {
+		return config.BTFModeCore
+	}
+	return config.BTFModeNonCore
 }
 
 func detectEnv() error {
@@ -70,9 +104,15 @@ func detectEnv() error {
 		return err
 	}
 
-	if err := detectBpfCap(); err != nil {
+	if err := validateBpfAccess(enforceBpfCapabilityBits, detectBpfCap); err != nil {
 		return err
 	}
+
+	// Resolve auto before probe configuration is copied. Historically zero
+	// flowed into BaseProbe.GetBPFName(), where it was treated as non-CO-RE
+	// even when /sys/kernel/btf/vmlinux existed. Core-only Android builds then
+	// requested an asset which could not have been embedded.
+	globalConf.BtfMode = resolveBTFMode(globalConf.BtfMode, pkgebpf.IsEnableBTF)
 
 	return nil
 }

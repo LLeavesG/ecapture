@@ -807,11 +807,16 @@ func TestApplicationDataEventDecodeCompactPayloadAndStack(t *testing.T) {
 func TestApplicationDataBPFConfigEnablesUserStackExplicitly(t *testing.T) {
 	withoutStack := ApplicationDataHook{}.bpfConfig()
 	withStack := ApplicationDataHook{CollectUserStack: true}.bpfConfig()
+	withDwarf := ApplicationDataHook{StackMode: AppDataStackDWARF}.bpfConfig()
 	if withoutStack.Flags&appDataFlagUserStack != 0 {
 		t.Fatalf("user stacks unexpectedly enabled by default: %#x", withoutStack.Flags)
 	}
 	if withStack.Flags&appDataFlagUserStack == 0 {
 		t.Fatalf("user stack flag missing: %#x", withStack.Flags)
+	}
+	if withDwarf.Flags&appDataFlagUserStack == 0 ||
+		withDwarf.Flags&appDataFlagDwarfStack == 0 {
+		t.Fatalf("DWARF stack flags missing: %#x", withDwarf.Flags)
 	}
 }
 

@@ -218,6 +218,10 @@ func (c *Config) prepareApplicationProfile() error {
 		if err := c.resolveApplicationDataLibraries(); err != nil {
 			return err
 		}
+		if c.hasDwarfStackHooks() && c.Pid == 0 {
+			return fmt.Errorf("stack_mode=%s requires one target pid; set match.pid or --pid",
+				AppDataStackDWARF)
+		}
 	}
 	if c.HasStrategy(StrategyJNIDiscovery) {
 		if err := c.resolveJNIDiscoveryLibrary(); err != nil {
@@ -399,6 +403,15 @@ func (c *Config) captureDataHookEnabled(hook ApplicationDataHook) bool {
 // generic hook engine's historical name.
 func (c *Config) EnabledApplicationDataHooks() []ApplicationDataHook {
 	return c.EnabledCaptureDataHooks()
+}
+
+func (c *Config) hasDwarfStackHooks() bool {
+	for _, hook := range c.EnabledCaptureDataHooks() {
+		if hook.StackMode == AppDataStackDWARF {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Config) resolveApplicationDataLibraries() error {

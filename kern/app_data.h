@@ -29,6 +29,7 @@
 #define APP_DATA_FLAG_BUFFER_IOVEC 0x200
 #define APP_DATA_FLAG_BUFFER_MSGHDR 0x400
 #define APP_DATA_FLAG_USER_STACK 0x800
+#define APP_DATA_FLAG_DWARF_STACK 0x1000
 #define APP_DATA_EVENT_TRUNCATED 0x01
 #define APP_DATA_STREAM_OFFSET_VALID 0x01
 #define APP_DATA_STREAM_FIN_VALID 0x02
@@ -36,6 +37,33 @@
 #define APP_DATA_MAX_IOVECS 16
 #define APP_DATA_MAX_IOVEC_SEGMENTS 8
 #define APP_DATA_MAX_STACK_DEPTH 16
+#define APP_DWARF_PAGE_BITS 12
+#define APP_DWARF_PAGE_SIZE (1U << APP_DWARF_PAGE_BITS)
+#define APP_DWARF_PAGE_MASK (APP_DWARF_PAGE_SIZE - 1)
+#define APP_DWARF_MAX_PAGE_DELTAS 2048
+#define APP_DWARF_MAX_TOTAL_DELTAS (8U * 1024U * 1024U)
+#define APP_DWARF_MAX_DELTA_PAIRS (APP_DWARF_MAX_TOTAL_DELTAS / 2)
+#define APP_DWARF_MAX_UNWIND_INFOS 16384
+
+#define APP_DWARF_UNWIND_FLAG_COMMAND 0x01
+#define APP_DWARF_UNWIND_FLAG_FRAME 0x02
+#define APP_DWARF_UNWIND_FLAG_LEAF_ONLY 0x04
+
+#define APP_DWARF_UNWIND_REG_CFA 1
+#define APP_DWARF_UNWIND_REG_PC 2
+#define APP_DWARF_UNWIND_REG_SP 3
+#define APP_DWARF_UNWIND_REG_FP 4
+#define APP_DWARF_UNWIND_REG_LR 5
+
+#define APP_DWARF_UNWIND_COMMAND_INVALID 0
+#define APP_DWARF_UNWIND_COMMAND_STOP 1
+#define APP_DWARF_UNWIND_COMMAND_SIGNAL 3
+#define APP_DWARF_UNWIND_COMMAND_FRAME_POINTER 4
+
+#define APP_DWARF_STATUS_RULE_MISSING -2
+#define APP_DWARF_STATUS_MEMORY_FAULT -14
+#define APP_DWARF_STATUS_INVALID_RULE -22
+#define APP_DWARF_STATUS_UNSUPPORTED -95
 
 struct app_hook_config_t {
     u32 buffer_arg;
@@ -100,6 +128,55 @@ struct app_hook_state_t {
 struct app_iovec_t {
     u64 base;
     u64 length;
+};
+
+/*
+ * Userspace compiles .eh_frame CFI into page-local rule transitions. Page
+ * headers point into a shared compact delta array instead of embedding a
+ * worst-case array in every hash value. Seventeen indexes split each page
+ * into 256-byte buckets. A lookup includes the preceding transition, so gaps
+ * inherit the correct rule while the verifier-safe binary search examines at
+ * most 257 entries instead of every transition in the 4 KiB page.
+ */
+struct app_dwarf_unwind_info_t {
+    u8 flags;
+    u8 base_reg;
+    u8 aux_base_reg;
+    u8 merge_opcode;
+    s32 param;
+    s32 aux_param;
+};
+
+struct app_dwarf_stack_delta_t {
+    u16 address_low;
+    u16 unwind_info;
+};
+
+struct app_dwarf_stack_delta_pair_t {
+    struct app_dwarf_stack_delta_t deltas[2];
+};
+
+struct app_dwarf_unwind_page_key_t {
+    u32 pid;
+    u32 reserved;
+    u64 page;
+};
+
+struct app_dwarf_unwind_page_t {
+    u32 delta_start;
+    u16 count;
+    u16 buckets[17];
+};
+
+struct app_dwarf_unwind_state_t {
+    u64 pc;
+    u64 sp;
+    u64 fp;
+    u64 lr;
+    u32 pid;
+    u8 return_address;
+    u8 lr_valid;
+    u16 reserved;
 };
 
 /*
@@ -193,11 +270,314 @@ struct {
 } app_iovec_state_heap SEC(".maps");
 
 struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct app_dwarf_unwind_page_key_t);
+    __type(value, struct app_dwarf_unwind_page_t);
+    __uint(max_entries, 131072);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
+} app_dwarf_unwind_pages SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, u32);
+    __type(value, struct app_dwarf_stack_delta_pair_t);
+    __uint(max_entries, APP_DWARF_MAX_DELTA_PAIRS);
+} app_dwarf_unwind_deltas SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, u32);
+    __type(value, struct app_dwarf_unwind_info_t);
+    __uint(max_entries, APP_DWARF_MAX_UNWIND_INFOS);
+} app_dwarf_unwind_infos SEC(".maps");
+
+struct {
     __uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
     __uint(key_size, sizeof(u32));
     __uint(value_size, sizeof(u32));
     __uint(max_entries, 1024);
 } app_data_events SEC(".maps");
+
+static __always_inline u64 app_dwarf_register_value(
+    struct app_dwarf_unwind_state_t *state, u8 reg) {
+    switch (reg) {
+    case APP_DWARF_UNWIND_REG_CFA:
+        return state->sp;
+    case APP_DWARF_UNWIND_REG_PC:
+        return state->pc;
+    case APP_DWARF_UNWIND_REG_SP:
+        return state->sp;
+    case APP_DWARF_UNWIND_REG_FP:
+        return state->fp;
+    case APP_DWARF_UNWIND_REG_LR:
+        return state->lr;
+    default:
+        return 0;
+    }
+}
+
+static __always_inline struct app_dwarf_unwind_page_t *
+app_dwarf_find_page(u32 pid, u64 address, u64 *normalized) {
+    struct app_dwarf_unwind_page_key_t key = {.pid = pid};
+    /*
+     * AArch64 PAC occupies otherwise-unused virtual-address bits. Linux arm64
+     * commonly uses 39, 42, or 48 user VA bits; TBI may additionally leave a
+     * tag in the top byte. A candidate is accepted only when its page exists
+     * in the PID-scoped table, so trying all supported widths is unambiguous.
+     */
+    const u64 masks[6] = {
+        ~0ULL,
+        0x00ffffffffffffffULL,
+        0x000fffffffffffffULL,
+        0x0000ffffffffffffULL,
+        0x000003ffffffffffULL,
+        0x0000007fffffffffULL,
+    };
+
+#pragma unroll
+    for (u32 index = 0; index < 6; index++) {
+        u64 candidate = address & masks[index];
+        key.page = candidate & ~(u64)APP_DWARF_PAGE_MASK;
+        struct app_dwarf_unwind_page_t *page =
+            bpf_map_lookup_elem(&app_dwarf_unwind_pages, &key);
+        if (page != NULL) {
+            *normalized = candidate;
+            return page;
+        }
+    }
+    return NULL;
+}
+
+static __always_inline int app_dwarf_read_delta(u32 logical_index,
+                                                u16 *address_low,
+                                                u16 *unwind_info) {
+    u32 pair_key = (logical_index >> 1) & (APP_DWARF_MAX_DELTA_PAIRS - 1);
+    struct app_dwarf_stack_delta_pair_t *pair =
+        bpf_map_lookup_elem(&app_dwarf_unwind_deltas, &pair_key);
+    if (pair == NULL)
+        return -1;
+    if (logical_index & 1) {
+        *address_low = pair->deltas[1].address_low;
+        *unwind_info = pair->deltas[1].unwind_info;
+    } else {
+        *address_low = pair->deltas[0].address_low;
+        *unwind_info = pair->deltas[0].unwind_info;
+    }
+    return 0;
+}
+
+static __always_inline struct app_dwarf_unwind_info_t *
+app_dwarf_find_unwind_info(struct app_dwarf_unwind_state_t *state,
+                           u64 address, u64 *normalized) {
+    struct app_dwarf_unwind_page_t *page =
+        app_dwarf_find_page(state->pid, address, normalized);
+    if (page == NULL)
+        return NULL;
+
+    u32 count = page->count;
+    u32 safe_count = count & (APP_DWARF_MAX_PAGE_DELTAS - 1);
+    /*
+     * These equality checks make both values explicitly bounded scalars for
+     * older verifiers. Userspace rejects a page with 2048 transitions and a
+     * delta array which reaches the fixed backing-array capacity.
+     */
+    if (count != safe_count || safe_count == 0)
+        return NULL;
+    u32 start = page->delta_start;
+    u32 safe_start = start & (APP_DWARF_MAX_TOTAL_DELTAS - 1);
+    if (start != safe_start ||
+        safe_start > APP_DWARF_MAX_TOTAL_DELTAS - safe_count)
+        return NULL;
+    u16 page_offset = *normalized & APP_DWARF_PAGE_MASK;
+    u32 bucket_index = (page_offset >> 8) & 15;
+    u32 bucket_low = page->buckets[bucket_index];
+    u32 bucket_high = page->buckets[bucket_index + 1];
+    u32 low = bucket_low & (APP_DWARF_MAX_PAGE_DELTAS - 1);
+    u32 high = bucket_high & (APP_DWARF_MAX_PAGE_DELTAS - 1);
+    /* Keep these as explicitly bounded scalars on older Android verifiers. */
+    if (bucket_low != low || bucket_high != high || low > high ||
+        high > safe_count)
+        return NULL;
+    /*
+     * A bucket can start before its first transition or contain no transition
+     * at all. Include the last transition from the preceding bucket so the
+     * upper-bound search still returns the rule active at page_offset.
+     * There are at most 256 distinct byte offsets in a bucket, plus this
+     * predecessor, so nine binary-search steps are sufficient.
+     */
+    if (low > 0)
+        low = (low - 1) & (APP_DWARF_MAX_PAGE_DELTAS - 1);
+#pragma unroll
+    for (u32 iteration = 0; iteration < 9; iteration++) {
+        /*
+         * Android's older verifier can forget the scalar bounds after the
+         * two binary-search branches merge. The compiler can otherwise prove
+         * these masks redundant from C semantics and remove them, while the
+         * verifier still needs to observe the narrowing instructions. The
+         * barriers preserve those instructions without changing runtime data.
+         */
+        barrier_var(low);
+        barrier_var(high);
+        low &= APP_DWARF_MAX_PAGE_DELTAS - 1;
+        high &= APP_DWARF_MAX_PAGE_DELTAS - 1;
+        if (low < high) {
+            u32 pivot = ((low + high) >> 1) &
+                        (APP_DWARF_MAX_PAGE_DELTAS - 1);
+            u32 logical_index =
+                (safe_start + (pivot & (APP_DWARF_MAX_PAGE_DELTAS - 1))) &
+                (APP_DWARF_MAX_TOTAL_DELTAS - 1);
+            u16 delta_address = 0;
+            u16 delta_unwind = 0;
+            if (app_dwarf_read_delta(logical_index, &delta_address,
+                                     &delta_unwind) != 0)
+                return NULL;
+            if (page_offset >= delta_address) {
+                low = (pivot + 1) & (APP_DWARF_MAX_PAGE_DELTAS - 1);
+            } else {
+                high = pivot & (APP_DWARF_MAX_PAGE_DELTAS - 1);
+            }
+        }
+    }
+    if (low == 0)
+        return NULL;
+    u32 logical_index =
+        (safe_start + ((low - 1) & (APP_DWARF_MAX_PAGE_DELTAS - 1))) &
+        (APP_DWARF_MAX_TOTAL_DELTAS - 1);
+    u16 delta_address = 0;
+    u16 delta_unwind = APP_DWARF_MAX_UNWIND_INFOS;
+    if (app_dwarf_read_delta(logical_index, &delta_address, &delta_unwind) != 0)
+        return NULL;
+    /* BPF array keys are four bytes even though the packed rule index is u16. */
+    u32 unwind_index = delta_unwind;
+    if (unwind_index >= APP_DWARF_MAX_UNWIND_INFOS)
+        return NULL;
+    return bpf_map_lookup_elem(&app_dwarf_unwind_infos, &unwind_index);
+}
+
+static __always_inline int app_dwarf_unwind_frame_pointer(
+    struct app_dwarf_unwind_state_t *state) {
+    u64 frame[2] = {};
+    if (state->fp == 0 ||
+        bpf_probe_read_user(frame, sizeof(frame), (void *)state->fp) != 0)
+        return APP_DWARF_STATUS_MEMORY_FAULT;
+    state->sp = state->fp + sizeof(frame);
+    state->fp = frame[0];
+    state->pc = frame[1];
+    state->lr_valid = 0;
+    state->return_address = 1;
+    return 0;
+}
+
+static __always_inline int app_dwarf_unwind_one(
+    struct app_dwarf_unwind_state_t *state) {
+    u64 lookup_address = state->pc;
+    if (state->return_address && lookup_address != 0)
+        lookup_address--;
+    u64 normalized = 0;
+    struct app_dwarf_unwind_info_t *info =
+        app_dwarf_find_unwind_info(state, lookup_address, &normalized);
+    if (info == NULL)
+        return APP_DWARF_STATUS_RULE_MISSING;
+
+    if ((info->flags & APP_DWARF_UNWIND_FLAG_COMMAND) != 0) {
+        switch (info->param) {
+        case APP_DWARF_UNWIND_COMMAND_STOP:
+            return 1;
+        case APP_DWARF_UNWIND_COMMAND_FRAME_POINTER:
+            return app_dwarf_unwind_frame_pointer(state);
+        case APP_DWARF_UNWIND_COMMAND_INVALID:
+        case APP_DWARF_UNWIND_COMMAND_SIGNAL:
+        default:
+            return APP_DWARF_STATUS_INVALID_RULE;
+        }
+    }
+    if ((info->flags & APP_DWARF_UNWIND_FLAG_LEAF_ONLY) != 0 &&
+        !state->lr_valid)
+        return APP_DWARF_STATUS_INVALID_RULE;
+    if (info->base_reg != APP_DWARF_UNWIND_REG_SP &&
+        info->base_reg != APP_DWARF_UNWIND_REG_FP)
+        return APP_DWARF_STATUS_INVALID_RULE;
+
+    u64 cfa = app_dwarf_register_value(state, info->base_reg) + info->param;
+    if (cfa == 0)
+        return APP_DWARF_STATUS_INVALID_RULE;
+
+    u64 return_address = 0;
+    if (info->aux_base_reg == APP_DWARF_UNWIND_REG_LR) {
+        if (!state->lr_valid)
+            return APP_DWARF_STATUS_INVALID_RULE;
+        return_address = state->lr + info->aux_param;
+    } else if (info->aux_base_reg == APP_DWARF_UNWIND_REG_CFA) {
+        u64 address = cfa + info->aux_param;
+        if ((info->flags & APP_DWARF_UNWIND_FLAG_FRAME) != 0) {
+            u64 frame[2] = {};
+            if (bpf_probe_read_user(frame, sizeof(frame),
+                                    (void *)(address - sizeof(u64))) != 0)
+                return APP_DWARF_STATUS_MEMORY_FAULT;
+            state->fp = frame[0];
+            return_address = frame[1];
+        } else if (bpf_probe_read_user(&return_address,
+                                       sizeof(return_address),
+                                       (void *)address) != 0) {
+            return APP_DWARF_STATUS_MEMORY_FAULT;
+        }
+    } else {
+        return APP_DWARF_STATUS_INVALID_RULE;
+    }
+
+    /*
+     * Normalize a signed return address before exposing it in the event. The
+     * same page-table membership check also prevents blindly stripping bits
+     * on 48-bit Linux processes. If the caller has no CFI page (for example
+     * JIT code), retain the raw address and terminate safely on the next step.
+     */
+    u64 normalized_return = 0;
+    u64 return_lookup = return_address;
+    if (return_lookup != 0)
+        return_lookup--;
+    if (app_dwarf_find_page(state->pid, return_lookup,
+                            &normalized_return) != NULL)
+        state->pc = normalized_return + (return_address != 0);
+    else
+        state->pc = return_address;
+    state->sp = cfa;
+    state->lr_valid = 0;
+    state->return_address = 1;
+    return 0;
+}
+
+static __always_inline int app_collect_dwarf_stack(
+    struct pt_regs *ctx, struct app_data_event_t *event) {
+#if defined(bpf_target_arm64)
+    struct app_dwarf_unwind_state_t state = {
+        .pc = (u64)PT_REGS_IP(ctx),
+        .sp = (u64)PT_REGS_SP(ctx),
+        .fp = (u64)PT_REGS_FP(ctx),
+        .lr = (u64)PT_REGS_RET(ctx),
+        .pid = event->pid,
+        .lr_valid = 1,
+    };
+    int status = 0;
+#pragma unroll
+    for (u32 depth = 0; depth < APP_DATA_MAX_STACK_DEPTH; depth++) {
+        if (state.pc == 0)
+            break;
+        event->user_stack[depth] =
+            state.pc & 0x00ffffffffffffffULL;
+        event->user_stack_depth = depth + 1;
+        if (depth + 1 == APP_DATA_MAX_STACK_DEPTH)
+            break;
+        status = app_dwarf_unwind_one(&state);
+        if (status != 0)
+            break;
+    }
+    if (status < 0)
+        return status;
+    return event->user_stack_depth * sizeof(u64);
+#else
+    return APP_DWARF_STATUS_UNSUPPORTED;
+#endif
+}
 
 static __always_inline u64 app_hook_argument(struct pt_regs *ctx, u32 index) {
     /*
@@ -552,8 +932,12 @@ static __always_inline int app_hook_emit(struct pt_regs *ctx, u32 slot,
     event->user_stack_depth = 0;
     __builtin_memset(event->user_stack, 0, sizeof(event->user_stack));
     if ((config->flags & APP_DATA_FLAG_USER_STACK) != 0) {
-        s32 stack_bytes = bpf_get_stack(
-            ctx, event->user_stack, sizeof(event->user_stack), BPF_F_USER_STACK);
+        s32 stack_bytes;
+        if ((config->flags & APP_DATA_FLAG_DWARF_STACK) != 0)
+            stack_bytes = app_collect_dwarf_stack(ctx, event);
+        else
+            stack_bytes = bpf_get_stack(
+                ctx, event->user_stack, sizeof(event->user_stack), BPF_F_USER_STACK);
         event->user_stack_status = stack_bytes;
         if (stack_bytes > 0)
             event->user_stack_depth = (u32)stack_bytes / sizeof(u64);
@@ -833,8 +1217,12 @@ static __always_inline int app_hook_emit_iovec(struct pt_regs *ctx, u32 slot,
     event->user_stack_depth = 0;
     __builtin_memset(event->user_stack, 0, sizeof(event->user_stack));
     if ((config->flags & APP_DATA_FLAG_USER_STACK) != 0) {
-        s32 stack_bytes = bpf_get_stack(
-            ctx, event->user_stack, sizeof(event->user_stack), BPF_F_USER_STACK);
+        s32 stack_bytes;
+        if ((config->flags & APP_DATA_FLAG_DWARF_STACK) != 0)
+            stack_bytes = app_collect_dwarf_stack(ctx, event);
+        else
+            stack_bytes = bpf_get_stack(
+                ctx, event->user_stack, sizeof(event->user_stack), BPF_F_USER_STACK);
         event->user_stack_status = stack_bytes;
         if (stack_bytes > 0)
             event->user_stack_depth = (u32)stack_bytes / sizeof(u64);
