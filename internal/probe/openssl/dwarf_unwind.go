@@ -177,7 +177,10 @@ func (r *appDwarfRuleSet) addSegment(start, end uint64, info appDwarfUnwindInfo)
 	}
 	for cursor := start; cursor < end; {
 		pageBase := cursor &^ uint64(appDwarfPageSize-1)
-		pageEnd := pageBase + appDwarfPageSize
+		pageEnd, overflow := addUint64(pageBase, appDwarfPageSize)
+		if overflow {
+			pageEnd = math.MaxUint64
+		}
 		segmentEnd := end
 		if segmentEnd > pageEnd {
 			segmentEnd = pageEnd
@@ -196,6 +199,23 @@ func (r *appDwarfRuleSet) addSegment(start, end uint64, info appDwarfUnwindInfo)
 }
 
 func (r *appDwarfRuleSet) addIntervals(loadBias uint64, intervals *appDwarfIntervalData) error {
+	if err := r.validateIntervals(loadBias, intervals); err != nil {
+		return err
+	}
+	return walkAppDwarfIntervals(
+		loadBias,
+		intervals,
+		func(start, end uint64, info appDwarfUnwindInfo) error {
+			return r.addSegment(start, end, info)
+		},
+	)
+}
+
+func walkAppDwarfIntervals(
+	loadBias uint64,
+	intervals *appDwarfIntervalData,
+	visit func(uint64, uint64, appDwarfUnwindInfo) error,
+) error {
 	for _, block := range intervals.Blocks {
 		for index, delta := range block.Deltas {
 			deltaStart, overflow := addUint64(block.Start, uint64(delta.Offset))
@@ -220,10 +240,37 @@ func (r *appDwarfRuleSet) addIntervals(loadBias uint64, intervals *appDwarfInter
 			if overflow {
 				return fmt.Errorf("DWARF interval end overflows uint64")
 			}
-			if err := r.addSegment(start, end, delta.Info); err != nil {
+			if err := visit(start, end, delta.Info); err != nil {
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+func (r *appDwarfRuleSet) validateIntervals(
+	loadBias uint64,
+	intervals *appDwarfIntervalData,
+) error {
+	newInfos := make(map[appDwarfUnwindInfo]struct{})
+	err := walkAppDwarfIntervals(
+		loadBias,
+		intervals,
+		func(start, end uint64, info appDwarfUnwindInfo) error {
+			if start >= end {
+				return nil
+			}
+			if _, found := r.infoIndex[info]; !found {
+				newInfos[info] = struct{}{}
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return err
+	}
+	if len(r.infos)+len(newInfos) > appDwarfMaxUnwindInfos {
+		return fmt.Errorf("DWARF unwind info count exceeds %d", appDwarfMaxUnwindInfos)
 	}
 	return nil
 }
@@ -356,11 +403,25 @@ func appDwarfELFLoadBias(mapping processModuleMapping, elfFile *elf.File) (uint6
 		}
 		alignedOffset := program.Off &^ (alignment - 1)
 		alignedVaddr := program.Vaddr &^ (alignment - 1)
-		segmentEnd := (program.Off + program.Filesz + alignment - 1) &^ (alignment - 1)
+		fileEnd, overflow := addUint64(program.Off, program.Filesz)
+		if overflow {
+			return 0, fmt.Errorf("ELF executable segment file range overflows uint64")
+		}
+		fileEnd, overflow = addUint64(fileEnd, alignment-1)
+		if overflow {
+			return 0, fmt.Errorf("ELF executable segment alignment overflows uint64")
+		}
+		segmentEnd := fileEnd &^ (alignment - 1)
 		if mapping.fileOffset < alignedOffset || mapping.fileOffset >= segmentEnd {
 			continue
 		}
-		mappedVaddr := alignedVaddr + mapping.fileOffset - alignedOffset
+		mappedVaddr, overflow := addUint64(
+			alignedVaddr,
+			mapping.fileOffset-alignedOffset,
+		)
+		if overflow {
+			return 0, fmt.Errorf("ELF mapped virtual address overflows uint64")
+		}
 		if mapping.start < mappedVaddr {
 			return 0, fmt.Errorf("mapping start %#x precedes ELF virtual address %#x",
 				mapping.start, mappedVaddr)
@@ -628,8 +689,14 @@ func (p *Probe) prepareDwarfUnwind() error {
 	stats.SourceDeltas = sourceDeltas
 	measureAppDwarfDeltaDistribution(pages, deltas, deltaCount, &stats)
 	if stats.Modules == 0 || len(keys) == 0 {
-		return fmt.Errorf("no usable arm64 DWARF CFI found in %d executable mappings: %w",
-			len(appDwarfExecutableMappings(mappings)), errors.Join(skipped...))
+		message := fmt.Sprintf(
+			"no usable arm64 DWARF CFI found in %d executable mappings",
+			len(appDwarfExecutableMappings(mappings)),
+		)
+		if cause := errors.Join(skipped...); cause != nil {
+			return fmt.Errorf("%s: %w", message, cause)
+		}
+		return errors.New(message)
 	}
 	p.dwarfUnwind = &appDwarfPreparedUnwind{
 		pid:        pid,
@@ -652,18 +719,7 @@ func (p *Probe) configureDwarfUnwind() error {
 	if prepared == nil {
 		return fmt.Errorf("DWARF unwind rules were not prepared before map creation")
 	}
-	defer func() {
-		// The page builders and packed upload tables are startup-only. Clear the
-		// final references and return their pages to the OS so a large target
-		// doesn't leave eCapture with a permanently inflated resident set.
-		p.dwarfUnwind = nil
-		prepared.keys = nil
-		prepared.pages = nil
-		prepared.deltas = nil
-		prepared.infos = nil
-		prepared.skipped = nil
-		debug.FreeOSMemory()
-	}()
+	defer p.releaseDwarfUnwind()
 
 	pagesMap, found, err := p.bpfManager.GetMap("app_dwarf_unwind_pages")
 	if err != nil {
@@ -725,4 +781,21 @@ func (p *Probe) configureDwarfUnwind() error {
 		Str("parser", "go-delve/delve/pkg/dwarf/frame").
 		Msg("Loaded arm64 DWARF CFI for eBPF user-stack unwinding")
 	return nil
+}
+
+func (p *Probe) releaseDwarfUnwind() {
+	prepared := p.dwarfUnwind
+	if prepared == nil {
+		return
+	}
+	// These packed upload tables are startup-only. Drop every reference and
+	// return their pages to the OS so both successful and failed starts release
+	// the potentially large target-specific rule set.
+	p.dwarfUnwind = nil
+	prepared.keys = nil
+	prepared.pages = nil
+	prepared.deltas = nil
+	prepared.infos = nil
+	prepared.skipped = nil
+	debug.FreeOSMemory()
 }

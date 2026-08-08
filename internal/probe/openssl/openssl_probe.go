@@ -143,6 +143,7 @@ func (p *Probe) Start(ctx context.Context) error {
 	if err := p.prepareDwarfUnwind(); err != nil {
 		return errors.NewConfigurationError("prepare DWARF user-stack unwinding", err)
 	}
+	defer p.releaseDwarfUnwind()
 
 	// Initialize eBPF manager
 	if err := p.bpfManager.InitWithOptions(bytes.NewReader(byteBuf), p.getManagerOptions()); err != nil {

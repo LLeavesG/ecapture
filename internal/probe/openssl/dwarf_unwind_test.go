@@ -19,6 +19,7 @@ import (
 	"debug/elf"
 	"encoding/binary"
 	"io"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -133,6 +134,67 @@ func TestAppDwarfRulePagesPreserveGapsAndPageBoundaries(t *testing.T) {
 	}
 	if got[1].UnwindInfo != 0 || got[3].UnwindInfo != 0 {
 		t.Fatalf("gap/terminal markers = %#v", got)
+	}
+}
+
+func TestAppDwarfRuleValidationDoesNotPartiallyMutateRules(t *testing.T) {
+	info := appDwarfUnwindInfo{
+		BaseReg:    appDwarfUnwindRegSP,
+		AuxBaseReg: appDwarfUnwindRegLR,
+		Param:      16,
+	}
+	intervals := &appDwarfIntervalData{Blocks: []appDwarfBasicBlock{
+		{
+			Start:  0x100,
+			End:    0x110,
+			Deltas: []appDwarfStackDeltaInfo{{Offset: 0, Info: info}},
+		},
+		{
+			Start:  math.MaxUint64,
+			End:    math.MaxUint64,
+			Deltas: []appDwarfStackDeltaInfo{{Offset: 1, Info: info}},
+		},
+	}}
+	rules := newAppDwarfRuleSet(42)
+	if err := rules.addIntervals(0, intervals); err == nil {
+		t.Fatal("overflowing interval was accepted")
+	}
+	if len(rules.pages) != 0 || len(rules.infos) != 1 || rules.segments != 0 {
+		t.Fatalf("failed module partially mutated rules: %#v", rules)
+	}
+}
+
+func TestAppDwarfRuleHandlesFinalAddressPage(t *testing.T) {
+	info := appDwarfUnwindInfo{
+		BaseReg:    appDwarfUnwindRegSP,
+		AuxBaseReg: appDwarfUnwindRegLR,
+		Param:      16,
+	}
+	rules := newAppDwarfRuleSet(42)
+	if err := rules.addSegment(math.MaxUint64-8, math.MaxUint64, info); err != nil {
+		t.Fatal(err)
+	}
+	if len(rules.pages) != 1 || rules.segments != 1 {
+		t.Fatalf("final address page was not recorded: %#v", rules)
+	}
+}
+
+func TestAppDwarfELFLoadBiasRejectsOverflowingSegment(t *testing.T) {
+	file := &elf.File{Progs: []*elf.Prog{{
+		ProgHeader: elf.ProgHeader{
+			Type:   elf.PT_LOAD,
+			Flags:  elf.PF_X,
+			Off:    math.MaxUint64 - 8,
+			Filesz: 16,
+			Align:  4096,
+		},
+	}}}
+	_, err := appDwarfELFLoadBias(processModuleMapping{
+		start:      0x1000,
+		fileOffset: math.MaxUint64 - 4,
+	}, file)
+	if err == nil {
+		t.Fatal("overflowing ELF segment was accepted")
 	}
 }
 
