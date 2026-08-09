@@ -88,11 +88,14 @@ func (e *PacketEvent) DecodeFromBytes(data []byte) error {
 	if err = binary.Read(buf, binary.LittleEndian, &e.CGroupID); err != nil {
 		return err
 	}
-	tmpData := make([]byte, e.PacketLen)
-	if err = binary.Read(buf, binary.LittleEndian, &tmpData); err != nil {
-		return err
+	// PacketLen is the original skb length, while the kernel caps the bytes
+	// appended to a perf sample. Ignore record-alignment padding and preserve
+	// the captured prefix instead of rejecting every truncated GSO packet.
+	capturedLength := len(buf.Bytes())
+	if uint64(capturedLength) > uint64(e.PacketLen) {
+		capturedLength = int(e.PacketLen)
 	}
-	e.PacketData = tmpData
+	e.PacketData = append([]byte(nil), buf.Bytes()[:capturedLength]...)
 	return nil
 }
 
@@ -100,6 +103,12 @@ func (e *PacketEvent) DecodeFromBytes(data []byte) error {
 func (e *PacketEvent) Validate() error {
 	if e.PacketLen == 0 {
 		return errors.New(errors.ErrCodeEventValidation, "packet length is zero")
+	}
+	if len(e.PacketData) == 0 {
+		return errors.New(errors.ErrCodeEventValidation, "captured packet data is empty")
+	}
+	if uint64(len(e.PacketData)) > uint64(e.PacketLen) {
+		return errors.New(errors.ErrCodeEventValidation, "captured packet data exceeds original packet length")
 	}
 	return nil
 }
