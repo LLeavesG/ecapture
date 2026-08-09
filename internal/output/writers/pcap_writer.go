@@ -46,6 +46,8 @@ type PcapWriter struct {
 	interfaceIDs     map[uint32]pcapInterfaceIDs
 	interfaceNames   map[uint32]string
 	interfaceMu      sync.RWMutex
+	lifecycleMu      sync.RWMutex
+	closeOnce        sync.Once
 	defaultInterface pcapInterfaceIDs
 	snaplen          uint32
 	filter           string
@@ -60,7 +62,8 @@ type PcapWriter struct {
 	packetCount     int
 	firstDSBWritten bool // true after the first DSB has been written to the file
 	expectKeylog    atomic.Bool
-	isClosed        bool
+	closed          bool
+	closeErr        error
 	logger          *lger.Logger
 }
 
@@ -174,7 +177,6 @@ func NewPcapWriterInterfaces(
 		ctx:              ctx,
 		ctxCancel:        cancel,
 		tcPackets:        []*TcPacket{},
-		isClosed:         false,
 		logger:           logger,
 	}
 	// Preserve the historical DSB-first behavior until the owning probe says
@@ -207,6 +209,12 @@ func (pw *PcapWriter) WritePacketForInterface(
 	rawIP bool,
 	originalLength uint32,
 ) error {
+	pw.lifecycleMu.RLock()
+	defer pw.lifecycleMu.RUnlock()
+	if pw.closed {
+		return fmt.Errorf("pcap writer is closed")
+	}
+
 	if originalLength < uint32(len(data)) {
 		originalLength = uint32(len(data))
 	}
@@ -245,6 +253,11 @@ func (pw *PcapWriter) RegisterInterface(name string, systemIndex uint32) error {
 	}
 	if systemIndex == 0 {
 		return fmt.Errorf("pcap interface %q has invalid system index 0", name)
+	}
+	pw.lifecycleMu.RLock()
+	defer pw.lifecycleMu.RUnlock()
+	if pw.closed {
+		return fmt.Errorf("pcap writer is closed")
 	}
 
 	pw.interfaceMu.RLock()
@@ -476,6 +489,12 @@ func (pw *PcapWriter) writePacket(pc *TcPacket) error {
 // The actual write is serialized through the Serve goroutine to avoid concurrent
 // access to the underlying NgWriter (which is not thread-safe).
 func (pw *PcapWriter) WriteKeyLog(keylogLine []byte) error {
+	pw.lifecycleMu.RLock()
+	defer pw.lifecycleMu.RUnlock()
+	if pw.closed {
+		return fmt.Errorf("pcap writer is closed")
+	}
+
 	// Make a copy to avoid the caller modifying the data after sending
 	data := make([]byte, len(keylogLine))
 	copy(data, keylogLine)
@@ -493,6 +512,12 @@ func (pw *PcapWriter) WriteKeyLog(keylogLine []byte) error {
 // and flushing happens automatically (on timer ticks, DSB writes, and shutdown).
 // Direct flush is only performed after Serve has exited to avoid concurrent access.
 func (pw *PcapWriter) Flush() error {
+	pw.lifecycleMu.RLock()
+	defer pw.lifecycleMu.RUnlock()
+	if pw.closed {
+		return nil
+	}
+
 	select {
 	case <-pw.serveDone:
 		// Serve has exited — safe to flush directly
@@ -506,40 +531,35 @@ func (pw *PcapWriter) Flush() error {
 // Close closes the PCAPNG writer and flushes any buffered data.
 // This should be called when the program exits to ensure all data is written.
 func (pw *PcapWriter) Close() error {
-	if pw.isClosed {
-		return nil
-	}
-	defer func() {
-		pw.isClosed = true
-	}()
+	pw.closeOnce.Do(func() {
+		// Exclude producers before cancellation so Serve can drain a stable set
+		// of queued writes. Channels stay open: closing producer-owned channels
+		// here would make late API calls panic instead of returning an error.
+		pw.lifecycleMu.Lock()
+		defer pw.lifecycleMu.Unlock()
+		pw.closed = true
+		pw.ctxCancel()
 
-	// Stop the Serve goroutine by canceling its context.
-	// The Serve goroutine will flush remaining packets before exiting.
-	pw.ctxCancel()
+		// Wait for the Serve goroutine to finish all pending writes.
+		// This ensures no concurrent access to the NgWriter after this point.
+		<-pw.serveDone
 
-	// Wait for the Serve goroutine to finish all pending writes.
-	// This ensures no concurrent access to the NgWriter after this point.
-	<-pw.serveDone
+		if err := pw.writer.Flush(); err != nil {
+			pw.closeErr = err
+			return
+		}
 
-	// Close channels so they don't leak (Serve has already exited).
-	close(pw.packetChan)
-	close(pw.keylogChan)
+		// Close the writer if it implements io.Closer.
+		if closer, ok := any(pw.writer).(io.Closer); ok {
+			pw.closeErr = closer.Close()
+			return
+		}
 
-	// Final flush to ensure all data is written to the underlying writer
-	if err := pw.Flush(); err != nil {
-		return err
-	}
-
-	// Close the writer if it implements io.Closer
-	if closer, ok := any(pw.writer).(io.Closer); ok {
-		return closer.Close()
-	}
-
-	if pw.packetCount == 0 {
-		return errors.Wrap(errors.ErrCodeEventNotReady, "nothing captured, please check your network interface, see \"ecapture tls -h\" for more information.", nil)
-	}
-
-	return nil
+		if pw.packetCount == 0 {
+			pw.closeErr = errors.Wrap(errors.ErrCodeEventNotReady, "nothing captured, please check your network interface, see \"ecapture tls -h\" for more information.", nil)
+		}
+	})
+	return pw.closeErr
 }
 
 func (pw *PcapWriter) Name() string {

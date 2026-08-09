@@ -158,3 +158,55 @@ func TestPcapWriterPreservesTruncatedPacketOriginalLength(t *testing.T) {
 		t.Fatalf("original length = %d, want %d", got, want)
 	}
 }
+
+func TestPcapWriterRejectsWritesAfterClose(t *testing.T) {
+	var output bytes.Buffer
+	writer, err := NewPcapWriterInterfaces(
+		&output, 65535, []string{"unit-test-interface"}, "",
+		logger.New(io.Discard, false),
+	)
+	if err != nil {
+		t.Fatalf("NewPcapWriterInterfaces() error = %v", err)
+	}
+	if err := writer.Close(); err == nil {
+		t.Fatal("Close() error = nil, want empty capture error")
+	}
+	if err := writer.WritePacket([]byte{1}, time.Now()); err == nil {
+		t.Fatal("WritePacket() error = nil after Close()")
+	}
+	if err := writer.WriteKeyLog([]byte("CLIENT_RANDOM value")); err == nil {
+		t.Fatal("WriteKeyLog() error = nil after Close()")
+	}
+	if err := writer.RegisterInterface("runtime-tun", 42); err == nil {
+		t.Fatal("RegisterInterface() error = nil after Close()")
+	}
+}
+
+func TestPcapWriterCloseIsConcurrentSafe(t *testing.T) {
+	var output bytes.Buffer
+	writer, err := NewPcapWriterInterfaces(
+		&output, 65535, []string{"unit-test-interface"}, "",
+		logger.New(io.Discard, false),
+	)
+	if err != nil {
+		t.Fatalf("NewPcapWriterInterfaces() error = %v", err)
+	}
+
+	const callers = 8
+	errors := make(chan error, callers)
+	for range callers {
+		go func() {
+			errors <- writer.Close()
+		}()
+	}
+	var first error
+	for range callers {
+		err := <-errors
+		if first == nil {
+			first = err
+		}
+		if (err == nil) != (first == nil) || (err != nil && err.Error() != first.Error()) {
+			t.Fatalf("concurrent Close() errors differ: first=%v, got=%v", first, err)
+		}
+	}
+}
