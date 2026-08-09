@@ -136,12 +136,14 @@ func applyOpenSSLProfileWithCLIOverrides(command *cobra.Command) error {
 	overrideString("model", &opensslConfig.CaptureMode, cli.CaptureMode)
 	overrideString("keylogfile", &opensslConfig.KeylogFile, cli.KeylogFile)
 	overrideString("pcapfile", &opensslConfig.PcapFile, cli.PcapFile)
-	overrideString("ifname", &opensslConfig.Ifname, cli.Ifname)
 	overrideString("unknown-flows", &opensslConfig.UnknownFlowPolicy, cli.UnknownFlowPolicy)
 	overrideString("ssl_version", &opensslConfig.SslVersion, cli.SslVersion)
-	if command.Flags().Changed("interfaces") {
-		opensslConfig.Ifnames = cliInterfaces
-	}
+	applyOpenSSLInterfaceOverrides(
+		command,
+		opensslConfig,
+		cli.Ifname,
+		cliInterfaces,
+	)
 	if command.Flags().Changed("strategy") {
 		opensslConfig.CaptureStrategies = cliStrategies
 	}
@@ -155,4 +157,30 @@ func applyOpenSSLProfileWithCLIOverrides(command *cobra.Command) error {
 		opensslConfig.PerfReorderLagMs = cli.PerfReorderLagMs
 	}
 	return nil
+}
+
+func applyOpenSSLInterfaceOverrides(
+	command *cobra.Command,
+	target *opensslProbe.Config,
+	cliIfname string,
+	cliIfnames []string,
+) {
+	ifnameChanged := command.Flags().Changed("ifname")
+	ifnamesChanged := command.Flags().Changed("interfaces")
+	if !ifnameChanged && !ifnamesChanged {
+		return
+	}
+
+	// The profile stores both the complete interface list and its first entry
+	// for compatibility with the historical --ifname field. Once either CLI
+	// form is explicit, clear both profile values before applying CLI values so
+	// normalizeInterfaces cannot merge a stale profile interface back in.
+	target.Ifname = ""
+	target.Ifnames = nil
+	if ifnamesChanged {
+		target.Ifnames = append([]string(nil), cliIfnames...)
+	}
+	if ifnameChanged {
+		target.Ifname = cliIfname
+	}
 }
