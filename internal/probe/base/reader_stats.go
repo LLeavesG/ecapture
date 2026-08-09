@@ -15,6 +15,7 @@
 package base
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -101,23 +102,41 @@ func (p *BaseProbe) startReaderStatsReporter() {
 	if p == nil {
 		return
 	}
-	p.readerLoopsW.Add(1)
+	p.statsMu.Lock()
+	defer p.statsMu.Unlock()
+	if p.statsCancel != nil {
+		return
+	}
+	reporterCtx, cancel := context.WithCancel(p.ctx)
+	p.statsCancel = cancel
+	p.statsW.Add(1)
 	go func() {
-		defer p.readerLoopsW.Done()
+		defer p.statsW.Done()
 		ticker := time.NewTicker(readerStatsEmitInterval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-p.ctx.Done():
+			case <-reporterCtx.Done():
 				return
 			case <-ticker.C:
-				if !p.isRunning.Load() {
-					return
-				}
 				p.dispatchReaderStats(false)
 			}
 		}
 	}()
+}
+
+func (p *BaseProbe) stopReaderStatsReporter() {
+	if p == nil {
+		return
+	}
+	p.statsMu.Lock()
+	defer p.statsMu.Unlock()
+	if p.statsCancel == nil {
+		return
+	}
+	p.statsCancel()
+	p.statsW.Wait()
+	p.statsCancel = nil
 }
 
 func (p *BaseProbe) dispatchReaderStats(final bool) {

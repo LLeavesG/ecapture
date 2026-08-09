@@ -181,6 +181,56 @@ func TestBaseProbeStopAndClose(t *testing.T) {
 	}
 }
 
+func TestBaseProbeCloseStopsStatsReporterPromptly(t *testing.T) {
+	probe := NewBaseProbe("test-probe")
+	cfg := config.NewBaseConfig()
+	ctx := context.Background()
+
+	if err := probe.Initialize(ctx, cfg); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := probe.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	started := time.Now()
+	if err := probe.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+		t.Fatalf("Close() waited for the statistics ticker: %s", elapsed)
+	}
+}
+
+func TestBaseProbeStatsReporterRestartsAfterStop(t *testing.T) {
+	probe := NewBaseProbe("test-probe")
+	cfg := config.NewBaseConfig()
+	ctx := context.Background()
+
+	if err := probe.Initialize(ctx, cfg); err != nil {
+		t.Fatalf("Initialize() error = %v", err)
+	}
+	if err := probe.Start(ctx); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := probe.Stop(ctx); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if probe.statsCancel != nil {
+		t.Fatal("Stop() left the statistics reporter running")
+	}
+
+	if err := probe.Start(ctx); err != nil {
+		t.Fatalf("second Start() error = %v", err)
+	}
+	if probe.statsCancel == nil {
+		t.Fatal("second Start() did not restart the statistics reporter")
+	}
+	if err := probe.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+}
+
 // mockCloser implements the closer interface for testing
 type mockCloser struct {
 	closed bool

@@ -57,6 +57,9 @@ type BaseProbe struct {
 	readers      []io.Closer
 	closers      []closer
 	readerLoopsW sync.WaitGroup // perf/ringbuf read goroutines; see GoReaderLoop
+	statsMu      sync.Mutex
+	statsCancel  context.CancelFunc
+	statsW       sync.WaitGroup
 }
 
 // closer interface for resources that need to be closed.
@@ -188,6 +191,7 @@ func (p *BaseProbe) Stop(ctx context.Context) error {
 	}
 
 	p.isRunning.Store(false)
+	p.stopReaderStatsReporter()
 	p.logger.Info().Msg("Probe stopped")
 	return nil
 }
@@ -207,6 +211,7 @@ func (p *BaseProbe) GetBPFName(baseName string) string {
 // Close releases all resources.
 func (p *BaseProbe) Close() error {
 	p.isRunning.Store(false)
+	p.stopReaderStatsReporter()
 
 	// Close all readers in reverse order
 	for i := len(p.readers) - 1; i >= 0; i-- {
