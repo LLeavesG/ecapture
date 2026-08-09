@@ -221,6 +221,15 @@ int main(void) {
             sizeof(private_vectors) / sizeof(private_vectors[0])) != 3)
         return 11;
 
+    struct private_stream_context fin_only_context = {
+        .connection_id = 0x1122334455667788ULL,
+        .stream_id = 0x24681357,
+        .stream_byte_offset = 0,
+        .fin = 1,
+    };
+    if (ecapture_test_private_vector(&fin_only_context, NULL, 0) != 0)
+        return 12;
+
     close(pipe_fds[0]);
     close(pipe_fds[1]);
     close(message_fds[0]);

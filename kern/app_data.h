@@ -209,6 +209,7 @@ struct app_iovec_state_t {
     u32 stream_flags;
     u32 hook_id;
     u32 direction;
+    u32 fin_only;
 };
 
 struct app_data_event_t {
@@ -1127,13 +1128,13 @@ static __noinline void app_hook_emit_iovec_vector(struct pt_regs *ctx,
 static __noinline int
 app_hook_measure_iovec_state(struct app_iovec_state_t *state) {
     if (state == NULL)
-        return 0;
+        return -1;
 
     if (state->vector_stride == 0 || state->vector_stride > 256 ||
         state->vector_base_offset + sizeof(u64) > state->vector_stride ||
         state->vector_length_offset + state->vector_length_size >
             state->vector_stride)
-        return 0;
+        return -1;
 
     APP_IOVEC_MEASURE(state, 0);
     APP_IOVEC_MEASURE(state, 1);
@@ -1184,11 +1185,12 @@ static __noinline int
 app_hook_emit_iovec_state(struct pt_regs *ctx,
                           struct app_iovec_state_t *state,
                           struct app_data_event_t *event) {
-    if (state == NULL || event == NULL || state->captured_len == 0)
+    if (state == NULL || event == NULL ||
+        (state->captured_len == 0 && state->fin_only == 0))
         return 0;
 
     event->timestamp_ns = state->timestamp_ns;
-    event->buffer_addr = state->iovec_address;
+    event->buffer_addr = state->fin_only != 0 ? 0 : state->iovec_address;
     event->context_id = state->context_id;
     event->stream_id = state->stream_id;
     event->stream_byte_offset = state->stream_byte_offset;
@@ -1199,6 +1201,14 @@ app_hook_emit_iovec_state(struct pt_regs *ctx,
     event->original_len = state->original_len;
     event->captured_len = state->captured_len;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
+    if (state->fin_only != 0) {
+        event->chunk_offset = 0;
+        event->data_len = 0;
+        bpf_perf_event_output(ctx, &app_data_events, BPF_F_CURRENT_CPU, event,
+                              APP_DATA_EVENT_HEADER_SIZE);
+        return 0;
+    }
+
     APP_IOVEC_EMIT_VECTOR(ctx, event, state, 0);
     APP_IOVEC_EMIT_VECTOR(ctx, event, state, 1);
     APP_IOVEC_EMIT_VECTOR(ctx, event, state, 2);
@@ -1225,8 +1235,12 @@ static __always_inline int app_hook_emit_iovec(struct pt_regs *ctx, u32 slot,
                                                u64 context_id, u64 stream_id,
                                                u64 stream_byte_offset,
                                                u32 stream_flags) {
-    if (iovec_address == 0 || vector_count == 0 ||
-        (uses_return_len && return_len == 0))
+    const bool has_fin =
+        (stream_flags & APP_DATA_STREAM_FIN_VALID) != 0 &&
+        (stream_flags & APP_DATA_STREAM_FIN) != 0;
+    const bool no_data = iovec_address == 0 || vector_count == 0 ||
+                         (uses_return_len && return_len == 0);
+    if (no_data && !has_fin)
         return 0;
 
     u32 zero = 0;
@@ -1256,8 +1270,14 @@ static __always_inline int app_hook_emit_iovec(struct pt_regs *ctx, u32 slot,
     state->stream_flags = stream_flags;
     state->hook_id = slot;
     state->direction = config->direction;
-    if (app_hook_measure_iovec_state(state) == 0)
-        return 0;
+    state->fin_only = no_data ? 1 : 0;
+    if (state->fin_only == 0) {
+        int measurement = app_hook_measure_iovec_state(state);
+        if (measurement < 0 || (measurement == 0 && !has_fin))
+            return 0;
+        if (measurement == 0)
+            state->fin_only = 1;
+    }
 
     state->timestamp_ns = bpf_ktime_get_ns();
     event->pid = bpf_get_current_pid_tgid() >> 32;
@@ -1326,7 +1346,10 @@ static __always_inline int app_hook_entry(struct pt_regs *ctx, u32 slot) {
                                       vector_count, 0, false,
                                       context_id, stream_id,
                                       stream_byte_offset, stream_flags);
-        if (iovec_address == 0 || vector_count == 0)
+        const bool has_fin =
+            (stream_flags & APP_DATA_STREAM_FIN_VALID) != 0 &&
+            (stream_flags & APP_DATA_STREAM_FIN) != 0;
+        if ((iovec_address == 0 || vector_count == 0) && !has_fin)
             return 0;
         struct app_hook_key_t key = {
             .pid_tgid = bpf_get_current_pid_tgid(),
@@ -1428,7 +1451,10 @@ static __always_inline int app_hook_return(struct pt_regs *ctx, u32 slot) {
                     ? app_hook_read_signed_length(active->result_length_address,
                                                   config->length_size)
                     : app_hook_signed_return(ctx, config);
-            if (result > 0)
+            const bool has_fin =
+                (active->stream_flags & APP_DATA_STREAM_FIN_VALID) != 0 &&
+                (active->stream_flags & APP_DATA_STREAM_FIN) != 0;
+            if (result > 0 || (result == 0 && has_fin))
                 app_hook_emit_iovec(ctx, slot, config, active->buffer,
                                     active->length, (u64)result, true,
                                     active->context_id, active->stream_id,
