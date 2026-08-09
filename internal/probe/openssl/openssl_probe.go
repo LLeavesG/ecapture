@@ -110,10 +110,22 @@ func (p *Probe) Initialize(ctx context.Context, cfg domain.Configuration) error 
 }
 
 // Start begins the OpenSSL probe operation.
-func (p *Probe) Start(ctx context.Context) error {
+func (p *Probe) Start(ctx context.Context) (startErr error) {
 	if err := p.BaseProbe.Start(ctx); err != nil {
 		return err
 	}
+	defer func() {
+		if startErr == nil {
+			return
+		}
+		// BaseProbe.Start starts the statistics reporter before probe-specific
+		// setup. Roll back branch-owned background work if any later setup step
+		// fails; callers embedding the probe must not need process exit for
+		// startup failure cleanup.
+		p.stopInterfaceWatcher()
+		p.stopRelatedProcessUIDWatcher()
+		_ = p.BaseProbe.Stop(ctx)
+	}()
 
 	var sslVersion string
 	sslVersion = p.config.SslVersion
