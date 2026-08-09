@@ -103,7 +103,7 @@ func (f *jniConversionCallerFilter) activate(pid uint32) (jniConversionFilterSta
 		if err := f.allowed.Update(&current, &one, ebpf.UpdateAny); err != nil {
 			return jniConversionFilterState{}, fmt.Errorf(
 				"allow JNI conversion caller pid=%d role=%d addr=0x%x: %w",
-				key.PID,
+				current.PID,
 				key.Role,
 				key.CallerAddr,
 				err,
