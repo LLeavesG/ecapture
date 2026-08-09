@@ -18,7 +18,9 @@ import (
 	"bytes"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gojue/ecapture/internal/domain"
 	"github.com/gojue/ecapture/internal/output/encoders"
@@ -349,5 +351,69 @@ func TestTextHandler_Close_ClosableWriter(t *testing.T) {
 	}
 	if !writer.closed {
 		t.Error("Writer should be closed")
+	}
+}
+
+type blockingWriter struct {
+	calls        atomic.Int32
+	active       atomic.Int32
+	overlapped   atomic.Bool
+	firstEntered chan struct{}
+	releaseFirst chan struct{}
+}
+
+func newBlockingWriter() *blockingWriter {
+	return &blockingWriter{
+		firstEntered: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+	}
+}
+
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	call := w.calls.Add(1)
+	active := w.active.Add(1)
+	if active > 1 {
+		w.overlapped.Store(true)
+	}
+	if call == 1 {
+		close(w.firstEntered)
+		<-w.releaseFirst
+	}
+	w.active.Add(-1)
+	return len(p), nil
+}
+
+func (w *blockingWriter) Close() error { return nil }
+func (w *blockingWriter) Name() string { return "blocking-writer" }
+func (w *blockingWriter) Flush() error { return nil }
+
+func TestTextHandlerSerializesConcurrentWrites(t *testing.T) {
+	writer := newBlockingWriter()
+	handler := NewTextHandler(writer, false)
+	event := &mockTLSDataEvent{data: []byte("event")}
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- handler.Handle(event) }()
+	<-writer.firstEntered
+
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- handler.Handle(event) }()
+	select {
+	case err := <-secondDone:
+		close(writer.releaseFirst)
+		<-firstDone
+		t.Fatalf("second write was not serialized: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(writer.releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first Handle() error = %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second Handle() error = %v", err)
+	}
+	if writer.overlapped.Load() {
+		t.Fatal("writer observed concurrent Handle calls")
 	}
 }

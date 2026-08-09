@@ -15,6 +15,8 @@
 package handlers
 
 import (
+	"sync"
+
 	"github.com/gojue/ecapture/internal/domain"
 	"github.com/gojue/ecapture/internal/errors"
 	"github.com/gojue/ecapture/internal/output/encoders"
@@ -27,6 +29,7 @@ type TextHandler struct {
 	writer          writers.OutputWriter
 	encoder         encoders.Encoder
 	suppressPackets bool
+	mu              sync.Mutex
 }
 
 func (h *TextHandler) Writer() writers.OutputWriter {
@@ -66,6 +69,8 @@ func NewEncodedTextHandler(
 // collector was requested; otherwise remote logs can become traffic that is
 // captured and logged again in a self-amplifying loop.
 func (h *TextHandler) SuppressPacketEvents() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.suppressPackets = true
 }
 
@@ -75,6 +80,8 @@ func (h *TextHandler) Handle(event domain.Event) error {
 	if event == nil {
 		return errors.New(errors.ErrCodeEventValidation, "event cannot be nil")
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.suppressPackets {
 		if _, packet := event.(PacketEvent); packet {
 			return nil
@@ -107,6 +114,8 @@ func (h *TextHandler) Handle(event domain.Event) error {
 
 // Close closes the handler and releases resources.
 func (h *TextHandler) Close() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.writer == nil {
 		return nil
 	}
