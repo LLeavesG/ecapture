@@ -710,50 +710,16 @@ func openStreamCommandIO(
 }
 
 func runStreamWireCorrelation(command *cobra.Command, _ []string) error {
-	var input io.Reader = command.InOrStdin()
-	var inputFile *os.File
-	if streamWireInput != "" && streamWireInput != "-" {
-		if streamWireOutput != "" {
-			inputPath, inputErr := filepath.Abs(streamWireInput)
-			outputPath, outputErr := filepath.Abs(streamWireOutput)
-			if inputErr != nil {
-				return fmt.Errorf("resolve wire correlation input: %w", inputErr)
-			}
-			if outputErr != nil {
-				return fmt.Errorf("resolve wire correlation output: %w", outputErr)
-			}
-			if filepath.Clean(inputPath) == filepath.Clean(outputPath) {
-				return fmt.Errorf("--input and --output must name different files")
-			}
-		}
-		var err error
-		inputFile, err = os.Open(streamWireInput)
-		if err != nil {
-			return fmt.Errorf("open wire correlation input: %w", err)
-		}
-		defer inputFile.Close()
-		input = inputFile
+	input, output, closeFiles, err := openStreamCommandIO(
+		command,
+		streamWireInput,
+		streamWireOutput,
+		"wire correlation",
+	)
+	if err != nil {
+		return err
 	}
-
-	var output io.Writer = command.OutOrStdout()
-	var outputFile *os.File
-	if streamWireOutput != "" {
-		var err error
-		outputFile, err = os.OpenFile(
-			streamWireOutput,
-			os.O_CREATE|os.O_TRUNC|os.O_WRONLY,
-			0o600,
-		)
-		if err != nil {
-			return fmt.Errorf("open wire correlation output: %w", err)
-		}
-		if err := outputFile.Chmod(0o600); err != nil {
-			_ = outputFile.Close()
-			return fmt.Errorf("protect wire correlation output: %w", err)
-		}
-		defer outputFile.Close()
-		output = outputFile
-	}
+	defer closeFiles()
 
 	summary, err := reconstruction.CorrelateWire(input, output)
 	if err != nil {
