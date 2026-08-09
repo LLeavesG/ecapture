@@ -43,4 +43,3 @@ The line-oriented output contained zero `Packet captured` records and was only
 3,811 bytes. This prevents remote logging traffic from becoming new captured
 traffic and forming a self-amplifying observation loop. An explicit event
 collector still opts into structured packet events for offline correlation.
-
