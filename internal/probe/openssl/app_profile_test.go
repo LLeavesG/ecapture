@@ -17,6 +17,8 @@ package openssl
 import (
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -92,6 +94,76 @@ func TestApplicationProfileValidation(t *testing.T) {
 	}
 	if len(profile.Capture.Interfaces) != 1 || profile.Capture.Interfaces[0] != "WLAN0" {
 		t.Fatalf("normalized interfaces = %v", profile.Capture.Interfaces)
+	}
+}
+
+func TestApplicationProfileNormalizesNetworkOwnerPackages(t *testing.T) {
+	profile := &ApplicationProfile{
+		Version: ApplicationProfileVersion,
+		Name:    "multi-owner-wire",
+		Match: ApplicationMatch{
+			Package: "com.google.android.apps.bard",
+			NetworkOwnerPackages: []string{
+				" com.google.android.googlequicksearchbox ",
+				"com.google.android.apps.bard",
+				"com.google.android.googlequicksearchbox",
+			},
+		},
+		Capture: ApplicationCapture{
+			Mode:       "pcap",
+			Strategies: []string{StrategyRawPackets},
+		},
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	want := []string{"com.google.android.googlequicksearchbox"}
+	if !reflect.DeepEqual(profile.Match.NetworkOwnerPackages, want) {
+		t.Fatalf("network owner packages = %#v, want %#v", profile.Match.NetworkOwnerPackages, want)
+	}
+}
+
+func TestLoadApplicationProfileAcceptsNetworkOwnerPackages(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "profile.json")
+	data := []byte(`{
+		"version": 1,
+		"name": "generated-wire",
+		"match": {
+			"package": "com.google.android.apps.bard",
+			"network_owner_packages": ["com.google.android.googlequicksearchbox"]
+		},
+		"capture": {"mode": "pcap", "strategies": ["raw_packets"]},
+		"tls": {}
+	}`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	profile, err := LoadApplicationProfile(path)
+	if err != nil {
+		t.Fatalf("LoadApplicationProfile() error = %v", err)
+	}
+	want := []string{"com.google.android.googlequicksearchbox"}
+	if !reflect.DeepEqual(profile.Match.NetworkOwnerPackages, want) {
+		t.Fatalf("network owner packages = %#v, want %#v", profile.Match.NetworkOwnerPackages, want)
+	}
+}
+
+func TestApplicationProfileRejectsInvalidNetworkOwnerPackage(t *testing.T) {
+	profile := &ApplicationProfile{
+		Version: ApplicationProfileVersion,
+		Name:    "invalid-related-package",
+		Match: ApplicationMatch{
+			Package:              "com.example.app",
+			NetworkOwnerPackages: []string{"not a package"},
+		},
+		Capture: ApplicationCapture{
+			Mode:       "pcap",
+			Strategies: []string{StrategyRawPackets},
+		},
+	}
+	if err := profile.Validate(); err == nil ||
+		!strings.Contains(err.Error(), "network owner package is invalid") {
+		t.Fatalf("Validate() error = %v", err)
 	}
 }
 

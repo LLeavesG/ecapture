@@ -864,6 +864,32 @@ func TestApplicationDataEventMarshalJSONIsCompact(t *testing.T) {
 	}
 }
 
+func TestApplicationDataEventMarshalJSONPreservesZeroStreamIdentity(t *testing.T) {
+	event := &ApplicationDataEvent{
+		Timestamp:    1,
+		StreamFlags:  AppDataStreamFlagOffsetValid | AppDataStreamFlagFinValid,
+		Pid:          42,
+		HookID:       1,
+		Direction:    DataTypeWrite,
+		HookName:     "quic-send",
+		CaptureLayer: CaptureLayerTransport,
+		Transport:    CaptureTransportQUIC,
+	}
+	data, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	for _, field := range [][]byte{
+		[]byte(`"contextId":0`),
+		[]byte(`"streamId":0`),
+		[]byte(`"streamOffset":0`),
+	} {
+		if !bytes.Contains(data, field) {
+			t.Fatalf("zero-identity JSON %s is missing %s", data, field)
+		}
+	}
+}
+
 func TestApplicationDataEventAllowsQUICFinOnlyMetadata(t *testing.T) {
 	event := &ApplicationDataEvent{
 		Timestamp:    101,

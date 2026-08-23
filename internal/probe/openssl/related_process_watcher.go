@@ -17,6 +17,7 @@ package openssl
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -44,9 +45,22 @@ func (p *Probe) configureRelatedProcessUIDs(parent context.Context) error {
 	}
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
+	initial := p.configuredRelatedUIDs()
+	committed := make(map[uint32]struct{}, len(initial))
+	for uid := range initial {
+		value := uint8(1)
+		if err := uidMap.Update(&uid, &value, ebpf.UpdateAny); err != nil {
+			cancel()
+			for committedUID := range committed {
+				_ = uidMap.Delete(&committedUID)
+			}
+			return fmt.Errorf("allow related Android UID %d: %w", uid, err)
+		}
+		committed[uid] = struct{}{}
+	}
 	p.relatedUIDWatcherCancel = cancel
 	p.relatedUIDWatcherDone = done
-	go p.watchRelatedProcessUIDs(ctx, done, uidMap)
+	go p.watchRelatedProcessUIDs(ctx, done, uidMap, committed)
 	return nil
 }
 
@@ -66,18 +80,11 @@ func (p *Probe) watchRelatedProcessUIDs(
 	ctx context.Context,
 	done chan struct{},
 	uidMap *ebpf.Map,
+	active map[uint32]struct{},
 ) {
 	defer close(done)
-	active := make(map[uint32]struct{})
 	reconcile := func() bool {
-		primary := uint32(p.config.GetUid())
-		desired := make(map[uint32]struct{})
-		for _, uid := range discoverRelatedProcessUIDs(p.config.PackageName) {
-			if uid == 0 || uid == primary {
-				continue
-			}
-			desired[uid] = struct{}{}
-		}
+		desired := p.desiredRelatedUIDs()
 		changed := !sameUIDSet(active, desired)
 		committed := make(map[uint32]struct{}, len(desired))
 		for uid := range desired {
@@ -93,7 +100,7 @@ func (p *Probe) watchRelatedProcessUIDs(
 			}
 			committed[uid] = struct{}{}
 			p.Logger().Info().Uint32("uid", uid).
-				Str("package", p.config.PackageName).
+				Str("packages", strings.Join(p.capturePackageNames(), ",")).
 				Msg("Included related Android process UID")
 		}
 		for uid := range active {
@@ -131,6 +138,39 @@ func (p *Probe) watchRelatedProcessUIDs(
 			timer.Reset(relatedUIDWatchInterval(now, fastUntil))
 		}
 	}
+}
+
+func (p *Probe) capturePackageNames() []string {
+	packages := make([]string, 0, 1+len(p.config.RelatedPackages))
+	if value := strings.TrimSpace(p.config.PackageName); value != "" {
+		packages = append(packages, value)
+	}
+	packages = append(packages, p.config.RelatedPackages...)
+	return packages
+}
+
+func (p *Probe) desiredRelatedUIDs() map[uint32]struct{} {
+	desired := p.configuredRelatedUIDs()
+	primary := uint32(p.config.GetUid())
+	for _, packageName := range p.capturePackageNames() {
+		for _, uid := range discoverRelatedProcessUIDs(packageName) {
+			if uid != 0 && uid != primary {
+				desired[uid] = struct{}{}
+			}
+		}
+	}
+	return desired
+}
+
+func (p *Probe) configuredRelatedUIDs() map[uint32]struct{} {
+	primary := uint32(p.config.GetUid())
+	desired := make(map[uint32]struct{}, len(p.config.RelatedPackageUIDs))
+	for _, uid := range p.config.RelatedPackageUIDs {
+		if uid != 0 && uid != primary {
+			desired[uid] = struct{}{}
+		}
+	}
+	return desired
 }
 
 func relatedUIDWatchInterval(now, fastUntil time.Time) time.Duration {

@@ -51,6 +51,10 @@ func (c *Config) ApplyApplicationProfile(profile *ApplicationProfile) error {
 
 	c.ProfileName = profile.Name
 	c.PackageName = profile.Match.Package
+	c.RelatedPackages = append(
+		[]string(nil),
+		profile.Match.NetworkOwnerPackages...,
+	)
 	if profile.Match.UID != 0 {
 		c.Uid = profile.Match.UID
 	}
@@ -182,6 +186,28 @@ func (c *Config) prepareApplicationProfile() error {
 			return err
 		}
 		c.Uid = uid
+	}
+	c.RelatedPackageUIDs = c.RelatedPackageUIDs[:0]
+	for _, packageName := range c.RelatedPackages {
+		uid, err := resolvePackageUID(packageName)
+		if err != nil {
+			return fmt.Errorf(
+				"resolve related Android package %q: %w",
+				packageName,
+				err,
+			)
+		}
+		if uid == 0 || uid > uint64(^uint32(0)) {
+			return fmt.Errorf(
+				"related Android package %q has invalid UID %d",
+				packageName,
+				uid,
+			)
+		}
+		c.RelatedPackageUIDs = append(
+			c.RelatedPackageUIDs,
+			uint32(uid),
+		)
 	}
 	if c.applicationProfile != nil && c.PackageName != "" &&
 		(c.applicationProfile.Match.VersionName != "" || c.applicationProfile.Match.VersionCode != 0) {

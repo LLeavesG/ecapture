@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,6 +28,8 @@ import (
 
 const (
 	ApplicationProfileVersion = 1
+	MaxNetworkOwnerPackages   = 16
+	MaxApplicationPackageName = 255
 
 	StrategyRawPackets   = "raw_packets"
 	StrategyTLSPlaintext = "tls_plaintext"
@@ -106,6 +109,10 @@ const (
 	JNIConversionReleaseStringCritical         = "release_string_critical"
 	JNIConversionGetDirectBufferAddress        = "get_direct_buffer_address"
 	JNIConversionGetDirectBufferCapacity       = "get_direct_buffer_capacity"
+)
+
+var androidPackageNamePattern = regexp.MustCompile(
+	`^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$`,
 )
 
 var (
@@ -206,13 +213,14 @@ type ApplicationProfile struct {
 }
 
 type ApplicationMatch struct {
-	Package        string `json:"package,omitempty"`
-	UID            uint64 `json:"uid,omitempty"`
-	PID            uint64 `json:"pid,omitempty"`
-	AndroidRelease string `json:"android_release,omitempty"`
-	ABI            string `json:"abi,omitempty"`
-	VersionName    string `json:"version_name,omitempty"`
-	VersionCode    uint64 `json:"version_code,omitempty"`
+	Package              string   `json:"package,omitempty"`
+	NetworkOwnerPackages []string `json:"network_owner_packages,omitempty"`
+	UID                  uint64   `json:"uid,omitempty"`
+	PID                  uint64   `json:"pid,omitempty"`
+	AndroidRelease       string   `json:"android_release,omitempty"`
+	ABI                  string   `json:"abi,omitempty"`
+	VersionName          string   `json:"version_name,omitempty"`
+	VersionCode          uint64   `json:"version_code,omitempty"`
 }
 
 type ApplicationCapture struct {
@@ -391,8 +399,33 @@ func (p *ApplicationProfile) Validate() error {
 	if p.Name == "" {
 		return fmt.Errorf("profile name is required")
 	}
+	p.Match.Package = strings.TrimSpace(p.Match.Package)
 	if p.Match.Package == "" && p.Match.UID == 0 && p.Match.PID == 0 {
 		return fmt.Errorf("profile match requires package, uid, or pid")
+	}
+	if p.Match.Package != "" &&
+		(len(p.Match.Package) > MaxApplicationPackageName ||
+			!androidPackageNamePattern.MatchString(p.Match.Package)) {
+		return fmt.Errorf("profile match package is invalid: %q", p.Match.Package)
+	}
+	p.Match.NetworkOwnerPackages = normalizeRelatedPackages(
+		p.Match.NetworkOwnerPackages,
+		p.Match.Package,
+	)
+	if len(p.Match.NetworkOwnerPackages) > MaxNetworkOwnerPackages {
+		return fmt.Errorf(
+			"profile match network_owner_packages exceeds %d entries",
+			MaxNetworkOwnerPackages,
+		)
+	}
+	for _, packageName := range p.Match.NetworkOwnerPackages {
+		if len(packageName) > MaxApplicationPackageName ||
+			!androidPackageNamePattern.MatchString(packageName) {
+			return fmt.Errorf(
+				"profile match network owner package is invalid: %q",
+				packageName,
+			)
+		}
 	}
 	if err := validateProfileStrategies(p.Capture.Strategies); err != nil {
 		return err
@@ -1219,6 +1252,28 @@ func normalizeStrings(values []string) []string {
 		normalized = append(normalized, value)
 	}
 	return normalized
+}
+
+func normalizeRelatedPackages(values []string, primary string) []string {
+	primary = strings.TrimSpace(primary)
+	seen := make(map[string]struct{}, len(values)+1)
+	if primary != "" {
+		seen[primary] = struct{}{}
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, found := seen[value]; found {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func normalizePaths(values []string) []string {

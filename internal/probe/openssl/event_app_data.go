@@ -107,8 +107,8 @@ func (e ApplicationDataEvent) MarshalJSON() ([]byte, error) {
 		Timestamp       uint64                      `json:"timestamp"`
 		WallTime        string                      `json:"wallTime,omitempty"`
 		BufferAddr      uint64                      `json:"bufferAddr"`
-		ContextID       uint64                      `json:"contextId,omitempty"`
-		StreamID        uint64                      `json:"streamId,omitempty"`
+		ContextID       uint64                      `json:"contextId"`
+		StreamID        uint64                      `json:"streamId"`
 		StreamOffset    *uint64                     `json:"streamOffset,omitempty"`
 		Fin             *bool                       `json:"fin,omitempty"`
 		Pid             uint32                      `json:"pid"`

@@ -85,3 +85,33 @@ func TestSameUIDSetIgnoresOrderAndDetectsChanges(t *testing.T) {
 		t.Fatal("changed UID sets were reported as equal")
 	}
 }
+
+func TestDesiredRelatedUIDsIncludesExplicitOwnerPackages(t *testing.T) {
+	cfg := NewConfig()
+	cfg.PackageName = "com.google.android.apps.bard"
+	cfg.RelatedPackages = []string{"com.google.android.googlequicksearchbox"}
+	cfg.RelatedPackageUIDs = []uint32{10137, 10138}
+	cfg.SetUid(10138)
+	p := &Probe{config: cfg}
+	got := p.desiredRelatedUIDs()
+	if _, found := got[10137]; !found {
+		t.Fatalf("explicit owner UID missing: %#v", got)
+	}
+	if _, found := got[10138]; found {
+		t.Fatalf("primary UID included as related: %#v", got)
+	}
+}
+
+func TestConfiguredRelatedUIDsExcludesPrimaryAndZero(t *testing.T) {
+	cfg := NewConfig()
+	cfg.RelatedPackageUIDs = []uint32{0, 10137, 10138}
+	cfg.SetUid(10138)
+	p := &Probe{config: cfg}
+	got := p.configuredRelatedUIDs()
+	if len(got) != 1 {
+		t.Fatalf("configured related UIDs = %#v", got)
+	}
+	if _, found := got[10137]; !found {
+		t.Fatalf("configured owner UID missing: %#v", got)
+	}
+}

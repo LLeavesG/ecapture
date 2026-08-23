@@ -47,6 +47,8 @@ type Config struct {
 	ProfilePath          string                 `json:"profile_path,omitempty"`
 	ProfileName          string                 `json:"profile_name,omitempty"`
 	PackageName          string                 `json:"package_name,omitempty"`
+	RelatedPackages      []string               `json:"related_packages,omitempty"`
+	RelatedPackageUIDs   []uint32               `json:"related_package_uids,omitempty"`
 	OpensslPathPattern   string                 `json:"openssl_path_glob,omitempty"`
 	OpensslExtraPaths    []string               `json:"openssl_extra_paths,omitempty"`
 	OpensslExtraPatterns []string               `json:"openssl_extra_path_globs,omitempty"`
