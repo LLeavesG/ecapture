@@ -60,6 +60,9 @@ type BaseProbe struct {
 	statsMu      sync.Mutex
 	statsCancel  context.CancelFunc
 	statsW       sync.WaitGroup
+	rawEvents    *rawEventArchive
+	rawFailed    atomic.Bool
+	decoders     []domain.IncompleteEventReporter
 }
 
 // closer interface for resources that need to be closed.
@@ -167,6 +170,17 @@ func (p *BaseProbe) Initialize(ctx context.Context, cfg domain.Configuration) er
 
 	// Create dispatcher
 	p.dispatcher = dispatcher
+	if rawPath := strings.TrimSpace(cfg.GetRawEventFile()); rawPath != "" {
+		archive, archiveErr := newRawEventArchive(rawPath)
+		if archiveErr != nil {
+			_ = dispatcher.Close()
+			return archiveErr
+		}
+		p.rawEvents = archive
+		p.closers = append(p.closers, archive)
+		p.Logger().Info().Str("raw_event_file", rawPath).
+			Msg("Raw perf/ringbuf event archive enabled")
+	}
 
 	return nil
 }
@@ -230,6 +244,7 @@ func (p *BaseProbe) Close() error {
 	// Reader Close() unblocks rd.Read(); read loops may still run deferred work
 	// (e.g. userland perf reorder flush) that calls Dispatch. Wait before closing dispatcher.
 	p.readerLoopsW.Wait()
+	p.collectIncompleteDecoderEvents()
 	p.dispatchReaderStats(true)
 
 	for _, cler := range p.closers {
@@ -311,6 +326,9 @@ func (p *BaseProbe) StartPerfEventReader(em *ebpf.Map, decoder domain.EventDecod
 	if decoder == nil {
 		return errors.New(errors.ErrCodeConfiguration, "event decoder cannot be nil")
 	}
+	if reporter, ok := decoder.(domain.IncompleteEventReporter); ok {
+		p.decoders = append(p.decoders, reporter)
+	}
 
 	mapSize := p.config.GetPerCpuMapSize()
 	rd, err := perf.NewReader(em, mapSize)
@@ -345,6 +363,16 @@ func (p *BaseProbe) StartPerfEventReader(em *ebpf.Map, decoder domain.EventDecod
 	}
 	p.GoReaderLoop(func() { p.perfEventLoop(rd, em, decoder) })
 	return nil
+}
+
+func (p *BaseProbe) collectIncompleteDecoderEvents() {
+	var total uint64
+	for _, decoder := range p.decoders {
+		if decoder != nil {
+			total += decoder.IncompleteEvents()
+		}
+	}
+	p.readerStats.incompleteEvents.Store(total)
 }
 
 func (p *BaseProbe) decoderSupportsPerfReorder(em *ebpf.Map, decoder domain.EventDecoder) bool {
@@ -401,6 +429,7 @@ func (p *BaseProbe) perfEventLoop(rd *perf.Reader, em *ebpf.Map, decoder domain.
 		}
 
 		if record.LostSamples != 0 {
+			p.archiveReaderRecord(rawEventSourcePerf, em, record.LostSamples, nil)
 			p.readerStats.lostSamples.Add(record.LostSamples)
 			p.logger.Warn().
 				Uint64("lost_samples", record.LostSamples).
@@ -408,6 +437,7 @@ func (p *BaseProbe) perfEventLoop(rd *perf.Reader, em *ebpf.Map, decoder domain.
 			continue
 		}
 		p.noteReaderRecord(false, len(record.RawSample))
+		p.archiveReaderRecord(rawEventSourcePerf, em, 0, record.RawSample)
 		event, err := decoder.Decode(em, record.RawSample)
 		if err != nil {
 			if stderrors.Is(err, errors.ErrEventNotReady) {
@@ -469,6 +499,7 @@ func (p *BaseProbe) perfEventLoopOrdered(rd *perf.Reader, em *ebpf.Map, decoder 
 		}
 
 		if record.LostSamples != 0 {
+			p.archiveReaderRecord(rawEventSourcePerf, em, record.LostSamples, nil)
 			p.readerStats.lostSamples.Add(record.LostSamples)
 			p.logger.Warn().
 				Uint64("lost_samples", record.LostSamples).
@@ -476,6 +507,7 @@ func (p *BaseProbe) perfEventLoopOrdered(rd *perf.Reader, em *ebpf.Map, decoder 
 			continue
 		}
 		p.noteReaderRecord(false, len(record.RawSample))
+		p.archiveReaderRecord(rawEventSourcePerf, em, 0, record.RawSample)
 		event, err := decoder.Decode(em, record.RawSample)
 		if err != nil {
 			if stderrors.Is(err, errors.ErrEventNotReady) {
@@ -554,6 +586,7 @@ func (p *BaseProbe) ringbufEventLoop(rd *ringbuf.Reader, em *ebpf.Map, decoder d
 		}
 
 		p.noteReaderRecord(true, len(record.RawSample))
+		p.archiveReaderRecord(rawEventSourceRingbuf, em, 0, record.RawSample)
 		event, err := decoder.Decode(em, record.RawSample)
 		if err != nil {
 			p.readerStats.decodeErrors.Add(1)
@@ -565,6 +598,26 @@ func (p *BaseProbe) ringbufEventLoop(rd *ringbuf.Reader, em *ebpf.Map, decoder d
 			p.readerStats.dispatchErrors.Add(1)
 			p.logger.Warn().Err(err).Msg("Failed to dispatch event")
 		}
+	}
+}
+
+func (p *BaseProbe) archiveReaderRecord(
+	source uint8,
+	em *ebpf.Map,
+	lostSamples uint64,
+	raw []byte,
+) {
+	if p == nil || p.rawEvents == nil || p.rawFailed.Load() {
+		return
+	}
+	mapName := ""
+	if em != nil {
+		mapName = em.String()
+	}
+	if err := p.rawEvents.write(source, mapName, lostSamples, raw); err != nil &&
+		p.rawFailed.CompareAndSwap(false, true) {
+		p.readerStats.rawArchiveErrors.Add(1)
+		p.logger.Warn().Err(err).Msg("Raw event archive disabled after write failure")
 	}
 }
 

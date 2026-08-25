@@ -70,6 +70,45 @@ func TestReconstructHTTP3StaticQPACKTransaction(t *testing.T) {
 	}
 }
 
+func TestReconstructHTTP3AllowsGREASEBeforeResponseHeaders(t *testing.T) {
+	requestHeaders := encodeQPACKHeaders(t,
+		qpack.HeaderField{Name: ":method", Value: "POST"},
+		qpack.HeaderField{Name: ":scheme", Value: "https"},
+		qpack.HeaderField{Name: ":authority", Value: "api.example.test"},
+		qpack.HeaderField{Name: ":path", Value: "/chat"},
+	)
+	responseHeaders := encodeQPACKHeaders(t,
+		qpack.HeaderField{Name: ":status", Value: "200"},
+	)
+	request := appendHTTP3Frame(nil, 1, requestHeaders)
+	response := appendHTTP3Frame(nil, 0x1f*0x12345678+0x21,
+		[]byte("GREASE is the word"))
+	response = appendHTTP3Frame(response, 1, responseHeaders)
+	response = appendHTTP3Frame(response, 0, []byte("answer"))
+	input := strings.Join([]string{
+		quicBoundaryEvent(10, "WRITE", 0, nil, boolPointer(true), request),
+		quicBoundaryEvent(11, "READ", 0, uint64Pointer(0), boolPointer(true), response),
+	}, "\n")
+
+	var output bytes.Buffer
+	summary, err := ReconstructHTTP3(strings.NewReader(input), &output)
+	if err != nil {
+		t.Fatalf("ReconstructHTTP3() error = %v", err)
+	}
+	if summary.Transactions != 1 || summary.CompleteTransactions != 1 ||
+		summary.HeaderBlocksDecoded != 2 || summary.HeaderDecodeErrors != 0 {
+		t.Fatalf("unexpected summary: %#v output=%s", summary, output.String())
+	}
+	var transaction HTTP3Transaction
+	if err := json.Unmarshal(output.Bytes(), &transaction); err != nil {
+		t.Fatalf("decode transaction: %v output=%s", err, output.String())
+	}
+	if !transaction.Complete || transaction.Status != "200" ||
+		!bytes.Equal(transaction.Response.Body, []byte("answer")) {
+		t.Fatalf("unexpected transaction: %#v", transaction)
+	}
+}
+
 func TestReconstructHTTP3DynamicQPACKTransaction(t *testing.T) {
 	settingsPayload := append(
 		encodeQUICVarintForTest(1),
@@ -136,6 +175,7 @@ func TestReconstructHTTP3DynamicQPACKTransaction(t *testing.T) {
 		transaction.Status != "200" ||
 		transaction.Request.QPACKMode != "dynamic-table" ||
 		!transaction.Complete ||
+		transaction.State != transactionStateComplete ||
 		!bytes.Equal(transaction.Request.Body, requestBody) ||
 		!bytes.Equal(transaction.Response.Body, responseBody) {
 		t.Fatalf("unexpected transaction: %#v", transaction)
@@ -170,6 +210,7 @@ func TestReconstructHTTP3RetainsDynamicBlockWithoutSettings(t *testing.T) {
 		t.Fatalf("decode transaction: %v output=%s", err, output.String())
 	}
 	if transaction.Request.QPACKMode != "exact-block-unresolved" ||
+		transaction.State != transactionStateError ||
 		len(transaction.Request.HeaderBlocks) != 1 ||
 		!bytes.Equal(transaction.Request.HeaderBlocks[0], requestHeaders) ||
 		len(transaction.Request.Errors) == 0 {

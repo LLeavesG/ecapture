@@ -50,6 +50,30 @@ func TestReconstructQUICStreamsExplicitOffsetsAndFinOnly(t *testing.T) {
 	}
 }
 
+func TestReconstructQUICStreamsDeduplicatesRedundantHookCoverage(t *testing.T) {
+	payload := []byte("redundant-boundary")
+	input := strings.Join([]string{
+		quicBoundaryEventForHook(
+			10, "quic-router", 1, "READ", 7,
+			uint64Pointer(0), boolPointer(true), payload,
+		),
+		quicBoundaryEventForHook(
+			11, "quic-stream-fallback", 2, "READ", 7,
+			uint64Pointer(0), boolPointer(true), payload,
+		),
+	}, "\n")
+	var output bytes.Buffer
+	summary, err := ReconstructQUICStreams(strings.NewReader(input), &output)
+	if err != nil {
+		t.Fatalf("ReconstructQUICStreams() error = %v", err)
+	}
+	if summary.Streams != 1 || summary.CompleteStreams != 1 ||
+		summary.DuplicateBytes != uint64(len(payload)) ||
+		summary.ConflictingBytes != 0 || summary.MissingBytes != 0 {
+		t.Fatalf("unexpected redundant-hook summary: %#v", summary)
+	}
+}
+
 func TestReconstructQUICStreamsInfersOrderedWriteOffsets(t *testing.T) {
 	input := strings.Join([]string{
 		quicBoundaryEvent(10, "WRITE", 9, nil, boolPointer(false), []byte("hello")),
@@ -107,6 +131,21 @@ func quicBoundaryEvent(
 	fin *bool,
 	data []byte,
 ) string {
+	return quicBoundaryEventForHook(
+		timestamp, "quiche-boundary", 1, direction, streamID, offset, fin, data,
+	)
+}
+
+func quicBoundaryEventForHook(
+	timestamp uint64,
+	hookName string,
+	hookID int,
+	direction string,
+	streamID uint64,
+	offset *uint64,
+	fin *bool,
+	data []byte,
+) string {
 	event := map[string]any{
 		"eventType":    "boundary_data",
 		"captureLayer": "transport",
@@ -115,8 +154,8 @@ func quicBoundaryEvent(
 		"pid":          42,
 		"tid":          43,
 		"direction":    direction,
-		"hookId":       1,
-		"hookName":     "quiche-boundary",
+		"hookId":       hookID,
+		"hookName":     hookName,
 		"bufferAddr":   4096 + timestamp,
 		"contextId":    0x1234,
 		"streamId":     streamID,

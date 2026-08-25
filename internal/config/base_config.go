@@ -59,6 +59,7 @@ type BaseConfig struct {
 	TruncateSize       uint64    `json:"truncate_size"`
 	LoggerAddr         string    `json:"logger_addr"`
 	EventCollectorAddr string    `json:"event_collector_addr"`
+	RawEventFile       string    `json:"raw_event_file"`
 	EventFormat        string    `json:"event_format"`
 	EcaptureQ          string    `json:"ecapture_q"`
 	Listen             string    `json:"listen"`
@@ -85,6 +86,7 @@ func NewBaseConfig() *BaseConfig {
 		TruncateSize:       0,
 		LoggerAddr:         "",
 		EventCollectorAddr: "",
+		RawEventFile:       "",
 		EventFormat:        EventFormatPlain,
 		EcaptureQ:          "",
 		Listen:             "localhost:28256",
@@ -228,6 +230,16 @@ func (c *BaseConfig) GetEventCollectorAddr() string {
 // SetEventCollectorAddr sets the event collector address.
 func (c *BaseConfig) SetEventCollectorAddr(addr string) {
 	c.EventCollectorAddr = addr
+}
+
+// GetRawEventFile returns the optional pre-decode perf/ringbuf archive path.
+func (c *BaseConfig) GetRawEventFile() string {
+	return c.RawEventFile
+}
+
+// SetRawEventFile sets the optional pre-decode perf/ringbuf archive path.
+func (c *BaseConfig) SetRawEventFile(path string) {
+	c.RawEventFile = path
 }
 
 // GetEventFormat returns the event serialization format.

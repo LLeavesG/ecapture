@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/cilium/ebpf"
 	manager "github.com/gojue/ebpfmanager"
@@ -613,7 +614,17 @@ func (d *masterSecretEventDecoder) GetDecoder(_ *ebpf.Map) (domain.Event, bool) 
 }
 
 // packetEventDecoder implements domain.EventDecoder for packet events
-type packetEventDecoder struct{}
+type packetEventDecoder struct {
+	once      sync.Once
+	assembler *base.PacketAssembler
+}
+
+func (d *packetEventDecoder) packetAssembler() *base.PacketAssembler {
+	d.once.Do(func() {
+		d.assembler = base.NewPacketAssembler(base.DefaultPacketAssemblyLimit)
+	})
+	return d.assembler
+}
 
 func (d *packetEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, error) {
 	event := &PacketEvent{}
@@ -623,7 +634,19 @@ func (d *packetEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, err
 	if err := event.Validate(); err != nil {
 		return nil, err
 	}
+	packet, ready, err := d.packetAssembler().Add(event.packetFragment())
+	if err != nil {
+		return nil, err
+	}
+	if !ready {
+		return nil, errors.ErrEventNotReady
+	}
+	event.setAssembledPacket(packet)
 	return event, nil
+}
+
+func (d *packetEventDecoder) IncompleteEvents() uint64 {
+	return d.packetAssembler().IncompleteEvents()
 }
 
 func (d *packetEventDecoder) GetDecoder(_ *ebpf.Map) (domain.Event, bool) {

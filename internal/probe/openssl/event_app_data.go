@@ -60,9 +60,13 @@ type ApplicationDataEvent struct {
 	Comm            [TaskCommLen]byte            `json:"comm"`
 	UserStackStatus int32                        `json:"userStackStatus"`
 	UserStackDepth  uint32                       `json:"userStackDepth"`
+	Uid             uint32                       `json:"uid"`
+	Reserved        uint32                       `json:"-"`
+	CGroupID        uint64                       `json:"cgroupId"`
 	UserStack       [AppDataMaxStackDepth]uint64 `json:"userStack"`
 	UserStackMode   string                       `json:"userStackMode,omitempty"`
 	Data            [MaxDataSize]byte            `json:"data"`
+	ProcessName     string                       `json:"processName,omitempty"`
 	HookName        string                       `json:"hookName,omitempty"`
 	CaptureLayer    string                       `json:"captureLayer,omitempty"`
 	Transport       string                       `json:"transport,omitempty"`
@@ -113,6 +117,7 @@ func (e ApplicationDataEvent) MarshalJSON() ([]byte, error) {
 		Fin             *bool                       `json:"fin,omitempty"`
 		Pid             uint32                      `json:"pid"`
 		Tid             uint32                      `json:"tid"`
+		ProcessName     string                      `json:"processName,omitempty"`
 		HookID          uint32                      `json:"hookId"`
 		HookName        string                      `json:"hookName,omitempty"`
 		Direction       string                      `json:"direction"`
@@ -125,6 +130,8 @@ func (e ApplicationDataEvent) MarshalJSON() ([]byte, error) {
 		UserStackStatus int32                       `json:"userStackStatus,omitempty"`
 		UserStackDepth  uint32                      `json:"userStackDepth,omitempty"`
 		UserStackMode   string                      `json:"userStackMode,omitempty"`
+		Uid             uint32                      `json:"uid"`
+		CGroupID        uint64                      `json:"cgroupId,omitempty"`
 		StackFrames     []ApplicationDataStackFrame `json:"userStack,omitempty"`
 		DataEncoding    string                      `json:"dataEncoding"`
 		Data            []byte                      `json:"data"`
@@ -142,6 +149,7 @@ func (e ApplicationDataEvent) MarshalJSON() ([]byte, error) {
 		Fin:             fin,
 		Pid:             e.Pid,
 		Tid:             e.Tid,
+		ProcessName:     e.ProcessName,
 		HookID:          e.HookID,
 		HookName:        e.HookName,
 		Direction:       e.directionName(),
@@ -154,6 +162,8 @@ func (e ApplicationDataEvent) MarshalJSON() ([]byte, error) {
 		UserStackStatus: e.UserStackStatus,
 		UserStackDepth:  e.UserStackDepth,
 		UserStackMode:   e.UserStackMode,
+		Uid:             e.Uid,
+		CGroupID:        e.CGroupID,
 		StackFrames:     e.StackFrames,
 		DataEncoding:    "base64",
 		Data:            e.GetData(),
@@ -184,6 +194,9 @@ func (e *ApplicationDataEvent) DecodeFromBytes(data []byte) error {
 		{"Comm", &e.Comm},
 		{"UserStackStatus", &e.UserStackStatus},
 		{"UserStackDepth", &e.UserStackDepth},
+		{"Uid", &e.Uid},
+		{"Reserved", &e.Reserved},
+		{"CGroupID", &e.CGroupID},
 		{"UserStack", &e.UserStack},
 	}
 	for _, field := range fields {

@@ -193,7 +193,9 @@ var streamTransactionsCmd = &cobra.Command{
 the same structured capture, preserves each decoder's exact transaction JSON,
 and merges results in capture-time order. Input is securely spooled rather
 than loaded into memory, so stdin and large all-traffic captures are
-supported. Application-encrypted bodies remain exact base64 bytes.`,
+supported. Standard HTTP Content-Encoding is decoded into bodyText while the
+exact encoded body remains available as base64. Application-encrypted bodies
+remain opaque exact base64 bytes.`,
 	Example: `ecapture stream transactions \
   --input capture-events.jsonl \
   --output transactions.jsonl`,
@@ -220,13 +222,14 @@ sensitive headers and bodies; file output is forced to mode 0600.`,
 
 var streamWireCmd = &cobra.Command{
 	Use:         "correlate-wire",
-	Short:       "Correlate custom TLS BIOs with captured network traffic.",
+	Short:       "Correlate byte boundaries with captured network traffic.",
 	Annotations: map[string]string{skipEnvDetection: "true"},
 	Long: `Consumes structured packet and wire-boundary events and exactly matches
-TLS ciphertext observed at a custom BIO with reassembled TCP/UDP payloads.
-Packet matches are network-verified. Exact matches against generic fd hooks are
-reported separately as unverified candidates because an fd can be a file or
-pipe. No application plaintext or timestamp-only heuristic is used.`,
+TLS ciphertext at a custom BIO, or bytes at a known socket payload boundary,
+with reassembled TCP/UDP payloads. Packet matches are network-verified. Exact
+matches against generic fd hooks are reported separately as unverified
+candidates because an fd can be a file or pipe. No application plaintext or
+timestamp-only heuristic is used.`,
 	Example: `ecapture stream correlate-wire \
   --input capture-events.jsonl \
   --output wire-correlations.jsonl`,
@@ -591,9 +594,13 @@ func runStreamTransactions(command *cobra.Command, _ []string) error {
 	}
 	_, _ = fmt.Fprintf(
 		command.ErrOrStderr(),
-		"reconstructed %d HTTP transactions (%d complete): %d HTTP/1.x, %d HTTP/2, %d legacy gQUIC, %d HTTP/3 from %d input bytes\n",
+		"reconstructed %d HTTP transactions (%d complete, %d open, %d reset, %d orphan, %d error): %d HTTP/1.x, %d HTTP/2, %d legacy gQUIC, %d HTTP/3 from %d input bytes\n",
 		summary.Transactions,
 		summary.CompleteTransactions,
+		summary.OpenTransactions,
+		summary.ResetTransactions,
+		summary.OrphanTransactions,
+		summary.ErrorTransactions,
 		summary.HTTP1Transactions,
 		summary.HTTP2Transactions,
 		summary.GQUICTransactions,
@@ -727,9 +734,9 @@ func runStreamWireCorrelation(command *cobra.Command, _ []string) error {
 	}
 	_, _ = fmt.Fprintf(
 		command.ErrOrStderr(),
-		"correlated %d/%d TLS BIO streams by exact ciphertext content: %d network-verified across %d packet flows, %d unverified fd candidates across %d fd/socket streams (%d ambiguous, %d unmatched, minimum %d bytes)\n",
+		"correlated %d/%d TLS-BIO/socket source streams by exact content: %d network-verified across %d packet flows, %d unverified fd candidates across %d fd streams (%d ambiguous, %d unmatched, minimum %d bytes)\n",
 		summary.Matched,
-		summary.TLSBIOStreams,
+		summary.TLSBIOStreams+summary.SocketStreams,
 		summary.WireVerified,
 		summary.PacketFlows,
 		summary.FDCandidates,

@@ -18,39 +18,49 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	stderrors "errors"
 	"net"
 	"strings"
 	"testing"
 	"time"
+
+	ecaptureerrors "github.com/gojue/ecapture/internal/errors"
 )
 
-func TestPacketEventDecodeMetadata(t *testing.T) {
+func encodePacketFragment(
+	t *testing.T, packetLen, capturedLen, offset uint32,
+	payload []byte, chunkCount uint32,
+) []byte {
+	t.Helper()
 	var comm [TaskCommLen]byte
 	copy(comm[:], "com.larus.nova")
-	packet := []byte{0x45, 0, 0, 20}
 	values := []any{
-		uint64(1234),
-		uint32(777),
-		comm,
-		uint32(len(packet)),
-		uint32(9),
-		uint32(10290),
+		uint64(1234), uint32(777), comm, packetLen,
+		uint32(9), uint32(10290),
 		uint32(PacketFlagAttributed | PacketFlagRawIP),
-		uint32(PacketDirectionEgress),
-		uint64(0x11223344),
-		uint64(0x55667788),
+		uint32(PacketDirectionEgress), uint64(0x11223344),
+		uint64(0x55667788), capturedLen, offset,
+		uint32(len(payload)), chunkCount,
 	}
 	var encoded bytes.Buffer
 	for _, value := range values {
 		if err := binary.Write(&encoded, binary.LittleEndian, value); err != nil {
-			t.Fatal(err)
+			t.Fatalf("encode packet fragment: %v", err)
 		}
 	}
-	encoded.Write(packet)
-	encoded.Write(make([]byte, 7)) // perf record-alignment padding
+	encoded.Write(payload)
+	return encoded.Bytes()
+}
+
+func TestPacketEventDecodeMetadata(t *testing.T) {
+	packet := []byte{0x45, 0, 0, 20}
+	encoded := encodePacketFragment(
+		t, uint32(len(packet)), uint32(len(packet)), 0, packet, 1,
+	)
+	encoded = append(encoded, make([]byte, 7)...) // perf record-alignment padding
 
 	var event PacketEvent
-	if err := event.DecodeFromBytes(encoded.Bytes()); err != nil {
+	if err := event.DecodeFromBytes(encoded); err != nil {
 		t.Fatalf("DecodeFromBytes() error = %v", err)
 	}
 	if event.Pid != 777 || event.Uid != 10290 || event.InterfaceIndex != 9 {
@@ -71,43 +81,40 @@ func TestPacketEventRejectsLegacyShortHeader(t *testing.T) {
 	}
 }
 
-func TestPacketEventPreservesOriginalLengthWhenPerfPayloadIsCapped(t *testing.T) {
-	var comm [TaskCommLen]byte
-	copy(comm[:], "com.larus.nova")
-	packet := bytes.Repeat([]byte{0x5a}, 60*1024)
-	const originalLength = uint32(65549)
-	values := []any{
-		uint64(1234),
-		uint32(777),
-		comm,
-		originalLength,
-		uint32(9),
-		uint32(10290),
-		uint32(PacketFlagAttributed | PacketFlagRawIP),
-		uint32(PacketDirectionEgress),
-		uint64(0x11223344),
-		uint64(0x55667788),
+func TestPacketEventDecoderReassembles65549ByteGSO(t *testing.T) {
+	packet := make([]byte, 65549)
+	for index := range packet {
+		packet[index] = byte(index % 251)
 	}
-	var encoded bytes.Buffer
-	for _, value := range values {
-		if err := binary.Write(&encoded, binary.LittleEndian, value); err != nil {
-			t.Fatal(err)
-		}
+	decoder := &packetEventDecoder{}
+	first := encodePacketFragment(
+		t, uint32(len(packet)), uint32(len(packet)), 0,
+		packet[:60*1024], 2,
+	)
+	if event, err := decoder.Decode(nil, first); event != nil ||
+		!stderrors.Is(err, ecaptureerrors.ErrEventNotReady) {
+		t.Fatalf("first Decode() = (%T,%v), want not ready", event, err)
 	}
-	encoded.Write(packet)
-
-	var event PacketEvent
-	if err := event.DecodeFromBytes(encoded.Bytes()); err != nil {
-		t.Fatalf("DecodeFromBytes() error = %v", err)
+	tail := encodePacketFragment(
+		t, uint32(len(packet)), uint32(len(packet)), 60*1024,
+		packet[60*1024:], 2,
+	)
+	decoded, err := decoder.Decode(nil, tail)
+	if err != nil {
+		t.Fatalf("tail Decode() error = %v", err)
 	}
-	if got, want := event.PacketLen, originalLength; got != want {
-		t.Fatalf("PacketLen = %d, want %d", got, want)
+	event, ok := decoded.(*PacketEvent)
+	if !ok {
+		t.Fatalf("decoded packet type = %T", decoded)
 	}
-	if got, want := event.CapturedLen, uint32(len(packet)); got != want {
-		t.Fatalf("CapturedLen = %d, want %d", got, want)
+	if !bytes.Equal(event.PacketData, packet) {
+		t.Fatalf("decoded packet = %d bytes, want %d", len(event.PacketData), len(packet))
 	}
-	if err := event.Validate(); err != nil {
-		t.Fatalf("Validate() error = %v", err)
+	if event.CapturedLen != uint32(len(packet)) || event.ChunkCount != 2 {
+		t.Fatalf("decoded lengths = captured:%d chunks:%d", event.CapturedLen, event.ChunkCount)
+	}
+	if decoder.IncompleteEvents() != 0 {
+		t.Fatalf("IncompleteEvents() = %d, want 0", decoder.IncompleteEvents())
 	}
 }
 

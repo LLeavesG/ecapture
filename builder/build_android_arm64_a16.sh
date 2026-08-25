@@ -59,15 +59,20 @@ done
 
 # cilium/ebpf needs GOOS=linux at runtime even though the output uses Android's
 # dynamic linker. Build the Android 16 CO-RE object and embed only that object.
-ANDROID=1 \
-TARGET_ARCH=aarch64 \
-GOARCH=arm64 \
-LINUX_ARCH=arm64 \
 # The checked-in Android vmlinux.h removes the need to execute bpftool here.
 # Reuse the already-validated Go tool target to satisfy Make's autogen gate.
-CMD_BPFTOOL=go \
-AUTOGENCMD=true \
-make kern/boringssl_a_16_kern.o
+# The BPF object target is phony and is rebuilt without -B. Forcing every
+# prerequisite also re-runs Make's multi-line tool checks; Apple's GNU Make
+# 3.81 predates .ONESHELL and cannot parse those checks as one shell script.
+make \
+    ANDROID=1 \
+    CROSS_ARCH=arm64 \
+    TARGET_ARCH=aarch64 \
+    GOARCH=arm64 \
+    LINUX_ARCH=arm64 \
+    CMD_BPFTOOL=go \
+    AUTOGENCMD=true \
+    kern/boringssl_a_16_kern.o
 go run github.com/shuLhan/go-bindata/cmd/go-bindata \
     -pkg assets \
     -o assets/ebpf_probe.go \

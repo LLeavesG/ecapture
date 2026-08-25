@@ -56,3 +56,10 @@ type EventDecoder interface {
 	// GetDecoder returns the event decoder for a specific eBPF map.
 	GetDecoder(em *ebpf.Map) (Event, bool)
 }
+
+// IncompleteEventReporter lets a stateful decoder expose fragments which did
+// not become one complete event before capture shutdown. The probe records
+// this independently from perf loss and ordinary decode failures.
+type IncompleteEventReporter interface {
+	IncompleteEvents() uint64
+}

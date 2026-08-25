@@ -28,27 +28,31 @@ const readerStatsEmitEveryRecords uint64 = 4096
 const readerStatsEmitInterval = time.Second
 
 type readerStatsCounters struct {
-	perfRecords     atomic.Uint64
-	perfRawBytes    atomic.Uint64
-	ringbufRecords  atomic.Uint64
-	ringbufRawBytes atomic.Uint64
-	lostSamples     atomic.Uint64
-	readErrors      atomic.Uint64
-	decodeErrors    atomic.Uint64
-	dispatchErrors  atomic.Uint64
+	perfRecords      atomic.Uint64
+	perfRawBytes     atomic.Uint64
+	ringbufRecords   atomic.Uint64
+	ringbufRawBytes  atomic.Uint64
+	lostSamples      atomic.Uint64
+	readErrors       atomic.Uint64
+	decodeErrors     atomic.Uint64
+	dispatchErrors   atomic.Uint64
+	rawArchiveErrors atomic.Uint64
+	incompleteEvents atomic.Uint64
 }
 
 // ReaderStatsSnapshot is a stable, structured view of perf/ringbuf pressure.
 // It is emitted periodically and once more when the probe closes.
 type ReaderStatsSnapshot struct {
-	PerfRecords     uint64 `json:"perfRecords"`
-	PerfRawBytes    uint64 `json:"perfRawBytes"`
-	RingbufRecords  uint64 `json:"ringbufRecords"`
-	RingbufRawBytes uint64 `json:"ringbufRawBytes"`
-	LostSamples     uint64 `json:"lostSamples"`
-	ReadErrors      uint64 `json:"readErrors"`
-	DecodeErrors    uint64 `json:"decodeErrors"`
-	DispatchErrors  uint64 `json:"dispatchErrors"`
+	PerfRecords      uint64 `json:"perfRecords"`
+	PerfRawBytes     uint64 `json:"perfRawBytes"`
+	RingbufRecords   uint64 `json:"ringbufRecords"`
+	RingbufRawBytes  uint64 `json:"ringbufRawBytes"`
+	LostSamples      uint64 `json:"lostSamples"`
+	ReadErrors       uint64 `json:"readErrors"`
+	DecodeErrors     uint64 `json:"decodeErrors"`
+	DispatchErrors   uint64 `json:"dispatchErrors"`
+	RawArchiveErrors uint64 `json:"rawArchiveErrors"`
+	IncompleteEvents uint64 `json:"incompleteEvents"`
 }
 
 func (p *BaseProbe) ReaderStats() ReaderStatsSnapshot {
@@ -56,14 +60,16 @@ func (p *BaseProbe) ReaderStats() ReaderStatsSnapshot {
 		return ReaderStatsSnapshot{}
 	}
 	return ReaderStatsSnapshot{
-		PerfRecords:     p.readerStats.perfRecords.Load(),
-		PerfRawBytes:    p.readerStats.perfRawBytes.Load(),
-		RingbufRecords:  p.readerStats.ringbufRecords.Load(),
-		RingbufRawBytes: p.readerStats.ringbufRawBytes.Load(),
-		LostSamples:     p.readerStats.lostSamples.Load(),
-		ReadErrors:      p.readerStats.readErrors.Load(),
-		DecodeErrors:    p.readerStats.decodeErrors.Load(),
-		DispatchErrors:  p.readerStats.dispatchErrors.Load(),
+		PerfRecords:      p.readerStats.perfRecords.Load(),
+		PerfRawBytes:     p.readerStats.perfRawBytes.Load(),
+		RingbufRecords:   p.readerStats.ringbufRecords.Load(),
+		RingbufRawBytes:  p.readerStats.ringbufRawBytes.Load(),
+		LostSamples:      p.readerStats.lostSamples.Load(),
+		ReadErrors:       p.readerStats.readErrors.Load(),
+		DecodeErrors:     p.readerStats.decodeErrors.Load(),
+		DispatchErrors:   p.readerStats.dispatchErrors.Load(),
+		RawArchiveErrors: p.readerStats.rawArchiveErrors.Load(),
+		IncompleteEvents: p.readerStats.incompleteEvents.Load(),
 	}
 }
 
@@ -149,7 +155,9 @@ func (p *BaseProbe) dispatchReaderStats(final bool) {
 		stats.LostSamples == 0 &&
 		stats.ReadErrors == 0 &&
 		stats.DecodeErrors == 0 &&
-		stats.DispatchErrors == 0 {
+		stats.DispatchErrors == 0 &&
+		stats.RawArchiveErrors == 0 &&
+		stats.IncompleteEvents == 0 {
 		return
 	}
 	event := &ReaderStatsEvent{
@@ -183,7 +191,7 @@ func (e *ReaderStatsEvent) DecodeFromBytes([]byte) error {
 
 func (e *ReaderStatsEvent) String() string {
 	return fmt.Sprintf(
-		"capture stats: probe=%s perf_records=%d ringbuf_records=%d lost_samples=%d read_errors=%d decode_errors=%d dispatch_errors=%d final=%t",
+		"capture stats: probe=%s perf_records=%d ringbuf_records=%d lost_samples=%d read_errors=%d decode_errors=%d dispatch_errors=%d raw_archive_errors=%d incomplete_events=%d final=%t",
 		e.Probe,
 		e.PerfRecords,
 		e.RingbufRecords,
@@ -191,6 +199,8 @@ func (e *ReaderStatsEvent) String() string {
 		e.ReadErrors,
 		e.DecodeErrors,
 		e.DispatchErrors,
+		e.RawArchiveErrors,
+		e.IncompleteEvents,
 		e.Final,
 	)
 }

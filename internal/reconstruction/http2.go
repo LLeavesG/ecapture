@@ -50,13 +50,18 @@ const (
 var http2ClientPreface = []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 
 type HTTP2Summary struct {
-	Reconstruction    Summary `json:"reconstruction"`
-	CallsProcessed    int     `json:"callsProcessed"`
-	Connections       int     `json:"connections"`
-	Frames            int     `json:"frames"`
-	Transactions      int     `json:"transactions"`
-	HeaderDecodeError int     `json:"headerDecodeErrors"`
-	Resynchronized    int     `json:"resynchronizedBytes"`
+	Reconstruction       Summary `json:"reconstruction"`
+	CallsProcessed       int     `json:"callsProcessed"`
+	Connections          int     `json:"connections"`
+	Frames               int     `json:"frames"`
+	Transactions         int     `json:"transactions"`
+	CompleteTransactions int     `json:"completeTransactions"`
+	OpenTransactions     int     `json:"openTransactions"`
+	ResetTransactions    int     `json:"resetTransactions"`
+	OrphanTransactions   int     `json:"orphanTransactions"`
+	ErrorTransactions    int     `json:"errorTransactions"`
+	HeaderDecodeError    int     `json:"headerDecodeErrors"`
+	Resynchronized       int     `json:"resynchronizedBytes"`
 }
 
 type HTTP2Header struct {
@@ -66,11 +71,12 @@ type HTTP2Header struct {
 }
 
 type HTTP2Message struct {
-	Headers        []HTTP2Header `json:"headers,omitempty"`
-	Body           []byte        `json:"body,omitempty"`
-	BodyEncoding   string        `json:"bodyEncoding,omitempty"`
-	HeadersDecoded bool          `json:"headersDecoded"`
-	EndStream      bool          `json:"endStream"`
+	Headers      []HTTP2Header `json:"headers,omitempty"`
+	Body         []byte        `json:"body,omitempty"`
+	BodyEncoding string        `json:"bodyEncoding,omitempty"`
+	HTTPBodyPresentation
+	HeadersDecoded bool `json:"headersDecoded"`
+	EndStream      bool `json:"endStream"`
 }
 
 type HTTP2Transaction struct {
@@ -96,6 +102,7 @@ type HTTP2Transaction struct {
 	Request      HTTP2Message `json:"request"`
 	Response     HTTP2Message `json:"response"`
 	Complete     bool         `json:"complete"`
+	State        string       `json:"state"`
 	Errors       []string     `json:"errors,omitempty"`
 }
 
@@ -110,6 +117,7 @@ type http2Frame struct {
 type http2StreamState struct {
 	transaction HTTP2Transaction
 	seen        bool
+	reset       bool
 }
 
 type http2ConnectionState struct {
@@ -137,8 +145,10 @@ type http2DirectionState struct {
 	prefaceProcessed bool
 	decoder          *hpack.Decoder
 	pendingStream    uint32
+	pendingTarget    uint32
 	pendingBlock     []byte
 	pendingEndStream bool
+	pendingRequest   bool
 }
 
 func ReconstructHTTP2(
@@ -160,11 +170,19 @@ func ReconstructHTTP2(
 	summary.Reconstruction = callSummary
 
 	connections := make(map[string]*http2ConnectionState)
+	activeConnections := make(map[string]*http2ConnectionState)
+	connectionGenerations := make(map[string]int)
 	for _, call := range calls {
-		key := http2ConnectionKey(call)
-		connection := connections[key]
-		if connection == nil {
+		baseKey := http2ConnectionKey(call)
+		connection := activeConnections[baseKey]
+		if connection == nil || startsNewHTTP2Connection(call) {
+			connectionGenerations[baseKey]++
+			key := http2GenerationKey(
+				baseKey,
+				connectionGenerations[baseKey],
+			)
 			connection = newHTTP2Connection(key, call, &summary)
+			activeConnections[baseKey] = connection
 			connections[key] = connection
 		}
 		connection.feed(call)
@@ -182,7 +200,37 @@ func ReconstructHTTP2(
 			transaction.Complete = transaction.Request.EndStream &&
 				transaction.Response.EndStream &&
 				transaction.Request.HeadersDecoded &&
-				transaction.Response.HeadersDecoded
+				transaction.Response.HeadersDecoded &&
+				len(transaction.Errors) == 0
+			transaction.State = classifyTransactionState(
+				transaction.Complete,
+				http2MessageObserved(transaction.Request),
+				http2MessageObserved(transaction.Response),
+				state.reset,
+				len(transaction.Errors) != 0,
+			)
+			switch transaction.State {
+			case transactionStateComplete:
+				connection.summary.CompleteTransactions++
+			case transactionStateOpen:
+				connection.summary.OpenTransactions++
+			case transactionStateReset:
+				connection.summary.ResetTransactions++
+			case transactionStateOrphan:
+				connection.summary.OrphanTransactions++
+			default:
+				connection.summary.ErrorTransactions++
+			}
+			materializeHTTPBody(
+				transaction.Request.Headers,
+				transaction.Request.Body,
+				&transaction.Request.HTTPBodyPresentation,
+			)
+			materializeHTTPBody(
+				transaction.Response.Headers,
+				transaction.Response.Body,
+				&transaction.Response.HTTPBodyPresentation,
+			)
 			transactions = append(transactions, transaction)
 		}
 	}
@@ -267,6 +315,20 @@ func http2ConnectionKey(call Call) string {
 	default:
 		return fmt.Sprintf("tls:%d:fd:%d", call.Pid, call.Fd)
 	}
+}
+
+func http2GenerationKey(baseKey string, generation int) string {
+	if generation <= 1 {
+		return baseKey
+	}
+	return fmt.Sprintf("%s:generation:%d", baseKey, generation)
+}
+
+func startsNewHTTP2Connection(call Call) bool {
+	if !strings.EqualFold(call.Direction, "WRITE") || len(call.Data) == 0 {
+		return false
+	}
+	return bytes.HasPrefix(call.Data, http2ClientPreface)
 }
 
 func (connection *http2ConnectionState) feed(call Call) {
@@ -369,6 +431,8 @@ func (state *http2DirectionState) handleFrame(
 	switch frame.frameType {
 	case http2FrameHeaders:
 		state.handleHeaders(frame, timestamp)
+	case http2FramePushPromise:
+		state.handlePushPromise(frame, timestamp)
 	case http2FrameContinuation:
 		state.handleContinuation(frame, timestamp)
 	case http2FrameData:
@@ -376,6 +440,7 @@ func (state *http2DirectionState) handleFrame(
 	case http2FrameRSTStream:
 		stream := state.stream(frame.streamID, timestamp)
 		state.message(stream).EndStream = true
+		stream.reset = true
 	case http2FrameSettings:
 		if frame.flags&http2FlagAck == 0 {
 			state.applySettings(frame.payload)
@@ -411,6 +476,7 @@ func (state *http2DirectionState) handleHeaders(
 		state.decodeHeaders(frame.streamID, payload, timestamp)
 	} else {
 		state.pendingStream = frame.streamID
+		state.pendingTarget = frame.streamID
 		state.pendingBlock = append(state.pendingBlock[:0], payload...)
 		state.pendingEndStream = frame.flags&http2FlagEndStream != 0
 	}
@@ -418,6 +484,49 @@ func (state *http2DirectionState) handleHeaders(
 		stream := state.stream(frame.streamID, timestamp)
 		state.message(stream).EndStream = true
 	}
+}
+
+func (state *http2DirectionState) handlePushPromise(
+	frame http2Frame,
+	timestamp uint64,
+) {
+	payload, ok := stripHTTP2Padding(frame.payload, frame.flags)
+	if !ok || len(payload) < 4 {
+		state.addStreamError(
+			frame.streamID, timestamp, "invalid PUSH_PROMISE frame",
+		)
+		return
+	}
+	promisedStreamID := uint32(payload[0]&0x7f)<<24 |
+		uint32(payload[1])<<16 |
+		uint32(payload[2])<<8 |
+		uint32(payload[3])
+	if promisedStreamID == 0 {
+		state.addStreamError(
+			frame.streamID, timestamp, "zero PUSH_PROMISE stream ID",
+		)
+		return
+	}
+	block := payload[4:]
+	if state.pendingStream != 0 {
+		state.addStreamError(
+			state.pendingTarget,
+			timestamp,
+			"header block interrupted before END_HEADERS",
+		)
+		state.clearPendingHeaders()
+	}
+	if frame.flags&http2FlagEndHeaders != 0 {
+		state.decodeHeadersInto(promisedStreamID, block, timestamp, true)
+		stream := state.stream(promisedStreamID, timestamp)
+		stream.transaction.Request.EndStream = true
+		return
+	}
+	state.pendingStream = frame.streamID
+	state.pendingTarget = promisedStreamID
+	state.pendingBlock = append(state.pendingBlock[:0], block...)
+	state.pendingEndStream = true
+	state.pendingRequest = true
 }
 
 func (state *http2DirectionState) handleContinuation(
@@ -432,13 +541,22 @@ func (state *http2DirectionState) handleContinuation(
 	if frame.flags&http2FlagEndHeaders == 0 {
 		return
 	}
+	targetStream := state.pendingTarget
+	if targetStream == 0 {
+		targetStream = state.pendingStream
+	}
 	endStream := state.pendingEndStream
+	requestMessage := state.pendingRequest
 	block := append([]byte(nil), state.pendingBlock...)
 	state.clearPendingHeaders()
-	state.decodeHeaders(frame.streamID, block, timestamp)
+	state.decodeHeadersInto(targetStream, block, timestamp, requestMessage)
 	if endStream {
-		stream := state.stream(frame.streamID, timestamp)
-		state.message(stream).EndStream = true
+		stream := state.stream(targetStream, timestamp)
+		message := state.message(stream)
+		if requestMessage {
+			message = &stream.transaction.Request
+		}
+		message.EndStream = true
 	}
 }
 
@@ -482,6 +600,15 @@ func (state *http2DirectionState) decodeHeaders(
 	block []byte,
 	timestamp uint64,
 ) {
+	state.decodeHeadersInto(streamID, block, timestamp, false)
+}
+
+func (state *http2DirectionState) decodeHeadersInto(
+	streamID uint32,
+	block []byte,
+	timestamp uint64,
+	requestMessage bool,
+) {
 	var fields []hpack.HeaderField
 	state.decoder.SetEmitFunc(func(field hpack.HeaderField) {
 		fields = append(fields, field)
@@ -505,6 +632,9 @@ func (state *http2DirectionState) decodeHeaders(
 
 	stream := state.stream(streamID, timestamp)
 	message := state.message(stream)
+	if requestMessage {
+		message = &stream.transaction.Request
+	}
 	message.HeadersDecoded = true
 	for _, field := range fields {
 		message.Headers = append(message.Headers, HTTP2Header{
@@ -553,8 +683,10 @@ func (state *http2DirectionState) applySettings(payload []byte) {
 
 func (state *http2DirectionState) clearPendingHeaders() {
 	state.pendingStream = 0
+	state.pendingTarget = 0
 	state.pendingBlock = state.pendingBlock[:0]
 	state.pendingEndStream = false
+	state.pendingRequest = false
 }
 
 func (state *http2DirectionState) stream(

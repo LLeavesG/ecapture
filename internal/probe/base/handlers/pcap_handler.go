@@ -109,7 +109,9 @@ func NewPcapHandler(writer writers.OutputWriter, ifName, filter string, lger *lo
 		return nil, errors.New(errors.ErrCodeResourceAllocation, "output writer cannot be nil")
 	}
 
-	// Create pcap writer with Ethernet link type and 65535 snaplen
+	// TC reassembles bounded GSO/BIG-TCP skbs up to 256 KiB before dispatch.
+	// Advertise the same PCAPNG snaplen so a complete record is never made
+	// inconsistent by a legacy 65535-byte interface description.
 	return NewPcapHandlerInterfaces(writer, []string{ifName}, filter, lger)
 }
 
@@ -120,7 +122,7 @@ func NewPcapHandlerInterfaces(
 	if writer == nil {
 		return nil, errors.New(errors.ErrCodeResourceAllocation, "output writer cannot be nil")
 	}
-	pcapWriter, err := writers.NewPcapWriterInterfaces(writer, 65535, ifNames, filter, lger)
+	pcapWriter, err := writers.NewPcapWriterInterfaces(writer, 256*1024, ifNames, filter, lger)
 	if err != nil {
 		return nil, errors.Wrap(errors.ErrCodeResourceAllocation, "failed to create pcap writer", err)
 	}

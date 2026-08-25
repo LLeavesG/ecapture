@@ -31,21 +31,24 @@ const (
 )
 
 type WireCorrelationSummary struct {
-	Reconstruction     Summary `json:"reconstruction"`
-	TLSBIOStreams      int     `json:"tlsBioStreams"`
-	PacketFlows        int     `json:"packetFlows"`
-	FDStreams          int     `json:"fdStreams"`
-	Matched            int     `json:"matched"`
-	WireVerified       int     `json:"wireVerified"`
-	FDCandidates       int     `json:"fdCandidates"`
-	Ambiguous          int     `json:"ambiguous"`
-	Unmatched          int     `json:"unmatched"`
-	CallsIgnored       int     `json:"callsIgnored"`
-	MinimumMatchLength int     `json:"minimumMatchLength"`
+	Reconstruction      Summary `json:"reconstruction"`
+	TLSBIOStreams       int     `json:"tlsBioStreams"`
+	SocketStreams       int     `json:"socketStreams"`
+	PacketFlows         int     `json:"packetFlows"`
+	InferredPacketFlows int     `json:"inferredPacketFlows"`
+	FDStreams           int     `json:"fdStreams"`
+	Matched             int     `json:"matched"`
+	WireVerified        int     `json:"wireVerified"`
+	FDCandidates        int     `json:"fdCandidates"`
+	Ambiguous           int     `json:"ambiguous"`
+	Unmatched           int     `json:"unmatched"`
+	CallsIgnored        int     `json:"callsIgnored"`
+	MinimumMatchLength  int     `json:"minimumMatchLength"`
 }
 
-// WireCorrelation joins a custom TLS BIO to a socket descriptor by exact
-// ciphertext content. No timing heuristic or application plaintext is used.
+// WireCorrelation joins a custom TLS BIO or a known socket payload boundary
+// to raw packets by exact content. No timing heuristic, protocol guess, or
+// application plaintext inference is used.
 type WireCorrelation struct {
 	EventType          string  `json:"eventType"`
 	CaptureLayer       string  `json:"captureLayer"`
@@ -53,6 +56,7 @@ type WireCorrelation struct {
 	TargetKind         string  `json:"targetKind"`
 	Method             string  `json:"method"`
 	Pid                uint32  `json:"pid"`
+	Uid                uint32  `json:"uid,omitempty"`
 	Direction          string  `json:"direction"`
 	BIOAddr            uint64  `json:"bioAddr"`
 	Fd                 uint32  `json:"fd,omitempty"`
@@ -60,6 +64,7 @@ type WireCorrelation struct {
 	SocketCookie       uint64  `json:"socketCookie,omitempty"`
 	NetworkVerified    bool    `json:"networkVerified"`
 	TLSCiphertextBytes int     `json:"tlsCiphertextBytes"`
+	SocketPayloadBytes int     `json:"socketPayloadBytes,omitempty"`
 	WireBytes          int     `json:"wireBytes,omitempty"`
 	FDPayloadBytes     int     `json:"fdPayloadBytes,omitempty"`
 	MatchedBytes       int     `json:"matchedBytes"`
@@ -74,6 +79,7 @@ type WireCorrelation struct {
 
 type wireSequenceKey struct {
 	pid       uint32
+	uid       uint32
 	direction string
 	context   uint64
 	role      string
@@ -106,6 +112,7 @@ type wirePacketCandidate struct {
 
 type wireDirectionKey struct {
 	pid       uint32
+	uid       uint32
 	direction string
 }
 
@@ -162,6 +169,7 @@ func CorrelateWire(
 		}
 		key := wireSequenceKey{
 			pid:       call.Pid,
+			uid:       call.Uid,
 			direction: call.Direction,
 			context:   call.ContextID,
 			role:      call.BoundaryRole,
@@ -194,16 +202,21 @@ func CorrelateWire(
 			sequence.data = append(sequence.data, call.Data...)
 		}
 		switch sequence.key.role {
-		case boundaryTLSCiphertext:
+		case boundaryTLSCiphertext, boundarySocketPayload:
 			sources = append(sources, sequence)
-		case boundarySocketPayload, boundaryFDPayload:
+			if sequence.key.role == boundaryTLSCiphertext {
+				summary.TLSBIOStreams++
+			} else {
+				summary.SocketStreams++
+			}
+		case boundaryFDPayload:
 			targets = append(targets, sequence)
 		}
 	}
-	summary.TLSBIOStreams = len(sources)
 	summary.FDStreams = len(targets)
 	packetRuns := packetCollector.runs()
 	summary.PacketFlows = len(packetCollector.flows)
+	summary.InferredPacketFlows = packetCollector.inferredFlows
 
 	sort.Slice(sources, func(i, j int) bool {
 		if sources[i].key.pid == sources[j].key.pid {
@@ -233,9 +246,21 @@ func CorrelateWire(
 		})
 		if len(packetCandidates) != 0 {
 			best := packetCandidates[0]
-			ambiguous := len(packetCandidates) > 1 &&
-				packetCandidates[1].match.length == best.match.length
+			ambiguous := packetCorrelationIsAmbiguous(packetCandidates)
 			confidence := "exact-wire-content"
+			method := "exact-ciphertext-content"
+			var bioAddr uint64
+			var fd uint32
+			var tlsBytes int
+			var socketBytes int
+			if source.key.role == boundaryTLSCiphertext {
+				bioAddr = source.key.context
+				tlsBytes = len(source.data)
+			} else {
+				method = "exact-socket-payload-content"
+				fd = uint32(source.key.context)
+				socketBytes = len(source.data)
+			}
 			if ambiguous {
 				confidence = "ambiguous-exact-wire-content"
 				summary.Ambiguous++
@@ -251,14 +276,17 @@ func CorrelateWire(
 				CaptureLayer:       "metadata",
 				Transport:          best.target.key.transport,
 				TargetKind:         "packet_flow",
-				Method:             "exact-ciphertext-content",
+				Method:             method,
 				Pid:                source.key.pid,
+				Uid:                source.key.uid,
 				Direction:          source.key.direction,
-				BIOAddr:            source.key.context,
+				BIOAddr:            bioAddr,
+				Fd:                 fd,
 				Tuple:              best.target.key.tuple,
 				SocketCookie:       best.target.socketCookie,
 				NetworkVerified:    true,
-				TLSCiphertextBytes: len(source.data),
+				TLSCiphertextBytes: tlsBytes,
+				SocketPayloadBytes: socketBytes,
 				WireBytes:          len(best.target.data),
 				MatchedBytes:       best.match.length,
 				Coverage:           float64(best.match.length) / float64(len(source.data)),
@@ -274,6 +302,10 @@ func CorrelateWire(
 			}
 			summary.Matched++
 			summary.WireVerified++
+			continue
+		}
+		if source.key.role != boundaryTLSCiphertext {
+			summary.Unmatched++
 			continue
 		}
 
@@ -324,6 +356,7 @@ func CorrelateWire(
 			TargetKind:         "fd_candidate",
 			Method:             "exact-ciphertext-content",
 			Pid:                source.key.pid,
+			Uid:                source.key.uid,
 			Direction:          source.key.direction,
 			BIOAddr:            source.key.context,
 			Fd:                 uint32(best.target.key.context),
@@ -348,6 +381,24 @@ func CorrelateWire(
 	return summary, nil
 }
 
+func packetCorrelationIsAmbiguous(candidates []wirePacketCandidate) bool {
+	if len(candidates) < 2 {
+		return false
+	}
+	best := candidates[0]
+	for _, candidate := range candidates[1:] {
+		if candidate.match.length < best.match.length {
+			break
+		}
+		// Repeated/duplicated packets for the same directional tuple still
+		// identify one flow. Only an equally strong distinct tuple is ambiguous.
+		if candidate.target.key.tuple != best.target.key.tuple {
+			return true
+		}
+	}
+	return false
+}
+
 // correlatePacketCandidates indexes each packet run once and evaluates every
 // BIO stream with the same process and direction while that compact index is
 // resident. The previous source-first loop rebuilt the same byte index for
@@ -359,17 +410,28 @@ func correlatePacketCandidates(
 	result := make(map[*wireSequence][]wirePacketCandidate)
 	groups := make(map[wireDirectionKey][]*wireSequence)
 	for _, source := range sources {
-		key := wireDirectionKey{
-			pid:       source.key.pid,
-			direction: source.key.direction,
+		if source.key.pid != 0 {
+			key := wireDirectionKey{
+				pid:       source.key.pid,
+				direction: source.key.direction,
+			}
+			groups[key] = append(groups[key], source)
 		}
-		groups[key] = append(groups[key], source)
+		if source.key.uid != 0 {
+			key := wireDirectionKey{
+				uid:       source.key.uid,
+				direction: source.key.direction,
+			}
+			groups[key] = append(groups[key], source)
+		}
 	}
 	for index := range packetRuns {
 		target := &packetRuns[index]
-		key := wireDirectionKey{
-			pid:       target.key.pid,
-			direction: target.key.direction,
+		key := wireDirectionKey{direction: target.key.direction}
+		if target.key.pid != 0 {
+			key.pid = target.key.pid
+		} else {
+			key.uid = target.key.uid
 		}
 		relevant := groups[key]
 		if len(relevant) == 0 ||

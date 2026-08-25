@@ -26,6 +26,8 @@ import (
 	"reflect"
 	"sort"
 	"testing"
+
+	manager "github.com/gojue/ebpfmanager"
 )
 
 func TestAppDwarfMapABILayout(t *testing.T) {
@@ -74,6 +76,16 @@ func TestAppDwarfMapSpecsUsePreparedSizes(t *testing.T) {
 	assertEntries("app_dwarf_unwind_pages", 3)
 	assertEntries("app_dwarf_unwind_deltas", 3)
 	assertEntries("app_dwarf_unwind_infos", 7)
+}
+
+func TestAndroidManagerOptionsClearOptionalRodataProtection(t *testing.T) {
+	config := NewConfig()
+	config.IsAndroid = true
+	probe := &Probe{config: config}
+	editor, found := probe.getManagerOptions().MapSpecEditors[".rodata"]
+	if !found || editor.EditorFlag != manager.EditFlags || editor.Flags != 0 {
+		t.Fatalf("Android .rodata editor = %#v, found=%v", editor, found)
+	}
 }
 
 func TestAppDwarfRulePagesPreserveGapsAndPageBoundaries(t *testing.T) {

@@ -19,6 +19,8 @@ import (
 	"slices"
 	"testing"
 
+	manager "github.com/gojue/ebpfmanager"
+
 	"github.com/gojue/ecapture/internal/probe/base/handlers"
 )
 
@@ -146,5 +148,65 @@ func TestLegacyApplicationDataStrategyRemainsCompatible(t *testing.T) {
 	hooks := config.EnabledCaptureDataHooks()
 	if len(hooks) != 2 {
 		t.Fatalf("legacy strategy selected %#v", hooks)
+	}
+}
+
+func TestRawPacketProgramsExcludeUnusedSemanticFamilies(t *testing.T) {
+	probes := []*manager.Probe{
+		{EbpfFuncName: "ingress_cls_func"},
+		{EbpfFuncName: "egress_cls_func"},
+		{EbpfFuncName: "tcp_sendmsg"},
+		{EbpfFuncName: "udp_sendmsg"},
+	}
+	excluded := excludedUnconfiguredEBPFFunctions(probes)
+	for _, function := range []string{
+		"probe_ret_app_data_4",
+		"probe_jni_register_natives_0",
+		"probe_entry_SSL_read",
+	} {
+		if !slices.Contains(excluded, function) {
+			t.Fatalf("unused function %q was not excluded", function)
+		}
+	}
+	for _, function := range []string{
+		"ingress_cls_func",
+		"egress_cls_func",
+		"tcp_sendmsg",
+		"udp_sendmsg",
+	} {
+		if slices.Contains(excluded, function) {
+			t.Fatalf("raw packet function %q was excluded", function)
+		}
+	}
+}
+
+func TestPacketAttributionProbesCanBeDisabledWhenKallsymsIsHidden(t *testing.T) {
+	if got := packetAttributionProbes(false); len(got) != 0 {
+		t.Fatalf("disabled packet attribution probes = %#v, want none", got)
+	}
+	got := packetAttributionProbes(true)
+	if len(got) != 2 || got[0].EbpfFuncName != "tcp_sendmsg" ||
+		got[1].EbpfFuncName != "udp_sendmsg" {
+		t.Fatalf("enabled packet attribution probes = %#v", got)
+	}
+}
+
+func TestKallsymsFreeProbeSetKeepsOnlyUserAndTCProbes(t *testing.T) {
+	got := probesWithoutKernelSymbols([]*manager.Probe{
+		{EbpfFuncName: "kernel-only"},
+		{EbpfFuncName: "user", BinaryPath: "/data/app/libssl.so"},
+		{EbpfFuncName: "tc", Ifname: "wlan0"},
+	})
+	if len(got) != 2 || got[0].EbpfFuncName != "user" || got[1].EbpfFuncName != "tc" {
+		t.Fatalf("kallsyms-free probes = %#v", got)
+	}
+}
+
+func TestConfiguredSemanticProgramRemainsLoadable(t *testing.T) {
+	excluded := excludedUnconfiguredEBPFFunctions([]*manager.Probe{
+		{EbpfFuncName: "probe_ret_app_data_4"},
+	})
+	if slices.Contains(excluded, "probe_ret_app_data_4") {
+		t.Fatal("configured semantic function was excluded")
 	}
 }

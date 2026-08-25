@@ -231,6 +231,9 @@ struct app_data_event_t {
     char comm[TASK_COMM_LEN];
     s32 user_stack_status;
     u32 user_stack_depth;
+    u32 uid;
+    u32 reserved;
+    u64 cgroup_id;
     u64 user_stack[APP_DATA_MAX_STACK_DEPTH];
     char data[MAX_DATA_SIZE_OPENSSL];
 };
@@ -264,17 +267,23 @@ struct {
 } app_hook_states SEC(".maps");
 
 struct {
+    /*
+     * One buffer per hook slot prevents nested libc boundaries (for example,
+     * a vectored wrapper entering another hooked socket function) from
+     * overwriting an outer event on the same CPU before it is emitted.
+     */
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, u32);
     __type(value, struct app_data_event_t);
-    __uint(max_entries, 1);
+    __uint(max_entries, APP_HOOK_MAX_SLOTS);
 } app_data_buffer_heap SEC(".maps");
 
 struct {
+    /* Keep vector accounting isolated for the same nested-hook case. */
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, u32);
     __type(value, struct app_iovec_state_t);
-    __uint(max_entries, 1);
+    __uint(max_entries, APP_HOOK_MAX_SLOTS);
 } app_iovec_state_heap SEC(".maps");
 
 struct {
@@ -678,9 +687,25 @@ static __always_inline u64 app_hook_argument(struct pt_regs *ctx, u32 index) {
     }
 }
 
+/*
+ * Android arm64 permits tagged user pointers through Top Byte Ignore (TBI).
+ * Native allocators used by Chromium/Cronet commonly return addresses such as
+ * 0xb4xx..., while bpf_probe_read_user() expects the canonical user address.
+ * Keep scalar arguments unchanged and normalize only values used as memory
+ * addresses so lengths, stream IDs, and flags retain their full bit width.
+ */
+static __always_inline u64 app_hook_user_address(u64 address) {
+#if defined(bpf_target_arm64)
+    return address & 0x00ffffffffffffffULL;
+#else
+    return address;
+#endif
+}
+
 static __always_inline u64 app_hook_deferred_length_address(
     struct pt_regs *ctx, struct app_hook_config_t *config) {
-    u64 length_base = app_hook_argument(ctx, config->length_arg);
+    u64 length_base = app_hook_user_address(
+        app_hook_argument(ctx, config->length_arg));
     if (length_base == 0)
         return 0;
     if ((config->flags & APP_DATA_FLAG_LENGTH_INDIRECT) != 0) {
@@ -688,12 +713,13 @@ static __always_inline u64 app_hook_deferred_length_address(
         if (bpf_probe_read_user(&indirect, sizeof(indirect),
                                 (void *)(length_base + config->length_offset)) != 0)
             return 0;
-        return indirect;
+        return app_hook_user_address(indirect);
     }
     return length_base + config->length_offset;
 }
 
 static __always_inline s64 app_hook_read_signed_length(u64 address, u32 size) {
+    address = app_hook_user_address(address);
     if (address == 0)
         return 0;
     switch (size) {
@@ -726,6 +752,7 @@ static __always_inline s64 app_hook_read_signed_length(u64 address, u32 size) {
 }
 
 static __always_inline u64 app_hook_read_length(u64 address, u32 size) {
+    address = app_hook_user_address(address);
     u64 length = 0;
     switch (size) {
     case 1: {
@@ -755,6 +782,7 @@ static __always_inline u64 app_hook_read_length(u64 address, u32 size) {
 
 static __always_inline int app_hook_read_scalar(u64 address, u32 size,
                                                 u64 *result) {
+    address = app_hook_user_address(address);
     if (result == NULL)
         return -1;
     *result = 0;
@@ -799,7 +827,8 @@ static __always_inline int app_hook_scalar(struct pt_regs *ctx, u32 argument,
     }
     if (value == 0)
         return -1;
-    return app_hook_read_scalar(value + offset, size, result);
+    return app_hook_read_scalar(app_hook_user_address(value) + offset,
+                                size, result);
 }
 
 static __always_inline u64 app_hook_identity(struct pt_regs *ctx, u32 argument,
@@ -812,7 +841,8 @@ static __always_inline u64 app_hook_identity(struct pt_regs *ctx, u32 argument,
 
 static __always_inline int app_hook_resolve(struct pt_regs *ctx, struct app_hook_config_t *config,
                                             u64 *buffer, u64 *length) {
-    u64 buffer_base = app_hook_argument(ctx, config->buffer_arg);
+    u64 buffer_base = app_hook_user_address(
+        app_hook_argument(ctx, config->buffer_arg));
     if (buffer_base == 0)
         return -1;
     u64 buffer_object = buffer_base + config->buffer_offset;
@@ -820,6 +850,7 @@ static __always_inline int app_hook_resolve(struct pt_regs *ctx, struct app_hook
         if (bpf_probe_read_user(&buffer_object, sizeof(buffer_object),
                                 (void *)buffer_object) != 0)
             return -1;
+        buffer_object = app_hook_user_address(buffer_object);
     }
     if (buffer_object == 0)
         return -1;
@@ -836,6 +867,7 @@ static __always_inline int app_hook_resolve(struct pt_regs *ctx, struct app_hook
         if ((marker & 0x80) != 0) {
             if (bpf_probe_read_user(buffer, sizeof(*buffer), (void *)buffer_object) != 0)
                 return -1;
+            *buffer = app_hook_user_address(*buffer);
             if (bpf_probe_read_user(length, sizeof(*length), (void *)(buffer_object + 8)) != 0)
                 return -1;
         } else {
@@ -861,12 +893,14 @@ static __always_inline int app_hook_resolve(struct pt_regs *ctx, struct app_hook
     }
     if (length_base == 0)
         length_base = buffer_base;
+    length_base = app_hook_user_address(length_base);
     if ((config->flags & APP_DATA_FLAG_LENGTH_INDIRECT) != 0) {
         u64 indirect = 0;
         if (bpf_probe_read_user(&indirect, sizeof(indirect),
                                 (void *)(length_base + config->length_offset)) != 0)
             return -1;
         length_base = indirect;
+        length_base = app_hook_user_address(length_base);
         if (length_base == 0)
             return -1;
         *length = app_hook_read_length(length_base, config->length_size);
@@ -907,8 +941,8 @@ static __always_inline int app_hook_emit(struct pt_regs *ctx, u32 slot,
         (stream_flags & APP_DATA_STREAM_FIN) != 0;
     if (!fin_only && (buffer == 0 || length == 0))
         return 0;
-    u32 zero = 0;
-    struct app_data_event_t *event = bpf_map_lookup_elem(&app_data_buffer_heap, &zero);
+    struct app_data_event_t *event =
+        bpf_map_lookup_elem(&app_data_buffer_heap, &slot);
     if (event == NULL)
         return 0;
 
@@ -938,6 +972,9 @@ static __always_inline int app_hook_emit(struct pt_regs *ctx, u32 slot,
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
     event->user_stack_status = 0;
     event->user_stack_depth = 0;
+    event->uid = bpf_get_current_uid_gid();
+    event->reserved = 0;
+    event->cgroup_id = bpf_get_current_cgroup_id();
     __builtin_memset(event->user_stack, 0, sizeof(event->user_stack));
     if ((config->flags & APP_DATA_FLAG_USER_STACK) != 0) {
         s32 stack_bytes;
@@ -984,11 +1021,12 @@ static __noinline int app_hook_read_vector(struct app_iovec_state_t *state,
         index >= state->vector_count || index >= APP_DATA_MAX_IOVECS)
         return -1;
 
-    u64 address = state->iovec_address +
+    u64 address = app_hook_user_address(state->iovec_address) +
                   (u64)index * (u64)state->vector_stride;
     if (bpf_probe_read_user(&vector->base, sizeof(vector->base),
                             (void *)(address + state->vector_base_offset)) != 0)
         return -1;
+    vector->base = app_hook_user_address(vector->base);
 
     switch (state->vector_length_size) {
     case 1: {
@@ -1061,7 +1099,8 @@ static __noinline void app_hook_measure_iovec(struct app_iovec_state_t *state,
 
 #define APP_IOVEC_EMIT_CHUNK(ctx, event, state, vector, vector_offset)                    \
     do {                                                                                 \
-        if ((state)->segment_count < APP_DATA_MAX_IOVEC_SEGMENTS &&                      \
+        if ((state)->measurement_failed == 0 &&                                          \
+            (state)->segment_count < APP_DATA_MAX_IOVEC_SEGMENTS &&                      \
             (state)->emitted_len < (state)->captured_len &&                              \
             (vector_offset) < (vector).length) {                                         \
             u64 _vector_remaining = (vector).length - (vector_offset);                   \
@@ -1075,12 +1114,22 @@ static __noinline void app_hook_measure_iovec(struct app_iovec_state_t *state,
                 (event)->data_len = _chunk;                                                \
                 (event)->chunk_offset = (state)->emitted_len;                              \
                 if (bpf_probe_read_user(&(event)->data, _chunk,                            \
-                                        (void *)((vector).base + (vector_offset))) == 0)   \
+                                        (void *)((vector).base + (vector_offset))) == 0) { \
                     bpf_perf_event_output(ctx, &app_data_events, BPF_F_CURRENT_CPU, event, \
                                           APP_DATA_EVENT_HEADER_SIZE + _chunk);            \
-                (vector_offset) += _chunk;                                                 \
-                (state)->emitted_len += _chunk;                                            \
-                (state)->segment_count++;                                                  \
+                    (vector_offset) += _chunk;                                             \
+                    (state)->emitted_len += _chunk;                                        \
+                    (state)->segment_count++;                                              \
+                } else {                                                                   \
+                    /*                                                                     \
+                     * Never advance the logical stream past bytes that were not read.     \
+                     * Continuing with a later vector would assign it the failed range's   \
+                     * offset and manufacture a corrupt, apparently contiguous call.       \
+                     */                                                                    \
+                    (state)->measurement_failed = 1;                                       \
+                    (state)->flags |= APP_DATA_EVENT_TRUNCATED;                            \
+                    (event)->flags |= APP_DATA_EVENT_TRUNCATED;                            \
+                }                                                                          \
             }                                                                             \
         }                                                                                 \
     } while (0)
@@ -1201,6 +1250,9 @@ app_hook_emit_iovec_state(struct pt_regs *ctx,
     event->original_len = state->original_len;
     event->captured_len = state->captured_len;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
+    event->uid = bpf_get_current_uid_gid();
+    event->reserved = 0;
+    event->cgroup_id = bpf_get_current_cgroup_id();
     if (state->fin_only != 0) {
         event->chunk_offset = 0;
         event->data_len = 0;
@@ -1243,16 +1295,15 @@ static __always_inline int app_hook_emit_iovec(struct pt_regs *ctx, u32 slot,
     if (no_data && !has_fin)
         return 0;
 
-    u32 zero = 0;
     struct app_iovec_state_t *state =
-        bpf_map_lookup_elem(&app_iovec_state_heap, &zero);
+        bpf_map_lookup_elem(&app_iovec_state_heap, &slot);
     struct app_data_event_t *event =
-        bpf_map_lookup_elem(&app_data_buffer_heap, &zero);
+        bpf_map_lookup_elem(&app_data_buffer_heap, &slot);
     if (state == NULL || event == NULL)
         return 0;
 
     __builtin_memset(state, 0, sizeof(*state));
-    state->iovec_address = iovec_address;
+    state->iovec_address = app_hook_user_address(iovec_address);
     state->return_len = return_len;
     state->vector_count =
         vector_count > 0xffffffffULL ? 0xffffffffU : (u32)vector_count;
@@ -1330,14 +1381,16 @@ static __always_inline int app_hook_entry(struct pt_regs *ctx, u32 slot) {
     }
     if ((config->flags &
          (APP_DATA_FLAG_BUFFER_IOVEC | APP_DATA_FLAG_BUFFER_MSGHDR)) != 0) {
-        u64 iovec_address = app_hook_argument(ctx, config->buffer_arg);
+        u64 iovec_address = app_hook_user_address(
+            app_hook_argument(ctx, config->buffer_arg));
         u64 vector_count = app_hook_argument(ctx, config->vector_count_arg);
         if ((config->flags & APP_DATA_FLAG_BUFFER_MSGHDR) != 0) {
-            u64 message_header = iovec_address;
+            u64 message_header = app_hook_user_address(iovec_address);
             if (message_header == 0 ||
                 bpf_probe_read_user(&iovec_address, sizeof(iovec_address),
                                     (void *)(message_header + config->buffer_offset)) != 0)
                 return 0;
+            iovec_address = app_hook_user_address(iovec_address);
             vector_count = app_hook_read_length(
                 message_header + config->length_offset, config->length_size);
         }

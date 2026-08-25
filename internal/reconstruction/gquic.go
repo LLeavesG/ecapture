@@ -30,6 +30,10 @@ type GQUICSummary struct {
 	Frames               int               `json:"frames"`
 	Transactions         int               `json:"transactions"`
 	CompleteTransactions int               `json:"completeTransactions"`
+	OpenTransactions     int               `json:"openTransactions"`
+	ResetTransactions    int               `json:"resetTransactions"`
+	OrphanTransactions   int               `json:"orphanTransactions"`
+	ErrorTransactions    int               `json:"errorTransactions"`
 	HeaderDecodeErrors   int               `json:"headerDecodeErrors"`
 	ResynchronizedBytes  int               `json:"resynchronizedBytes"`
 }
@@ -156,8 +160,34 @@ func ReconstructGQUIC(
 					transaction.Request.EndStream &&
 					transaction.Response.EndStream &&
 					len(transaction.Errors) == 0
-			if transaction.Complete {
+			transaction.State = classifyTransactionState(
+				transaction.Complete,
+				http2MessageObserved(transaction.Request),
+				http2MessageObserved(transaction.Response),
+				state.reset,
+				len(transaction.Errors) != 0,
+			)
+			materializeHTTPBody(
+				transaction.Request.Headers,
+				transaction.Request.Body,
+				&transaction.Request.HTTPBodyPresentation,
+			)
+			materializeHTTPBody(
+				transaction.Response.Headers,
+				transaction.Response.Body,
+				&transaction.Response.HTTPBodyPresentation,
+			)
+			switch transaction.State {
+			case transactionStateComplete:
 				summary.CompleteTransactions++
+			case transactionStateOpen:
+				summary.OpenTransactions++
+			case transactionStateReset:
+				summary.ResetTransactions++
+			case transactionStateOrphan:
+				summary.OrphanTransactions++
+			default:
+				summary.ErrorTransactions++
 			}
 			transactions = append(transactions, transaction)
 		}

@@ -83,6 +83,7 @@ func TestReconstructHTTP1SplitCallsChunkedAndBinaryBodies(t *testing.T) {
 		t.Fatal(err)
 	}
 	if transaction.Protocol != "http1" ||
+		transaction.State != transactionStateComplete ||
 		transaction.StreamID != 1 ||
 		transaction.StreamIDSource != "synthetic-http1-sequence" ||
 		transaction.Method != "POST" ||
@@ -177,6 +178,7 @@ func TestReconstructHTTP1DoesNotClaimCaptureEOFTerminatedBodyComplete(
 		t.Fatal(err)
 	}
 	if transaction.Complete ||
+		transaction.State != transactionStateError ||
 		transaction.Response.EndStream ||
 		string(transaction.Response.Body) != "partial" ||
 		len(transaction.Errors) != 1 ||

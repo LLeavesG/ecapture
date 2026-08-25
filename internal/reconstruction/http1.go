@@ -40,6 +40,9 @@ type HTTP1Summary struct {
 	Responses             int     `json:"responses"`
 	Transactions          int     `json:"transactions"`
 	CompleteTransactions  int     `json:"completeTransactions"`
+	OpenTransactions      int     `json:"openTransactions"`
+	OrphanTransactions    int     `json:"orphanTransactions"`
+	ErrorTransactions     int     `json:"errorTransactions"`
 	ParseErrors           int     `json:"parseErrors"`
 }
 
@@ -69,6 +72,7 @@ type HTTP1Transaction struct {
 	Request         HTTP2Message `json:"request"`
 	Response        HTTP2Message `json:"response"`
 	Complete        bool         `json:"complete"`
+	State           string       `json:"state"`
 	Errors          []string     `json:"errors,omitempty"`
 }
 
@@ -226,11 +230,6 @@ func ReconstructHTTP1(
 					transaction.Errors,
 					request.errors...,
 				)
-			} else {
-				transaction.Errors = append(
-					transaction.Errors,
-					"response observed without its request",
-				)
 			}
 			if index < len(responses) {
 				response := responses[index]
@@ -248,11 +247,6 @@ func ReconstructHTTP1(
 					transaction.Errors,
 					response.errors...,
 				)
-			} else {
-				transaction.Errors = append(
-					transaction.Errors,
-					"request observed without its response",
-				)
 			}
 			transaction.WallTime = wallTimeAt(
 				connection.wallTime,
@@ -265,8 +259,32 @@ func ReconstructHTTP1(
 					transaction.Request.EndStream &&
 					transaction.Response.EndStream &&
 					len(transaction.Errors) == 0
-			if transaction.Complete {
+			transaction.State = classifyTransactionState(
+				transaction.Complete,
+				index < len(requests),
+				index < len(responses),
+				false,
+				len(transaction.Errors) != 0,
+			)
+			materializeHTTPBody(
+				transaction.Request.Headers,
+				transaction.Request.Body,
+				&transaction.Request.HTTPBodyPresentation,
+			)
+			materializeHTTPBody(
+				transaction.Response.Headers,
+				transaction.Response.Body,
+				&transaction.Response.HTTPBodyPresentation,
+			)
+			switch transaction.State {
+			case transactionStateComplete:
 				summary.CompleteTransactions++
+			case transactionStateOpen:
+				summary.OpenTransactions++
+			case transactionStateOrphan:
+				summary.OrphanTransactions++
+			default:
+				summary.ErrorTransactions++
 			}
 			transactions = append(transactions, transaction)
 		}

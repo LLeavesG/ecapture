@@ -18,8 +18,16 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"math"
 	"testing"
 )
+
+func TestManagerMemlockRLimitLinuxDefault(t *testing.T) {
+	got := managerMemlockRLimit(false)
+	if got == nil || got.Cur != math.MaxUint64 || got.Max != math.MaxUint64 {
+		t.Fatalf("managerMemlockRLimit(false) = %#v, want unlimited", got)
+	}
+}
 
 func TestNewProbe(t *testing.T) {
 	probe, err := NewProbe()

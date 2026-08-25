@@ -26,6 +26,10 @@ type TransactionSummary struct {
 	InputBytes           int64                   `json:"inputBytes"`
 	Transactions         int                     `json:"transactions"`
 	CompleteTransactions int                     `json:"completeTransactions"`
+	OpenTransactions     int                     `json:"openTransactions"`
+	ResetTransactions    int                     `json:"resetTransactions"`
+	OrphanTransactions   int                     `json:"orphanTransactions"`
+	ErrorTransactions    int                     `json:"errorTransactions"`
 	HTTP1Transactions    int                     `json:"http1Transactions"`
 	HTTP2Transactions    int                     `json:"http2Transactions"`
 	GQUICTransactions    int                     `json:"gquicTransactions"`
@@ -43,7 +47,7 @@ type transactionRecord struct {
 	streamID     uint64
 	timestamp    uint64
 	lastSeen     uint64
-	complete     bool
+	state        string
 }
 
 type transactionMetadata struct {
@@ -54,6 +58,7 @@ type transactionMetadata struct {
 	LastSeen     uint64 `json:"lastSeen"`
 	WallTime     string `json:"wallTime"`
 	Complete     bool   `json:"complete"`
+	State        string `json:"state"`
 }
 
 // ReconstructTransactions automatically runs every implemented HTTP
@@ -146,8 +151,17 @@ func ReconstructTransactions(
 		if _, err := writer.Write([]byte{'\n'}); err != nil {
 			return summary, fmt.Errorf("terminate transaction record: %w", err)
 		}
-		if record.complete {
+		switch record.state {
+		case transactionStateComplete:
 			summary.CompleteTransactions++
+		case transactionStateOpen:
+			summary.OpenTransactions++
+		case transactionStateReset:
+			summary.ResetTransactions++
+		case transactionStateOrphan:
+			summary.OrphanTransactions++
+		default:
+			summary.ErrorTransactions++
 		}
 	}
 	summary.Transactions = len(records)
@@ -288,6 +302,14 @@ func readTransactionRecords(
 			return nil, fmt.Errorf(
 				"transaction output is missing protocol provenance")
 		}
+		state := metadata.State
+		if state == "" {
+			if metadata.Complete {
+				state = transactionStateComplete
+			} else {
+				state = transactionStateError
+			}
+		}
 		records = append(records, transactionRecord{
 			raw:          append(json.RawMessage(nil), raw...),
 			protocol:     metadata.Protocol,
@@ -295,7 +317,7 @@ func readTransactionRecords(
 			streamID:     metadata.StreamID,
 			timestamp:    metadata.Timestamp,
 			lastSeen:     metadata.LastSeen,
-			complete:     metadata.Complete,
+			state:        state,
 		})
 	}
 	return records, nil

@@ -26,6 +26,7 @@ func TestReaderStatsSnapshotTracksPerfAndRingbufPressure(t *testing.T) {
 	probe.noteReaderRecord(true, 256)
 	probe.readerStats.lostSamples.Add(3)
 	probe.readerStats.decodeErrors.Add(1)
+	probe.readerStats.incompleteEvents.Add(2)
 
 	stats := probe.ReaderStats()
 	if stats.PerfRecords != 1 || stats.PerfRawBytes != 128 {
@@ -34,7 +35,7 @@ func TestReaderStatsSnapshotTracksPerfAndRingbufPressure(t *testing.T) {
 	if stats.RingbufRecords != 1 || stats.RingbufRawBytes != 256 {
 		t.Fatalf("unexpected ringbuf stats: %#v", stats)
 	}
-	if stats.LostSamples != 3 || stats.DecodeErrors != 1 {
+	if stats.LostSamples != 3 || stats.DecodeErrors != 1 || stats.IncompleteEvents != 2 {
 		t.Fatalf("unexpected loss/error stats: %#v", stats)
 	}
 }
@@ -46,8 +47,9 @@ func TestReaderStatsEventUsesStableJSONContract(t *testing.T) {
 		Final:     true,
 		Timestamp: time.Unix(123, 0).UTC(),
 		ReaderStatsSnapshot: ReaderStatsSnapshot{
-			PerfRecords: 42,
-			LostSamples: 2,
+			PerfRecords:      42,
+			LostSamples:      2,
+			IncompleteEvents: 3,
 		},
 	}
 	if err := event.Validate(); err != nil {
@@ -65,6 +67,7 @@ func TestReaderStatsEventUsesStableJSONContract(t *testing.T) {
 		decoded["probe"] != "openssl" ||
 		decoded["perfRecords"] != float64(42) ||
 		decoded["lostSamples"] != float64(2) ||
+		decoded["incompleteEvents"] != float64(3) ||
 		decoded["final"] != true {
 		t.Fatalf("unexpected JSON: %s", data)
 	}

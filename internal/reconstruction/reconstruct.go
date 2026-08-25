@@ -51,6 +51,8 @@ type Call struct {
 	WallTime      string      `json:"wallTime,omitempty"`
 	Pid           uint32      `json:"pid"`
 	Tid           uint32      `json:"tid"`
+	Uid           uint32      `json:"uid,omitempty"`
+	CGroupID      uint64      `json:"cgroupId,omitempty"`
 	Comm          string      `json:"comm,omitempty"`
 	Direction     string      `json:"direction"`
 	HookID        uint32      `json:"hookId,omitempty"`
@@ -88,6 +90,8 @@ type structuredChunk struct {
 	WallTime     string  `json:"wallTime"`
 	Pid          uint32  `json:"pid"`
 	Tid          uint32  `json:"tid"`
+	Uid          uint32  `json:"uid"`
+	CGroupID     uint64  `json:"cgroupId"`
 	Comm         string  `json:"comm"`
 	Direction    string  `json:"direction"`
 	DataType     int64   `json:"dataType"`
@@ -355,6 +359,8 @@ func compatibleChunk(first, next structuredChunk) error {
 		first.CapturedLen != next.CapturedLen ||
 		first.OriginalLen != next.OriginalLen ||
 		first.Flags != next.Flags ||
+		first.Uid != next.Uid ||
+		first.CGroupID != next.CGroupID ||
 		!equalUint64Pointer(first.StreamOffset, next.StreamOffset) ||
 		!equalBoolPointer(first.Fin, next.Fin) {
 		return fmt.Errorf("conflicting metadata for call %q", callKey(first))
@@ -406,6 +412,8 @@ func (call *activeCall) normalized(complete bool) Call {
 		WallTime:      event.WallTime,
 		Pid:           event.Pid,
 		Tid:           event.Tid,
+		Uid:           event.Uid,
+		CGroupID:      event.CGroupID,
 		Comm:          event.Comm,
 		Direction:     normalizeDirection(event),
 		HookID:        event.HookID,

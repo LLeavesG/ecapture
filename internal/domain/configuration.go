@@ -60,6 +60,11 @@ type Configuration interface {
 
 	SetEventCollectorAddr(addr string)
 
+	// GetRawEventFile returns the optional pre-decode perf/ringbuf archive.
+	GetRawEventFile() string
+
+	SetRawEventFile(path string)
+
 	// GetEventWriter returns the pre-configured event writer (e.g., for ecaptureQ).
 	// Returns nil if no event writer is configured.
 	GetEventWriter() io.Writer

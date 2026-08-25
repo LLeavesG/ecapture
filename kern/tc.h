@@ -24,7 +24,7 @@
 #define ETH_P_8021AD 0x88A8
 #endif
 
-#define TC_PACKET_META_SIZE 64
+#define TC_PACKET_META_SIZE 80
 #define SOCKET_ALLOW 1
 #define TC_UNKNOWN_INCLUDE 0
 #define TC_UNKNOWN_MARK 1
@@ -34,6 +34,7 @@
 #define TC_EVENT_UNKNOWN_FLOW 0x04
 #define TC_EVENT_RAW_IP 0x08
 #define TC_EVENT_VLAN 0x10
+#define TC_EVENT_FRAGMENTED 0x20
 
 const volatile u64 tc_unknown_flow_policy = TC_UNKNOWN_INCLUDE;
 const volatile u64 tc_strict_attribution = 0;
@@ -58,6 +59,15 @@ struct skb_data_event_t {
     u32 direction;
     u64 socket_cookie;
     u64 cgroup_id;
+    u32 captured_len;
+    u32 chunk_offset;
+    u32 chunk_len;
+    u32 chunk_count;
+};
+
+struct skb_data_buffer_t {
+    struct skb_data_event_t event;
+    u8 data[SKB_FRAGMENT_DATA_SIZE];
 };
 
 struct net_id_t {
@@ -89,7 +99,7 @@ struct {
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
     __type(key, u32);
-    __type(value, struct skb_data_event_t);
+    __type(value, struct skb_data_buffer_t);
     __uint(max_entries, 1);
 } skb_data_buffer_heap SEC(".maps");
 
@@ -114,14 +124,38 @@ static __always_inline void get_proc_cmdline(struct task_struct *task, char *cmd
     bpf_probe_read(cmdline, len & (size - 1), (const void *)args_start);
 }
 
-static __always_inline struct skb_data_event_t *make_skb_data_event() {
+static __always_inline struct skb_data_buffer_t *make_skb_data_buffer() {
     u32 zero = 0;
-    struct skb_data_event_t *event =
+    struct skb_data_buffer_t *event =
         bpf_map_lookup_elem(&skb_data_buffer_heap, &zero);
     if (event == NULL) {
         return NULL;
     }
     return event;
+}
+
+static __always_inline int emit_skb_fragment(
+        struct __sk_buff *skb, struct skb_data_buffer_t *buffer,
+        const struct skb_data_event_t *metadata, u32 capture_len,
+        u32 chunk_offset) {
+    if (buffer == NULL || capture_len <= chunk_offset) {
+        return 0;
+    }
+
+    u32 chunk_len = capture_len - chunk_offset;
+    if (chunk_len > SKB_FRAGMENT_DATA_SIZE) {
+        chunk_len = SKB_FRAGMENT_DATA_SIZE;
+    }
+    __builtin_memcpy(&buffer->event, metadata, sizeof(*metadata));
+    buffer->event.chunk_offset = chunk_offset;
+    buffer->event.chunk_len = chunk_len;
+    if (bpf_skb_load_bytes(skb, chunk_offset, buffer->data, chunk_len) < 0) {
+        return -1;
+    }
+
+    u64 output_size = TC_PACKET_META_SIZE + chunk_len;
+    return bpf_perf_event_output(
+        skb, &skb_events, BPF_F_CURRENT_CPU, buffer, output_size);
 }
 
 static __always_inline bool skb_revalidate_data(struct __sk_buff *skb,
@@ -327,12 +361,45 @@ static __always_inline int capture_packets(struct __sk_buff *skb, bool is_ingres
     u32 capture_len = skb->len;
     if (capture_len > SKB_MAX_DATA_SIZE)
         capture_len = SKB_MAX_DATA_SIZE;
+    u32 first_chunk_len = capture_len;
+    if (first_chunk_len > SKB_FIRST_CHUNK_SIZE)
+        first_chunk_len = SKB_FIRST_CHUNK_SIZE;
+
+    event.captured_len = capture_len;
+    event.chunk_offset = 0;
+    event.chunk_len = first_chunk_len;
+    event.chunk_count = 1;
+    if (capture_len > SKB_FIRST_CHUNK_SIZE) {
+        u32 remaining = capture_len - SKB_FIRST_CHUNK_SIZE;
+        event.chunk_count +=
+            (remaining + SKB_FRAGMENT_DATA_SIZE - 1) /
+            SKB_FRAGMENT_DATA_SIZE;
+        event.flags |= TC_EVENT_FRAGMENTED;
+    }
 
     u64 flags = BPF_F_CURRENT_CPU;
-    flags |= (u64)capture_len << 32;
+    flags |= (u64)first_chunk_len << 32;
 
     size_t pkt_size = TC_PACKET_META_SIZE;
     bpf_perf_event_output(skb, &skb_events, flags, &event, pkt_size);
+
+    if (event.chunk_count > 1) {
+        struct skb_data_buffer_t *buffer = make_skb_data_buffer();
+        emit_skb_fragment(skb, buffer, &event, capture_len,
+                          SKB_FIRST_CHUNK_SIZE);
+        emit_skb_fragment(skb, buffer, &event, capture_len,
+                          SKB_FIRST_CHUNK_SIZE + SKB_FRAGMENT_DATA_SIZE);
+        emit_skb_fragment(skb, buffer, &event, capture_len,
+                          SKB_FIRST_CHUNK_SIZE + 2 * SKB_FRAGMENT_DATA_SIZE);
+        emit_skb_fragment(skb, buffer, &event, capture_len,
+                          SKB_FIRST_CHUNK_SIZE + 3 * SKB_FRAGMENT_DATA_SIZE);
+        emit_skb_fragment(skb, buffer, &event, capture_len,
+                          SKB_FIRST_CHUNK_SIZE + 4 * SKB_FRAGMENT_DATA_SIZE);
+        emit_skb_fragment(skb, buffer, &event, capture_len,
+                          SKB_FIRST_CHUNK_SIZE + 5 * SKB_FRAGMENT_DATA_SIZE);
+        emit_skb_fragment(skb, buffer, &event, capture_len,
+                          SKB_FIRST_CHUNK_SIZE + 6 * SKB_FRAGMENT_DATA_SIZE);
+    }
     return TC_ACT_OK;
 }
 

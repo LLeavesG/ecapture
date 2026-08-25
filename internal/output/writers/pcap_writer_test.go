@@ -120,16 +120,16 @@ func TestPcapWriterRegistersRuntimeInterface(t *testing.T) {
 	}
 }
 
-func TestPcapWriterPreservesTruncatedPacketOriginalLength(t *testing.T) {
+func TestPcapWriterWritesComplete65549BytePacket(t *testing.T) {
 	var output bytes.Buffer
 	writer, err := NewPcapWriterInterfaces(
-		&output, 65535, []string{"unit-test-interface"}, "",
+		&output, 256*1024, []string{"unit-test-interface"}, "",
 		logger.New(io.Discard, false),
 	)
 	if err != nil {
 		t.Fatalf("NewPcapWriterInterfaces() error = %v", err)
 	}
-	packet := bytes.Repeat([]byte{0x5a}, 60*1024)
+	packet := bytes.Repeat([]byte{0x5a}, 65549)
 	const originalLength = uint32(65549)
 	if err := writer.WritePacketForInterface(
 		packet, time.Unix(1_800_000_002, 0), 0, false, originalLength,

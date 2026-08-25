@@ -425,12 +425,6 @@ func (c *Config) captureDataHookEnabled(hook ApplicationDataHook) bool {
 	}
 }
 
-// EnabledApplicationDataHooks is kept for callers compiled against the
-// generic hook engine's historical name.
-func (c *Config) EnabledApplicationDataHooks() []ApplicationDataHook {
-	return c.EnabledCaptureDataHooks()
-}
-
 func (c *Config) hasDwarfStackHooks() bool {
 	for _, hook := range c.EnabledCaptureDataHooks() {
 		if hook.StackMode == AppDataStackDWARF {

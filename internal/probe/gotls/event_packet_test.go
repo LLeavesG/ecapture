@@ -17,16 +17,23 @@ package gotls
 import (
 	"bytes"
 	"encoding/binary"
+	stderrors "errors"
 	"testing"
+
+	ecaptureerrors "github.com/gojue/ecapture/internal/errors"
 )
 
-func encodePacketEvent(t *testing.T, packetLen uint32, payload []byte) []byte {
+func encodePacketEvent(
+	t *testing.T, packetLen, capturedLen, offset uint32,
+	payload []byte, chunkCount uint32,
+) []byte {
 	t.Helper()
 	var data bytes.Buffer
 	values := []any{
 		uint64(1234), uint32(7), [TaskCommLen]byte{}, packetLen,
 		uint32(11), uint32(1000), uint32(0), uint32(1),
 		uint64(22), uint64(33),
+		capturedLen, offset, uint32(len(payload)), chunkCount,
 	}
 	for _, value := range values {
 		if err := binary.Write(&data, binary.LittleEndian, value); err != nil {
@@ -37,23 +44,33 @@ func encodePacketEvent(t *testing.T, packetLen uint32, payload []byte) []byte {
 	return data.Bytes()
 }
 
-func TestPacketEventPreservesTruncatedPacketPrefix(t *testing.T) {
-	payload := bytes.Repeat([]byte{0x5a}, 1024)
-	event := &PacketEvent{}
-	if err := event.DecodeFromBytes(encodePacketEvent(t, 65549, payload)); err != nil {
-		t.Fatalf("DecodeFromBytes() error = %v", err)
+func TestPacketEventReassemblesLargePacket(t *testing.T) {
+	packet := bytes.Repeat([]byte{0x5a}, 65549)
+	decoder := &packetEventDecoder{}
+	first := encodePacketEvent(t, 65549, 65549, 0, packet[:60*1024], 2)
+	if event, err := decoder.Decode(nil, first); event != nil ||
+		!stderrors.Is(err, ecaptureerrors.ErrEventNotReady) {
+		t.Fatalf("first Decode() = (%T,%v), want not ready", event, err)
 	}
-	if !bytes.Equal(event.PacketData, payload) {
-		t.Fatalf("captured payload length = %d, want %d", len(event.PacketData), len(payload))
+	tail := encodePacketEvent(t, 65549, 65549, 60*1024, packet[60*1024:], 2)
+	decoded, err := decoder.Decode(nil, tail)
+	if err != nil {
+		t.Fatalf("tail Decode() error = %v", err)
 	}
-	if err := event.Validate(); err != nil {
-		t.Fatalf("Validate() error = %v", err)
+	event, ok := decoded.(*PacketEvent)
+	if !ok {
+		t.Fatalf("decoded event type = %T", decoded)
+	}
+	if !bytes.Equal(event.PacketData, packet) {
+		t.Fatalf("captured payload length = %d, want %d", len(event.PacketData), len(packet))
 	}
 }
 
 func TestPacketEventIgnoresPerfRecordPadding(t *testing.T) {
 	payload := []byte{1, 2, 3, 4}
-	encoded := encodePacketEvent(t, uint32(len(payload)), payload)
+	encoded := encodePacketEvent(
+		t, uint32(len(payload)), uint32(len(payload)), 0, payload, 1,
+	)
 	encoded = append(encoded, bytes.Repeat([]byte{0xff}, 7)...)
 	event := &PacketEvent{}
 	if err := event.DecodeFromBytes(encoded); err != nil {

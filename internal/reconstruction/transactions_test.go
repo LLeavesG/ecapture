@@ -157,6 +157,43 @@ func TestReconstructTransactionsAutoDetectsAndOrdersProtocols(t *testing.T) {
 	}
 }
 
+func TestReconstructTransactionsPreservesOpenCaptureHorizon(t *testing.T) {
+	requestHeaders := encodeHPACKHeaders(t,
+		hpack.HeaderField{Name: ":method", Value: "GET"},
+		hpack.HeaderField{Name: ":scheme", Value: "https"},
+		hpack.HeaderField{Name: ":authority", Value: "open.example.test"},
+		hpack.HeaderField{Name: ":path", Value: "/pending"},
+	)
+	writeBytes := append([]byte(nil), http2ClientPreface...)
+	writeBytes = append(writeBytes, makeHTTP2Frame(
+		http2FrameHeaders,
+		http2FlagEndHeaders|http2FlagEndStream,
+		1,
+		requestHeaders,
+	)...)
+	input := marshalTLSCaptureEvent(t, 10, "WRITE", writeBytes)
+
+	var output bytes.Buffer
+	summary, err := ReconstructTransactions(
+		strings.NewReader(input), &output,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Transactions != 1 || summary.CompleteTransactions != 0 ||
+		summary.OpenTransactions != 1 || summary.OrphanTransactions != 0 ||
+		summary.ErrorTransactions != 0 {
+		t.Fatalf("unexpected summary: %#v output=%s", summary, output.String())
+	}
+	var transaction transactionMetadata
+	if err := json.Unmarshal(output.Bytes(), &transaction); err != nil {
+		t.Fatal(err)
+	}
+	if transaction.Complete || transaction.State != transactionStateOpen {
+		t.Fatalf("open transaction was misclassified: %#v", transaction)
+	}
+}
+
 func withTLSAddress(
 	t *testing.T,
 	line string,

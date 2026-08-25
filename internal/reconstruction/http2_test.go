@@ -168,6 +168,249 @@ func TestReconstructHTTP2FromGenericTLSBoundaryHooks(t *testing.T) {
 	}
 }
 
+func TestReconstructHTTP2PushPromiseWithContinuation(t *testing.T) {
+	requestHeaders := encodeHPACKHeaders(t,
+		hpack.HeaderField{Name: ":method", Value: "GET"},
+		hpack.HeaderField{Name: ":scheme", Value: "https"},
+		hpack.HeaderField{Name: ":authority", Value: "push.example.test"},
+		hpack.HeaderField{Name: ":path", Value: "/index"},
+	)
+	pushedRequestHeaders := encodeHPACKHeaders(t,
+		hpack.HeaderField{Name: ":method", Value: "GET"},
+		hpack.HeaderField{Name: ":scheme", Value: "https"},
+		hpack.HeaderField{Name: ":authority", Value: "push.example.test"},
+		hpack.HeaderField{Name: ":path", Value: "/asset.json"},
+	)
+	responseHeaders := encodeHPACKHeaders(t,
+		hpack.HeaderField{Name: ":status", Value: "200"},
+	)
+
+	writeBytes := append([]byte(nil), http2ClientPreface...)
+	writeBytes = append(writeBytes, makeHTTP2Frame(
+		http2FrameHeaders,
+		http2FlagEndHeaders|http2FlagEndStream,
+		1,
+		requestHeaders,
+	)...)
+
+	split := len(pushedRequestHeaders) / 2
+	promisePayload := []byte{0, 0, 0, 2}
+	promisePayload = append(promisePayload, pushedRequestHeaders[:split]...)
+	readBytes := makeHTTP2Frame(
+		http2FramePushPromise,
+		0,
+		1,
+		promisePayload,
+	)
+	readBytes = append(readBytes, makeHTTP2Frame(
+		http2FrameContinuation,
+		http2FlagEndHeaders,
+		1,
+		pushedRequestHeaders[split:],
+	)...)
+	readBytes = append(readBytes, makeHTTP2Frame(
+		http2FrameHeaders,
+		http2FlagEndHeaders|http2FlagEndStream,
+		1,
+		responseHeaders,
+	)...)
+	readBytes = append(readBytes, makeHTTP2Frame(
+		http2FrameHeaders,
+		http2FlagEndHeaders,
+		2,
+		responseHeaders,
+	)...)
+	readBytes = append(readBytes, makeHTTP2Frame(
+		http2FrameData,
+		http2FlagEndStream,
+		2,
+		[]byte("pushed-body"),
+	)...)
+
+	input := strings.Join([]string{
+		marshalTLSCaptureEvent(t, 100, "WRITE", writeBytes),
+		marshalTLSCaptureEvent(t, 101, "READ", readBytes),
+	}, "\n")
+	var output bytes.Buffer
+	summary, err := ReconstructHTTP2(strings.NewReader(input), &output)
+	if err != nil {
+		t.Fatalf("ReconstructHTTP2() error = %v", err)
+	}
+	if summary.Transactions != 2 || summary.CompleteTransactions != 2 ||
+		summary.HeaderDecodeError != 0 {
+		t.Fatalf("unexpected summary: %#v output=%s", summary, output.String())
+	}
+	decoder := json.NewDecoder(&output)
+	var transactions []HTTP2Transaction
+	for decoder.More() {
+		var transaction HTTP2Transaction
+		if err := decoder.Decode(&transaction); err != nil {
+			t.Fatal(err)
+		}
+		transactions = append(transactions, transaction)
+	}
+	if len(transactions) != 2 || !transactions[0].Complete ||
+		transactions[0].State != transactionStateComplete ||
+		!transactions[1].Complete || transactions[1].StreamID != 2 ||
+		transactions[1].State != transactionStateComplete ||
+		transactions[1].Method != "GET" ||
+		transactions[1].Path != "/asset.json" ||
+		transactions[1].Status != "200" ||
+		string(transactions[1].Response.Body) != "pushed-body" {
+		t.Fatalf("unexpected PUSH_PROMISE transactions: %#v", transactions)
+	}
+}
+
+func TestReconstructHTTP2ClassifiesOpenResetAndOrphan(t *testing.T) {
+	requestHeaders := encodeHPACKHeaders(t,
+		hpack.HeaderField{Name: ":method", Value: "GET"},
+		hpack.HeaderField{Name: ":scheme", Value: "https"},
+		hpack.HeaderField{Name: ":authority", Value: "state.example.test"},
+		hpack.HeaderField{Name: ":path", Value: "/open"},
+	)
+	responseHeaders := encodeHPACKHeaders(t,
+		hpack.HeaderField{Name: ":status", Value: "200"},
+	)
+	writeBytes := append([]byte(nil), http2ClientPreface...)
+	for _, streamID := range []uint32{1, 3} {
+		writeBytes = append(writeBytes, makeHTTP2Frame(
+			http2FrameHeaders,
+			http2FlagEndHeaders|http2FlagEndStream,
+			streamID,
+			requestHeaders,
+		)...)
+	}
+	readBytes := makeHTTP2Frame(
+		http2FrameHeaders,
+		http2FlagEndHeaders|http2FlagEndStream,
+		2,
+		responseHeaders,
+	)
+	readBytes = append(readBytes, makeHTTP2Frame(
+		http2FrameRSTStream,
+		0,
+		3,
+		[]byte{0, 0, 0, 8},
+	)...)
+
+	input := strings.Join([]string{
+		marshalTLSCaptureEvent(t, 100, "WRITE", writeBytes),
+		marshalTLSCaptureEvent(t, 101, "READ", readBytes),
+	}, "\n")
+	var output bytes.Buffer
+	summary, err := ReconstructHTTP2(strings.NewReader(input), &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Transactions != 3 || summary.CompleteTransactions != 0 ||
+		summary.OpenTransactions != 1 || summary.ResetTransactions != 1 ||
+		summary.OrphanTransactions != 1 || summary.ErrorTransactions != 0 {
+		t.Fatalf("unexpected summary: %#v output=%s", summary, output.String())
+	}
+	states := make(map[uint32]string)
+	decoder := json.NewDecoder(&output)
+	for decoder.More() {
+		var transaction HTTP2Transaction
+		if err := decoder.Decode(&transaction); err != nil {
+			t.Fatal(err)
+		}
+		states[transaction.StreamID] = transaction.State
+	}
+	if states[1] != transactionStateOpen ||
+		states[2] != transactionStateOrphan ||
+		states[3] != transactionStateReset {
+		t.Fatalf("unexpected transaction states: %#v", states)
+	}
+}
+
+func TestReconstructHTTP2SplitsReusedSSLAddressAtClientPreface(t *testing.T) {
+	firstRequest := encodeHPACKHeaders(t,
+		hpack.HeaderField{Name: ":method", Value: "GET"},
+		hpack.HeaderField{Name: ":scheme", Value: "https"},
+		hpack.HeaderField{Name: ":authority", Value: "first.example.test"},
+		hpack.HeaderField{Name: ":path", Value: "/first"},
+	)
+	secondRequest := encodeHPACKHeaders(t,
+		hpack.HeaderField{Name: ":method", Value: "POST"},
+		hpack.HeaderField{Name: ":scheme", Value: "https"},
+		hpack.HeaderField{Name: ":authority", Value: "second.example.test"},
+		hpack.HeaderField{Name: ":path", Value: "/second"},
+	)
+	firstResponse := encodeHPACKHeaders(t,
+		hpack.HeaderField{Name: ":status", Value: "200"},
+		hpack.HeaderField{Name: "content-encoding", Value: "gzip"},
+	)
+	secondResponse := encodeHPACKHeaders(t,
+		hpack.HeaderField{Name: ":status", Value: "201"},
+		hpack.HeaderField{Name: "content-type", Value: "application/json"},
+	)
+	requestBytes := func(headers []byte) []byte {
+		result := append([]byte(nil), http2ClientPreface...)
+		return append(result, makeHTTP2Frame(
+			http2FrameHeaders,
+			http2FlagEndHeaders|http2FlagEndStream,
+			1,
+			headers,
+		)...)
+	}
+	responseBytes := func(headers []byte, body []byte) []byte {
+		result := makeHTTP2Frame(
+			http2FrameHeaders,
+			http2FlagEndHeaders,
+			1,
+			headers,
+		)
+		return append(result, makeHTTP2Frame(
+			http2FrameData,
+			http2FlagEndStream,
+			1,
+			body,
+		)...)
+	}
+	input := strings.Join([]string{
+		marshalTLSCaptureEvent(t, 100, "WRITE", requestBytes(firstRequest)),
+		marshalTLSCaptureEvent(t, 101, "READ", responseBytes(
+			firstResponse, []byte("first-body"),
+		)),
+		marshalTLSCaptureEvent(t, 200, "WRITE", requestBytes(secondRequest)),
+		marshalTLSCaptureEvent(t, 201, "READ", responseBytes(
+			secondResponse, []byte("second-body"),
+		)),
+	}, "\n")
+
+	var output bytes.Buffer
+	summary, err := ReconstructHTTP2(strings.NewReader(input), &output)
+	if err != nil {
+		t.Fatalf("ReconstructHTTP2() error = %v", err)
+	}
+	if summary.Connections != 2 || summary.Transactions != 2 ||
+		summary.HeaderDecodeError != 0 {
+		t.Fatalf("unexpected summary: %#v output=%s", summary, output.String())
+	}
+	decoder := json.NewDecoder(&output)
+	var transactions []HTTP2Transaction
+	for decoder.More() {
+		var transaction HTTP2Transaction
+		if err := decoder.Decode(&transaction); err != nil {
+			t.Fatal(err)
+		}
+		transactions = append(transactions, transaction)
+	}
+	if len(transactions) != 2 ||
+		transactions[0].Authority != "first.example.test" ||
+		transactions[0].Path != "/first" ||
+		string(transactions[0].Response.Body) != "first-body" ||
+		transactions[1].Authority != "second.example.test" ||
+		transactions[1].Path != "/second" ||
+		string(transactions[1].Response.Body) != "second-body" ||
+		transactions[0].ConnectionID == transactions[1].ConnectionID ||
+		!strings.HasSuffix(
+			transactions[1].ConnectionID, ":generation:2",
+		) {
+		t.Fatalf("reused SSL address was merged: %#v", transactions)
+	}
+}
+
 func encodeHPACKHeaders(t *testing.T, fields ...hpack.HeaderField) []byte {
 	t.Helper()
 	var buffer bytes.Buffer

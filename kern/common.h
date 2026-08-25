@@ -59,13 +59,19 @@
 #define ETH_P_IP 0x0800 /* Internet Protocol packet        */
 #define ETH_P_IPV6 0x86DD
 /*
- * perf_event_header.size is a u16.  TC's BPF_F_CTXLEN_MASK appends skb bytes
- * to the 64-byte metadata payload in one PERF_RECORD_SAMPLE, so forwarding a
- * 64 KiB GSO/loopback skb can overflow the record boundary and desynchronise
- * the userspace perf reader.  Keep enough headroom for the perf sample
- * headers while retaining almost all ordinary/GSO packet data.
+ * perf_event_header.size is a u16. TC therefore emits a packet prefix that
+ * fits one PERF_RECORD_SAMPLE and moves the remainder through bounded scratch
+ * chunks. Userspace reassembles every chunk before publishing one packet.
+ *
+ * 256 KiB covers ordinary IP packets, Android's 64 KiB GSO skbs and current
+ * BIG TCP defaults while keeping verifier work and per-CPU scratch bounded.
+ * A larger skb is reported as incomplete instead of being presented as an
+ * authoritative truncated PCAP record.
  */
-#define SKB_MAX_DATA_SIZE (60 * 1024)
+#define SKB_FIRST_CHUNK_SIZE (60 * 1024)
+#define SKB_FRAGMENT_DATA_SIZE (30 * 1024)
+#define SKB_MAX_DATA_SIZE (256 * 1024)
+#define SKB_MAX_CHUNKS 8
 
 // .rodata section bug via : https://github.com/gojue/ecapture/issues/39
 

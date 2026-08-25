@@ -29,6 +29,9 @@ type HTTP3TransactionSummary struct {
 	StreamsProcessed     int               `json:"streamsProcessed"`
 	Transactions         int               `json:"transactions"`
 	CompleteTransactions int               `json:"completeTransactions"`
+	OpenTransactions     int               `json:"openTransactions"`
+	OrphanTransactions   int               `json:"orphanTransactions"`
+	ErrorTransactions    int               `json:"errorTransactions"`
 	HeaderBlocks         int               `json:"headerBlocks"`
 	HeaderBlocksDecoded  int               `json:"headerBlocksDecoded"`
 	DynamicBlocksDecoded int               `json:"dynamicBlocksDecoded"`
@@ -39,14 +42,15 @@ type HTTP3TransactionSummary struct {
 }
 
 type HTTP3Message struct {
-	Headers        []HTTP2Header `json:"headers,omitempty"`
-	HeaderBlocks   [][]byte      `json:"headerBlocks,omitempty"`
-	Body           []byte        `json:"body,omitempty"`
-	BodyEncoding   string        `json:"bodyEncoding,omitempty"`
-	HeadersDecoded bool          `json:"headersDecoded"`
-	QPACKMode      string        `json:"qpackMode,omitempty"`
-	EndStream      bool          `json:"endStream"`
-	Errors         []string      `json:"errors,omitempty"`
+	Headers      []HTTP2Header `json:"headers,omitempty"`
+	HeaderBlocks [][]byte      `json:"headerBlocks,omitempty"`
+	Body         []byte        `json:"body,omitempty"`
+	BodyEncoding string        `json:"bodyEncoding,omitempty"`
+	HTTPBodyPresentation
+	HeadersDecoded bool     `json:"headersDecoded"`
+	QPACKMode      string   `json:"qpackMode,omitempty"`
+	EndStream      bool     `json:"endStream"`
+	Errors         []string `json:"errors,omitempty"`
 }
 
 type HTTP3Transaction struct {
@@ -70,6 +74,7 @@ type HTTP3Transaction struct {
 	Request             HTTP3Message `json:"request"`
 	Response            HTTP3Message `json:"response"`
 	Complete            bool         `json:"complete"`
+	State               string       `json:"state"`
 	Errors              []string     `json:"errors,omitempty"`
 }
 
@@ -228,8 +233,34 @@ func ReconstructHTTP3(
 				len(transaction.Request.Errors) == 0 &&
 				len(transaction.Response.Errors) == 0 &&
 				len(transaction.Errors) == 0
-		if transaction.Complete {
+		transaction.State = classifyTransactionState(
+			transaction.Complete,
+			http3MessageObserved(transaction.Request),
+			http3MessageObserved(transaction.Response),
+			false,
+			len(transaction.Request.Errors) != 0 ||
+				len(transaction.Response.Errors) != 0 ||
+				len(transaction.Errors) != 0,
+		)
+		materializeHTTPBody(
+			transaction.Request.Headers,
+			transaction.Request.Body,
+			&transaction.Request.HTTPBodyPresentation,
+		)
+		materializeHTTPBody(
+			transaction.Response.Headers,
+			transaction.Response.Body,
+			&transaction.Response.HTTPBodyPresentation,
+		)
+		switch transaction.State {
+		case transactionStateComplete:
 			summary.CompleteTransactions++
+		case transactionStateOpen:
+			summary.OpenTransactions++
+		case transactionStateOrphan:
+			summary.OrphanTransactions++
+		default:
+			summary.ErrorTransactions++
 		}
 		transactions = append(transactions, *transaction)
 	}

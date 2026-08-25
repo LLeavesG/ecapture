@@ -250,12 +250,17 @@ func parseHTTP3Stream(stream QUICStream) ([]HTTP3Record, bool) {
 		return nil, base.StreamType != nil
 	}
 	first, firstComplete, firstPlausible := parseHTTP3Frame(data[offset:])
-	if !firstPlausible ||
-		(base.StreamType == nil &&
-			(first.frameType != 0 && first.frameType != 1)) {
+	if !firstPlausible {
 		return nil, false
 	}
 	if !firstComplete {
+		// A bidirectional stream is only classified as HTTP/3 once a
+		// request-stream frame is visible. Unknown extension/GREASE frames
+		// are legal before HEADERS, but an incomplete unknown prefix alone
+		// is not enough to distinguish HTTP/3 from arbitrary QUIC data.
+		if base.StreamType == nil && first.frameType != 0 && first.frameType != 1 {
+			return nil, false
+		}
 		record := incompleteHTTP3Record(
 			base, 0, uint64(offset), data[offset:],
 			"incomplete HTTP/3 frame")
@@ -267,6 +272,7 @@ func parseHTTP3Stream(stream QUICStream) ([]HTTP3Record, bool) {
 
 	var records []HTTP3Record
 	index := 0
+	recognized := base.StreamType != nil
 	for offset < len(data) {
 		frame, complete, plausible := parseHTTP3Frame(data[offset:])
 		if !plausible {
@@ -283,6 +289,9 @@ func parseHTTP3Stream(stream QUICStream) ([]HTTP3Record, bool) {
 		record.FrameName = http3FrameTypeName(frame.frameType)
 		record.Length = frame.length
 		record.Complete = complete
+		if frame.frameType == 0 || frame.frameType == 1 {
+			recognized = true
+		}
 		if complete {
 			record.Data = append([]byte(nil), frame.payload...)
 			offset += frame.headerLen + len(frame.payload)
@@ -294,6 +303,9 @@ func parseHTTP3Stream(stream QUICStream) ([]HTTP3Record, bool) {
 		}
 		records = append(records, record)
 		index++
+	}
+	if !recognized {
+		return nil, false
 	}
 	return records, true
 }

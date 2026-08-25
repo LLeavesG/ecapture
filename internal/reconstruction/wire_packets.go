@@ -27,6 +27,7 @@ const wirePacketFlagRawIP = 0x08
 
 type wirePacketKey struct {
 	pid       uint32
+	uid       uint32
 	direction string
 	transport string
 	tuple     string
@@ -48,18 +49,23 @@ type wirePacketRun struct {
 
 type wirePacketFlow struct {
 	key          wirePacketKey
+	canonical    string
 	segments     []wirePacketSegment
 	datagrams    []wirePacketSegment
 	socketCookie uint64
 }
 
 type wirePacketCollector struct {
-	flows map[wirePacketKey]*wirePacketFlow
+	flows         map[wirePacketKey]*wirePacketFlow
+	owners        map[string]uint32
+	inferredFlows int
+	resolved      bool
 }
 
 type structuredPacketEvent struct {
 	Timestamp    uint64 `json:"Timestamp"`
 	Pid          uint32 `json:"Pid"`
+	Uid          uint32 `json:"Uid"`
 	Flags        uint32 `json:"Flags"`
 	Direction    uint8  `json:"Direction"`
 	SocketCookie uint64 `json:"SocketCookie"`
@@ -67,13 +73,16 @@ type structuredPacketEvent struct {
 }
 
 func newWirePacketCollector() *wirePacketCollector {
-	return &wirePacketCollector{flows: make(map[wirePacketKey]*wirePacketFlow)}
+	return &wirePacketCollector{
+		flows:  make(map[wirePacketKey]*wirePacketFlow),
+		owners: make(map[string]uint32),
+	}
 }
 
 func (collector *wirePacketCollector) observe(raw json.RawMessage) {
 	var event structuredPacketEvent
 	if err := json.Unmarshal(raw, &event); err != nil ||
-		event.Timestamp == 0 || event.Pid == 0 || len(event.PacketData) == 0 {
+		event.Timestamp == 0 || len(event.PacketData) == 0 {
 		return
 	}
 
@@ -121,12 +130,29 @@ func (collector *wirePacketCollector) observe(raw json.RawMessage) {
 	default:
 		return
 	}
+	canonical := canonicalWireFlow(
+		transport,
+		srcNetwork.String(),
+		srcPort,
+		dstNetwork.String(),
+		dstPort,
+	)
+	if event.Pid != 0 {
+		const ambiguousOwner = ^uint32(0)
+		owner, found := collector.owners[canonical]
+		if !found {
+			collector.owners[canonical] = event.Pid
+		} else if owner != event.Pid {
+			collector.owners[canonical] = ambiguousOwner
+		}
+	}
 	if len(payload) == 0 {
 		return
 	}
 
 	key := wirePacketKey{
 		pid:       event.Pid,
+		uid:       event.Uid,
 		direction: direction,
 		transport: transport,
 		tuple: fmt.Sprintf(
@@ -139,7 +165,7 @@ func (collector *wirePacketCollector) observe(raw json.RawMessage) {
 	}
 	flow := collector.flows[key]
 	if flow == nil {
-		flow = &wirePacketFlow{key: key}
+		flow = &wirePacketFlow{key: key, canonical: canonical}
 		collector.flows[key] = flow
 	}
 	if event.SocketCookie != 0 {
@@ -158,6 +184,7 @@ func (collector *wirePacketCollector) observe(raw json.RawMessage) {
 }
 
 func (collector *wirePacketCollector) runs() []wirePacketRun {
+	collector.resolveUnknownOwners()
 	var runs []wirePacketRun
 	for _, flow := range collector.flows {
 		if flow.key.transport == "udp" {
@@ -178,6 +205,9 @@ func (collector *wirePacketCollector) runs() []wirePacketRun {
 		if runs[i].key.pid != runs[j].key.pid {
 			return runs[i].key.pid < runs[j].key.pid
 		}
+		if runs[i].key.uid != runs[j].key.uid {
+			return runs[i].key.uid < runs[j].key.uid
+		}
 		if runs[i].key.direction != runs[j].key.direction {
 			return runs[i].key.direction < runs[j].key.direction
 		}
@@ -187,6 +217,51 @@ func (collector *wirePacketCollector) runs() []wirePacketRun {
 		return runs[i].firstSeen < runs[j].firstSeen
 	})
 	return runs
+}
+
+func canonicalWireFlow(
+	transport string,
+	srcIP string,
+	srcPort uint16,
+	dstIP string,
+	dstPort uint16,
+) string {
+	left := fmt.Sprintf("%s:%d", srcIP, srcPort)
+	right := fmt.Sprintf("%s:%d", dstIP, dstPort)
+	if right < left {
+		left, right = right, left
+	}
+	return transport + "|" + left + "|" + right
+}
+
+func (collector *wirePacketCollector) resolveUnknownOwners() {
+	if collector == nil || collector.resolved {
+		return
+	}
+	collector.resolved = true
+	resolved := make(map[wirePacketKey]*wirePacketFlow, len(collector.flows))
+	const ambiguousOwner = ^uint32(0)
+	for _, flow := range collector.flows {
+		key := flow.key
+		if key.pid == 0 {
+			owner := collector.owners[flow.canonical]
+			if owner != 0 && owner != ambiguousOwner {
+				key.pid = owner
+				flow.key = key
+				collector.inferredFlows++
+			}
+		}
+		if existing := resolved[key]; existing != nil {
+			existing.segments = append(existing.segments, flow.segments...)
+			existing.datagrams = append(existing.datagrams, flow.datagrams...)
+			if flow.socketCookie != 0 {
+				existing.socketCookie = flow.socketCookie
+			}
+			continue
+		}
+		resolved[key] = flow
+	}
+	collector.flows = resolved
 }
 
 func assembleTCPPacketRuns(flow *wirePacketFlow) []wirePacketRun {

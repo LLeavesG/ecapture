@@ -112,6 +112,108 @@ func TestCorrelateWirePrefersNetworkVerifiedPacketFlow(t *testing.T) {
 	}
 }
 
+func TestCorrelateWireMatchesSocketBoundaryToPacketFlowByExactContent(t *testing.T) {
+	payload := make([]byte, 192)
+	for i := range payload {
+		payload[i] = byte((i*31 + 7) % 251)
+	}
+
+	var input bytes.Buffer
+	encoder := json.NewEncoder(&input)
+	writeWireEvent(t, encoder, 100, 0, 23, boundarySocketPayload,
+		"WRITE", payload[:80])
+	writeWireEvent(t, encoder, 101, 0, 23, boundarySocketPayload,
+		"WRITE", payload[80:])
+	writeTCPPacketEvent(t, encoder, 102, 1000, payload[:90])
+	writeTCPPacketEvent(t, encoder, 103, 1090, payload[90:])
+
+	var output bytes.Buffer
+	summary, err := CorrelateWire(&input, &output)
+	if err != nil {
+		t.Fatalf("CorrelateWire() error = %v", err)
+	}
+	if summary.SocketStreams != 1 || summary.TLSBIOStreams != 0 ||
+		summary.Matched != 1 || summary.WireVerified != 1 ||
+		summary.Unmatched != 0 {
+		t.Fatalf("unexpected summary: %#v", summary)
+	}
+
+	var correlation WireCorrelation
+	if err := json.NewDecoder(&output).Decode(&correlation); err != nil {
+		t.Fatalf("decode correlation: %v", err)
+	}
+	if correlation.TargetKind != "packet_flow" ||
+		correlation.Method != "exact-socket-payload-content" ||
+		!correlation.NetworkVerified || correlation.Fd != 23 ||
+		correlation.BIOAddr != 0 || correlation.TLSCiphertextBytes != 0 ||
+		correlation.SocketPayloadBytes != len(payload) ||
+		correlation.MatchedBytes != len(payload) {
+		t.Fatalf("unexpected correlation: %#v", correlation)
+	}
+}
+
+func TestCorrelateWireInfersIngressPIDFromExactReverseTuple(t *testing.T) {
+	request := bytes.Repeat([]byte("request-"), 10)
+	response := bytes.Repeat([]byte("response-"), 12)
+
+	var input bytes.Buffer
+	encoder := json.NewEncoder(&input)
+	// A known-owner egress packet establishes the bidirectional socket flow.
+	writeTCPPacketEventWithFlow(t, encoder, 100, 1000, request, 42, 1, false)
+	// TC ingress can lack a current task. Its exact reverse tuple inherits only
+	// the unambiguous owner established above.
+	writeTCPPacketEventWithFlow(t, encoder, 101, 2000, response, 0, 0, true)
+	writeWireEvent(t, encoder, 102, 0, 23, boundarySocketPayload,
+		"READ", response)
+
+	var output bytes.Buffer
+	summary, err := CorrelateWire(&input, &output)
+	if err != nil {
+		t.Fatalf("CorrelateWire() error = %v", err)
+	}
+	if summary.Matched != 1 || summary.WireVerified != 1 ||
+		summary.InferredPacketFlows != 1 {
+		t.Fatalf("unexpected summary: %#v", summary)
+	}
+	var correlation WireCorrelation
+	if err := json.NewDecoder(&output).Decode(&correlation); err != nil {
+		t.Fatal(err)
+	}
+	if correlation.Pid != 42 || correlation.Direction != "READ" ||
+		correlation.MatchedBytes != len(response) ||
+		correlation.Tuple != "10.0.0.2:443->10.0.0.1:12345" {
+		t.Fatalf("unexpected ingress correlation: %#v", correlation)
+	}
+}
+
+func TestCorrelateWireMatchesIngressByUIDWithoutPID(t *testing.T) {
+	response := bytes.Repeat([]byte("uid-response-"), 10)
+	var input bytes.Buffer
+	encoder := json.NewEncoder(&input)
+	writeTCPPacketEventWithFlow(t, encoder, 100, 2000, response, 0, 0, true)
+	writeWireEvent(t, encoder, 101, 0, 23, boundarySocketPayload,
+		"READ", response)
+
+	var output bytes.Buffer
+	summary, err := CorrelateWire(&input, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Matched != 1 || summary.WireVerified != 1 ||
+		summary.InferredPacketFlows != 0 {
+		t.Fatalf("unexpected UID correlation summary: %#v", summary)
+	}
+	var correlation WireCorrelation
+	if err := json.NewDecoder(&output).Decode(&correlation); err != nil {
+		t.Fatal(err)
+	}
+	if correlation.Pid != 42 || correlation.Uid != 10293 ||
+		correlation.Direction != "READ" ||
+		correlation.MatchedBytes != len(response) {
+		t.Fatalf("unexpected UID correlation: %#v", correlation)
+	}
+}
+
 func TestLongestExactWireMatchRejectsShortCoincidence(t *testing.T) {
 	source := bytes.Repeat([]byte{0x41}, wireCorrelationMinimum-1)
 	target := append([]byte{0x00}, source...)
@@ -121,6 +223,25 @@ func TestLongestExactWireMatchRejectsShortCoincidence(t *testing.T) {
 	}
 	if match.length >= wireCorrelationMinimum {
 		t.Fatalf("short match crossed confidence threshold: %#v", match)
+	}
+}
+
+func TestPacketCorrelationAmbiguityRequiresDistinctTuple(t *testing.T) {
+	first := &wirePacketRun{key: wirePacketKey{tuple: "a:1->b:2"}}
+	duplicate := &wirePacketRun{key: wirePacketKey{tuple: "a:1->b:2"}}
+	distinct := &wirePacketRun{key: wirePacketKey{tuple: "a:1->c:3"}}
+	match := wireMatch{length: 128}
+	if packetCorrelationIsAmbiguous([]wirePacketCandidate{
+		{target: first, match: match},
+		{target: duplicate, match: match},
+	}) {
+		t.Fatal("duplicate packets from one tuple were marked ambiguous")
+	}
+	if !packetCorrelationIsAmbiguous([]wirePacketCandidate{
+		{target: first, match: match},
+		{target: distinct, match: match},
+	}) {
+		t.Fatal("equal matches from distinct tuples were not marked ambiguous")
 	}
 }
 
@@ -141,6 +262,7 @@ func writeWireEvent(
 		"boundaryRole": boundaryRole,
 		"timestamp":    timestamp,
 		"pid":          uint32(42),
+		"uid":          uint32(10293),
 		"tid":          uint32(7),
 		"hookId":       hookID,
 		"contextId":    contextID,
@@ -154,6 +276,8 @@ func writeWireEvent(
 	}
 	if boundaryRole == boundaryTLSCiphertext {
 		event["transport"] = "tls"
+	} else if boundaryRole == boundarySocketPayload {
+		event["transport"] = "socket"
 	} else {
 		event["transport"] = "fd"
 	}
@@ -169,7 +293,30 @@ func writeTCPPacketEvent(
 	sequence uint32,
 	payload []byte,
 ) {
+	writeTCPPacketEventWithFlow(
+		t, encoder, timestamp, sequence, payload, 42, 1, false,
+	)
+}
+
+func writeTCPPacketEventWithFlow(
+	t *testing.T,
+	encoder *json.Encoder,
+	timestamp uint64,
+	sequence uint32,
+	payload []byte,
+	pid uint32,
+	direction uint8,
+	reverse bool,
+) {
 	t.Helper()
+	srcIP := net.IP{10, 0, 0, 1}
+	dstIP := net.IP{10, 0, 0, 2}
+	srcPort := layers.TCPPort(12345)
+	dstPort := layers.TCPPort(443)
+	if reverse {
+		srcIP, dstIP = dstIP, srcIP
+		srcPort, dstPort = dstPort, srcPort
+	}
 	ethernet := &layers.Ethernet{
 		SrcMAC:       net.HardwareAddr{0, 1, 2, 3, 4, 5},
 		DstMAC:       net.HardwareAddr{6, 7, 8, 9, 10, 11},
@@ -179,12 +326,12 @@ func writeTCPPacketEvent(
 		Version:  4,
 		TTL:      64,
 		Protocol: layers.IPProtocolTCP,
-		SrcIP:    net.IP{10, 0, 0, 1},
-		DstIP:    net.IP{10, 0, 0, 2},
+		SrcIP:    srcIP,
+		DstIP:    dstIP,
 	}
 	tcp := &layers.TCP{
-		SrcPort: 12345,
-		DstPort: 443,
+		SrcPort: srcPort,
+		DstPort: dstPort,
 		Seq:     sequence,
 		ACK:     true,
 	}
@@ -204,8 +351,9 @@ func writeTCPPacketEvent(
 	}
 	event := map[string]any{
 		"Timestamp":    timestamp,
-		"Pid":          uint32(42),
-		"Direction":    uint8(1),
+		"Pid":          pid,
+		"Uid":          uint32(10293),
+		"Direction":    direction,
 		"SocketCookie": uint64(99),
 		"PacketData":   buffer.Bytes(),
 	}

@@ -3,12 +3,14 @@ module github.com/gojue/ecapture
 go 1.25.12
 
 require (
+	github.com/andybalholm/brotli v1.1.1
 	github.com/cilium/ebpf v0.18.0
 	github.com/gin-gonic/gin v1.10.0
 	github.com/go-delve/delve v1.24.2
 	github.com/gojue/ebpfmanager v0.5.0
 	github.com/google/gopacket v1.1.19
 	github.com/jschwinger233/elibpcap v1.1.0
+	github.com/klauspost/compress v1.18.0
 	github.com/quic-go/qpack v0.6.0
 	github.com/rs/zerolog v1.34.0
 	github.com/shuLhan/go-bindata v4.0.0+incompatible

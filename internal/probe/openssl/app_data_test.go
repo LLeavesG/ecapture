@@ -712,6 +712,9 @@ func TestApplicationDataEventDecode(t *testing.T) {
 		comm,
 		int32(0),
 		uint32(0),
+		uint32(10293),
+		uint32(0),
+		uint64(0x12345678),
 		[AppDataMaxStackDepth]uint64{},
 		payload,
 	}
@@ -748,6 +751,9 @@ func TestApplicationDataEventDecode(t *testing.T) {
 	if event.PerfMonoNs() != 123456 || event.IsTruncated() {
 		t.Fatalf("unexpected event metadata: %#v", event)
 	}
+	if event.Uid != 10293 || event.CGroupID != 0x12345678 {
+		t.Fatalf("process ownership metadata was not preserved: %#v", event)
+	}
 	if event.ContextID != 0x1234 || event.StreamID != 7 ||
 		!event.HasStreamOffset() || event.StreamOffset != 4096 ||
 		!event.HasFin() || !event.IsFin() ||
@@ -782,6 +788,9 @@ func TestApplicationDataEventDecodeCompactPayloadAndStack(t *testing.T) {
 		comm,
 		int32(16),
 		uint32(2),
+		uint32(10293),
+		uint32(0),
+		uint64(0x12345678),
 		stack,
 		[]byte("payload"),
 	}
@@ -829,6 +838,9 @@ func TestApplicationDataEventMarshalJSONIsCompact(t *testing.T) {
 		StreamFlags: AppDataStreamFlagOffsetValid |
 			AppDataStreamFlagFinValid,
 		Pid:          42,
+		Uid:          10293,
+		CGroupID:     0x12345678,
+		ProcessName:  "com.example.app:channel",
 		HookID:       1,
 		Direction:    DataTypeWrite,
 		OriginalLen:  7,
@@ -846,6 +858,9 @@ func TestApplicationDataEventMarshalJSONIsCompact(t *testing.T) {
 	if len(data) > 1000 || !bytes.Contains(data, []byte(`"eventType":"boundary_data"`)) ||
 		!bytes.Contains(data, []byte(`"captureLayer":"transport"`)) ||
 		!bytes.Contains(data, []byte(`"transport":"quic"`)) ||
+		!bytes.Contains(data, []byte(`"processName":"com.example.app:channel"`)) ||
+		!bytes.Contains(data, []byte(`"uid":10293`)) ||
+		!bytes.Contains(data, []byte(`"cgroupId":305419896`)) ||
 		!bytes.Contains(data, []byte(`"data":"cGF5bG9hZA=="`)) ||
 		!bytes.Contains(data, []byte(`"streamId":7`)) ||
 		!bytes.Contains(data, []byte(`"streamOffset":0`)) ||

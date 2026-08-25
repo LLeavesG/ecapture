@@ -183,28 +183,7 @@ func resolvePackageVersion(packageName string) (string, uint64, error) {
 	if err != nil {
 		return "", 0, fmt.Errorf("query Android package %q: %w", packageName, err)
 	}
-	var versionName string
-	var versionCode uint64
-	sc := bufio.NewScanner(strings.NewReader(string(output)))
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		switch {
-		case strings.HasPrefix(line, "versionName="):
-			versionName = strings.TrimSpace(strings.TrimPrefix(line, "versionName="))
-		case strings.HasPrefix(line, "versionCode="):
-			value := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "versionCode=")))
-			if len(value) != 0 {
-				versionCode, _ = strconv.ParseUint(value[0], 10, 64)
-			}
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return "", 0, fmt.Errorf("read Android package version for %q: %w", packageName, err)
-	}
-	if versionName == "" && versionCode == 0 {
-		return "", 0, fmt.Errorf("Android package version for %q not found", packageName)
-	}
-	return versionName, versionCode, nil
+	return parsePackageVersionDump(string(output), packageName)
 }
 
 // detectAndroidVersion reads the Android version from build.prop

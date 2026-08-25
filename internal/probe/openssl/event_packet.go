@@ -22,18 +22,20 @@ import (
 
 	"github.com/gojue/ecapture/internal/domain"
 	"github.com/gojue/ecapture/internal/errors"
+	"github.com/gojue/ecapture/internal/probe/base"
 )
 
 const (
 	TaskCommLen       = 16
 	CmdlineLen        = 256
-	PacketMetadataLen = 64
+	PacketMetadataLen = 80
 
 	PacketFlagAttributed   = 0x01
 	PacketFlagUIDFromSock  = 0x02
 	PacketFlagUnknownFlow  = 0x04
 	PacketFlagRawIP        = 0x08
 	PacketFlagVLAN         = 0x10
+	PacketFlagFragmented   = 0x20
 	PacketDirectionIngress = 0
 	PacketDirectionEgress  = 1
 )
@@ -53,6 +55,9 @@ type PacketEvent struct {
 	Direction      uint32
 	SocketCookie   uint64
 	CGroupID       uint64
+	ChunkOffset    uint32
+	ChunkLen       uint32
+	ChunkCount     uint32
 	PacketData     []byte
 }
 
@@ -119,18 +124,24 @@ func (e *PacketEvent) DecodeFromBytes(data []byte) error {
 	if err = binary.Read(buf, binary.LittleEndian, &e.CGroupID); err != nil {
 		return err
 	}
-	// PacketLen is the original skb length. The kernel deliberately caps the
-	// bytes appended to one perf sample so large GSO/loopback skbs cannot
-	// overflow perf_event_header.size and desynchronise the reader.
-	// cilium/perf may expose up to seven bytes of record-alignment padding
-	// after RawSample. Never treat those bytes as packet data.
-	capturedLength := len(buf.Bytes())
-	if uint64(capturedLength) > uint64(e.PacketLen) {
-		capturedLength = int(e.PacketLen)
+	if err = binary.Read(buf, binary.LittleEndian, &e.CapturedLen); err != nil {
+		return err
 	}
-	tmpData := append([]byte(nil), buf.Bytes()[:capturedLength]...)
-	e.CapturedLen = uint32(len(tmpData))
-	e.PacketData = tmpData
+	if err = binary.Read(buf, binary.LittleEndian, &e.ChunkOffset); err != nil {
+		return err
+	}
+	if err = binary.Read(buf, binary.LittleEndian, &e.ChunkLen); err != nil {
+		return err
+	}
+	if err = binary.Read(buf, binary.LittleEndian, &e.ChunkCount); err != nil {
+		return err
+	}
+	// RawSample can include perf record-alignment padding. ChunkLen is the
+	// kernel-owned byte count and is the only authoritative payload boundary.
+	if uint64(e.ChunkLen) > uint64(len(buf.Bytes())) {
+		return errors.New(errors.ErrCodeEventDecode, "packet fragment payload is shorter than metadata")
+	}
+	e.PacketData = append([]byte(nil), buf.Bytes()[:e.ChunkLen]...)
 	return nil
 }
 
@@ -139,11 +150,25 @@ func (e *PacketEvent) Validate() error {
 	if e.PacketLen == 0 {
 		return errors.New(errors.ErrCodeEventValidation, "packet length is zero")
 	}
+	// Hand-built complete events used by handlers may omit transport metadata.
+	// Normalize only that in-memory form; decoded kernel fragments always carry
+	// explicit nonzero fields.
+	if e.CapturedLen == 0 && e.ChunkLen == 0 && e.ChunkCount == 0 {
+		e.CapturedLen = uint32(len(e.PacketData))
+		e.ChunkLen = e.CapturedLen
+		e.ChunkCount = 1
+	}
 	if len(e.PacketData) == 0 {
 		return errors.New(errors.ErrCodeEventValidation, "captured packet data is empty")
 	}
-	if uint64(len(e.PacketData)) > uint64(e.PacketLen) {
-		return errors.New(errors.ErrCodeEventValidation, "captured packet data exceeds original packet length")
+	if e.CapturedLen > e.PacketLen || uint32(len(e.PacketData)) != e.ChunkLen {
+		return errors.New(errors.ErrCodeEventValidation, "packet fragment lengths are inconsistent")
+	}
+	if e.ChunkCount == 0 || e.ChunkCount > 8 {
+		return errors.New(errors.ErrCodeEventValidation, "packet fragment count is invalid")
+	}
+	if uint64(e.ChunkOffset)+uint64(e.ChunkLen) > uint64(e.CapturedLen) {
+		return errors.New(errors.ErrCodeEventValidation, "packet fragment exceeds captured packet length")
 	}
 	return nil
 }
@@ -189,12 +214,42 @@ func (e *PacketEvent) Clone() domain.Event {
 		Direction:      e.Direction,
 		SocketCookie:   e.SocketCookie,
 		CGroupID:       e.CGroupID,
+		ChunkOffset:    e.ChunkOffset,
+		ChunkLen:       e.ChunkLen,
+		ChunkCount:     e.ChunkCount,
 	}
 	if e.PacketData != nil {
 		clone.PacketData = make([]byte, len(e.PacketData))
 		copy(clone.PacketData, e.PacketData)
 	}
 	return clone
+}
+
+func (e *PacketEvent) packetFragment() base.PacketFragment {
+	return base.PacketFragment{
+		Key: base.PacketFragmentKey{
+			Timestamp:      e.Timestamp,
+			PID:            e.Pid,
+			UID:            e.Uid,
+			InterfaceIndex: e.InterfaceIndex,
+			Direction:      e.Direction,
+			SocketCookie:   e.SocketCookie,
+			CGroupID:       e.CGroupID,
+			PacketLength:   e.PacketLen,
+		},
+		CapturedLength: e.CapturedLen,
+		Offset:         e.ChunkOffset,
+		Length:         e.ChunkLen,
+		Count:          e.ChunkCount,
+		Data:           e.PacketData,
+	}
+}
+
+func (e *PacketEvent) setAssembledPacket(packet []byte) {
+	e.PacketData = packet
+	e.ChunkOffset = 0
+	e.ChunkLen = uint32(len(packet))
+	e.CapturedLen = uint32(len(packet))
 }
 
 // Type returns the event type.

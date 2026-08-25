@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
+	"sort"
 	"strings"
 	"sync"
 
@@ -679,20 +681,12 @@ func (p *Probe) setupManagerPcapNG() error {
 	// cannot be attributed with bpf_get_current_pid_tgid(). Record each
 	// TCP/UDP socket's tuple while sendmsg still runs in the caller's context,
 	// then let both TC directions look it up in network_map.
-	probes = append(probes,
-		&manager.Probe{
-			Section:          "kprobe/tcp_sendmsg",
-			EbpfFuncName:     "tcp_sendmsg",
-			AttachToFuncName: "tcp_sendmsg",
-			UID:              "kprobe_tc_tcp_sendmsg",
-		},
-		&manager.Probe{
-			Section:          "kprobe/udp_sendmsg",
-			EbpfFuncName:     "udp_sendmsg",
-			AttachToFuncName: "udp_sendmsg",
-			UID:              "kprobe_tc_udp_sendmsg",
-		},
-	)
+	useSocketAttribution := !p.config.IsAndroid || kernelSymbolsReadable()
+	probes = append(probes, packetAttributionProbes(useSocketAttribution)...)
+	if !useSocketAttribution {
+		p.Logger().Warn().
+			Msg("kernel symbols are unreadable; continuing without tcp_sendmsg/udp_sendmsg packet attribution probes")
+	}
 
 	// Add TC-related maps for network packet capture
 	maps = append(maps, &manager.Map{Name: "skb_events"})
@@ -727,8 +721,6 @@ func (p *Probe) setupManagerPcapNG() error {
 				_ = keylogWriter.Close()
 				return fmt.Errorf("failed to register keylog handler: %w", err)
 			}
-			// Note: keylogWriter will be closed through keylogHandler.Close() when dispatcher closes
-			// Don't add it to p.closer to avoid double-close
 			p.Logger().Info().Str("keylog_file", keylogFile).Msg("Keylog handler registered for pcapng mode")
 		}
 	}
@@ -764,9 +756,6 @@ func (p *Probe) setupManagerPcapNG() error {
 	}
 	p.pcapWriter = pcapHandler.PcapWriter()
 	p.pcapWriter.SetExpectKeylog(captureKeys)
-	// Note: pcapWriter will be closed through pcapHandler.Close() when dispatcher closes
-	// Don't add it to p.closer to avoid double-close
-	//p.Logger().Info().Str("Writer", pcapWriter.Name()).Msg("Pcap handler registered")
 
 	// Pcapng 的 Keylog writer
 	if captureKeys {
@@ -778,8 +767,6 @@ func (p *Probe) setupManagerPcapNG() error {
 			return fmt.Errorf("failed to register pcapkeylog handler: %w", err)
 		}
 	}
-	// Note: pcapKeylogWriter will be closed through pcapKeylogHandler.Close()
-	// Don't add it to p.closer to avoid double-close
 	p.Logger().Info().Str("pcap_file", pcapFile).Msg("Pcap handler registered")
 	p.Logger().Debug().
 		Str("ifname", p.config.Ifname).
@@ -787,6 +774,61 @@ func (p *Probe) setupManagerPcapNG() error {
 	p.bpfManager = &manager.Manager{
 		Probes: probes,
 		Maps:   maps,
+	}
+	return nil
+}
+
+func packetAttributionProbes(enabled bool) []*manager.Probe {
+	if !enabled {
+		return nil
+	}
+	return []*manager.Probe{
+		{
+			Section:          "kprobe/tcp_sendmsg",
+			EbpfFuncName:     "tcp_sendmsg",
+			AttachToFuncName: "tcp_sendmsg",
+			UID:              "kprobe_tc_tcp_sendmsg",
+		},
+		{
+			Section:          "kprobe/udp_sendmsg",
+			EbpfFuncName:     "udp_sendmsg",
+			AttachToFuncName: "udp_sendmsg",
+			UID:              "kprobe_tc_udp_sendmsg",
+		},
+	}
+}
+
+func kernelSymbolsReadable() bool {
+	file, err := os.Open("/proc/kallsyms")
+	if err != nil {
+		return false
+	}
+	return file.Close() == nil
+}
+
+// cilium/ebpf treats the AttachTo metadata of every Kprobe-typed program as a
+// possible kernel-module symbol. Uprobes share that BPF program type, so on
+// Android devices that hide /proc/kallsyms the collection loader otherwise
+// fails before ebpfmanager attaches the user-space probe. ebpfmanager already
+// owns the real uprobe target in Probe.BinaryPath/AttachToFuncName; clearing
+// the redundant ProgramSpec metadata is safe and avoids the kernel lookup.
+func clearUserProbeKernelAttachTargets(bpfManager *manager.Manager) error {
+	for _, probe := range bpfManager.Probes {
+		if probe == nil || probe.BinaryPath == "" {
+			continue
+		}
+		specs, found, err := bpfManager.GetProgramSpec(probe.GetIdentificationPair())
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		for _, spec := range specs {
+			if spec != nil {
+				spec.AttachTo = ""
+			}
+		}
 	}
 	return nil
 }
@@ -836,45 +878,11 @@ func (p *Probe) setupManagerKeyLog() error {
 		return fmt.Errorf("keylog mode requires keylog file path")
 	}
 
-	opensslPath := p.config.OpensslPath
 	var probes []*manager.Probe
 	var maps []*manager.Map
 	// KEYLOG mode: Master secret extraction probes
-	maps = append(maps, &manager.Map{Name: "mastersecret_events"})
-	p.mapNameToDecoder["mastersecret_events"] = &masterSecretEventDecoder{}
-
-	// Add master secret extraction probes based on OpenSSL version
 	p.Logger().Info().Strs("keylog_hook_funcs", p.config.MasterHookFuncs).Msg("Configuring master secret extraction probes for KeyLog mode")
-	probes = make([]*manager.Probe, 0)
-	if p.config.IsBoringSSL {
-		maps = append(maps, &manager.Map{Name: "bssl_do_handshake_map"})
-		for _, masterFunc := range p.config.MasterHookFuncs {
-			probes = append(probes, &manager.Probe{
-				Section:          "uprobe/bssl_do_handshake",
-				EbpfFuncName:     "uprobe_bssl_do_handshake",
-				AttachToFuncName: masterFunc,
-				BinaryPath:       opensslPath,
-				UID:              fmt.Sprintf("uprobe_bssl_hs_%s", masterFunc),
-			})
-			probes = append(probes, &manager.Probe{
-				Section:          "uretprobe/bssl_do_handshake",
-				EbpfFuncName:     "uretprobe_bssl_do_handshake",
-				AttachToFuncName: masterFunc,
-				BinaryPath:       opensslPath,
-				UID:              fmt.Sprintf("uretprobe_bssl_hs_%s", masterFunc),
-			})
-		}
-	} else {
-		for _, masterFunc := range p.config.MasterHookFuncs {
-			probes = append(probes, &manager.Probe{
-				Section:          "uprobe/SSL_write_key",
-				EbpfFuncName:     "probe_ssl_master_key",
-				AttachToFuncName: masterFunc,
-				BinaryPath:       opensslPath,
-				UID:              fmt.Sprintf("uprobe_smk_%s", masterFunc),
-			})
-		}
-	}
+	probes, maps = p.appendMasterSecretProbes(probes, maps)
 
 	keylogFileWriter, err := writers.NewFileWriter(writers.FileWriterConfig{
 		Path:       keylogFile,
@@ -948,6 +956,17 @@ func (p *Probe) setupManager() error {
 			&manager.Map{Name: relatedUIDMapName},
 		)
 	}
+	if p.config.IsAndroid && !kernelSymbolsReadable() {
+		before := len(p.bpfManager.Probes)
+		p.bpfManager.Probes = probesWithoutKernelSymbols(p.bpfManager.Probes)
+		p.bpfManager.InstructionPatchers = append(
+			p.bpfManager.InstructionPatchers,
+			clearUserProbeKernelAttachTargets,
+		)
+		p.Logger().Warn().
+			Int("excluded_kernel_probes", before-len(p.bpfManager.Probes)).
+			Msg("using Android kallsyms-free uprobe/TC capture path")
+	}
 	p.Logger().Info().
 		Str("openssl_path", p.config.OpensslPath).
 		Str("capture_mode", p.config.CaptureMode).
@@ -960,6 +979,19 @@ func (p *Probe) setupManager() error {
 	}
 
 	return nil
+}
+
+func probesWithoutKernelSymbols(probes []*manager.Probe) []*manager.Probe {
+	kept := make([]*manager.Probe, 0, len(probes))
+	for _, probe := range probes {
+		if probe == nil {
+			continue
+		}
+		if probe.BinaryPath != "" || probe.Ifname != "" {
+			kept = append(kept, probe)
+		}
+	}
+	return kept
 }
 
 func (p *Probe) setupManagerAll() error {
@@ -1281,17 +1313,21 @@ func appendUniqueManagerMaps(dst []*manager.Map, values ...*manager.Map) []*mana
 
 // getManagerOptions returns eBPF manager options.
 func (p *Probe) getManagerOptions() manager.Options {
+	var configuredProbes []*manager.Probe
+	if p.bpfManager != nil {
+		configuredProbes = p.bpfManager.Probes
+	}
 	opts := manager.Options{
 		DefaultKProbeMaxActive: 512,
+		ExcludedEbpfFuncs: excludedUnconfiguredEBPFFunctions(
+			configuredProbes,
+		),
 		VerifierOptions: ebpf.CollectionOptions{
 			Programs: ebpf.ProgramOptions{
 				LogSizeStart: 2097152,
 			},
 		},
-		RLimit: &unix.Rlimit{
-			Cur: math.MaxUint64,
-			Max: math.MaxUint64,
-		},
+		RLimit: managerMemlockRLimit(p.config != nil && p.config.IsAndroid),
 	}
 	pageEntries := uint32(1)
 	deltaEntries := uint32(1)
@@ -1314,6 +1350,16 @@ func (p *Probe) getManagerOptions() manager.Options {
 			MaxEntries: infoEntries,
 			EditorFlag: manager.EditMaxEntries,
 		},
+	}
+	if p.config != nil && p.config.IsAndroid {
+		// Some Android root domains can load BPF maps but deny cilium/ebpf's
+		// feature probe for BPF_F_RDONLY_PROG. Clear the optional loader-side
+		// protection after constants have been rewritten so the real map load
+		// is not rejected on a false "requires >= v5.2" result.
+		opts.MapSpecEditors[".rodata"] = manager.MapSpecEditor{
+			Flags:      0,
+			EditorFlag: manager.EditFlags,
+		}
 	}
 
 	// Add constant editors if kernel supports global variables
@@ -1375,6 +1421,84 @@ func (p *Probe) getManagerOptions() manager.Options {
 	return opts
 }
 
+// managerMemlockRLimit returns nil on modern Android kernels. Android's root
+// shell commonly has a fixed 64 KiB RLIMIT_MEMLOCK hard limit and does not
+// carry CAP_SYS_RESOURCE, so asking ebpfmanager to set infinity fails before it
+// even attempts to load a BPF object. Android kernels used by this capture path
+// account BPF allocations to memcg; leaving the existing rlimit untouched lets
+// the kernel make the authoritative load decision.
+func managerMemlockRLimit(isAndroid bool) *unix.Rlimit {
+	if isAndroid {
+		if kv, err := kernel.HostVersion(); err == nil && kv >= kernel.VersionCode(5, 11, 0) {
+			return nil
+		}
+	}
+	return &unix.Rlimit{Cur: math.MaxUint64, Max: math.MaxUint64}
+}
+
+// excludedUnconfiguredEBPFFunctions prevents the kernel verifier from loading
+// hook families which are not part of the selected capture strategies. A
+// verifier rejection in an unused semantic hook must not prevent the
+// independent TC packet plane from starting for a raw-packet-only profile.
+func excludedUnconfiguredEBPFFunctions(probes []*manager.Probe) []string {
+	enabled := make(map[string]struct{}, len(probes))
+	for _, probe := range probes {
+		if probe != nil && probe.EbpfFuncName != "" {
+			enabled[probe.EbpfFuncName] = struct{}{}
+		}
+	}
+
+	known := []string{
+		base.TcFuncNameIngress,
+		base.TcFuncNameEgress,
+		"tcp_sendmsg",
+		"udp_sendmsg",
+		"probe_entry_SSL_read",
+		"probe_ret_SSL_read",
+		"probe_entry_SSL_write",
+		"probe_ret_SSL_write",
+		"probe_SSL_set_fd",
+		"probe_SSL_provide_quic_data",
+		"probe_connect",
+		"retprobe_connect",
+		"probe_inet_stream_connect",
+		"probe_inet_accept",
+		"retprobe_accept4",
+		"probe_tcp_v4_destroy_sock",
+		"probe_ssl_master_key",
+		"uprobe_bssl_do_handshake",
+		"uretprobe_bssl_do_handshake",
+	}
+	for slot := 0; slot < MaxApplicationHooks; slot++ {
+		known = append(known,
+			fmt.Sprintf("probe_entry_app_data_%d", slot),
+			fmt.Sprintf("probe_ret_app_data_%d", slot),
+		)
+	}
+	for segment := 0; segment < JNIDiscoverySegments; segment++ {
+		known = append(known,
+			fmt.Sprintf("probe_jni_register_natives_%d", segment),
+		)
+	}
+	for _, program := range jniConversionProbePrograms {
+		entry := "probe_jni_" + program.role
+		if program.hasReturn {
+			entry = "probe_entry_jni_" + program.role
+			known = append(known, "probe_return_jni_"+program.role)
+		}
+		known = append(known, entry)
+	}
+
+	excluded := make([]string, 0, len(known))
+	for _, function := range known {
+		if _, found := enabled[function]; !found {
+			excluded = append(excluded, function)
+		}
+	}
+	sort.Strings(excluded)
+	return excluded
+}
+
 func boolToUint64(value bool) uint64 {
 	if value {
 		return 1
@@ -1408,7 +1532,17 @@ func (d *connectDecoder) GetDecoder(_ *ebpf.Map) (domain.Event, bool) {
 }
 
 // packetEventDecoder implements domain.EventDecoder for packet events
-type packetEventDecoder struct{}
+type packetEventDecoder struct {
+	once      sync.Once
+	assembler *base.PacketAssembler
+}
+
+func (d *packetEventDecoder) packetAssembler() *base.PacketAssembler {
+	d.once.Do(func() {
+		d.assembler = base.NewPacketAssembler(base.DefaultPacketAssemblyLimit)
+	})
+	return d.assembler
+}
 
 func (d *packetEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, error) {
 	event := &PacketEvent{}
@@ -1418,7 +1552,19 @@ func (d *packetEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, err
 	if err := event.Validate(); err != nil {
 		return nil, err
 	}
+	packet, ready, err := d.packetAssembler().Add(event.packetFragment())
+	if err != nil {
+		return nil, err
+	}
+	if !ready {
+		return nil, errors.ErrEventNotReady
+	}
+	event.setAssembledPacket(packet)
 	return event, nil
+}
+
+func (d *packetEventDecoder) IncompleteEvents() uint64 {
+	return d.packetAssembler().IncompleteEvents()
 }
 
 func (d *packetEventDecoder) GetDecoder(_ *ebpf.Map) (domain.Event, bool) {
@@ -1469,6 +1615,7 @@ type applicationDataEventDecoder struct {
 	hooks        []ApplicationDataHook
 	resolver     *processModuleResolver
 	moduleBuilds *moduleBuildIDCache
+	processNames *processNameResolver
 }
 
 func (d *applicationDataEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.Event, error) {
@@ -1484,6 +1631,10 @@ func (d *applicationDataEventDecoder) Decode(_ *ebpf.Map, data []byte) (domain.E
 		event.BoundaryRole = hook.BoundaryRole
 		event.UserStackMode = hook.StackMode
 	}
+	if d.processNames == nil {
+		d.processNames = newProcessNameResolver()
+	}
+	event.ProcessName = d.processNames.resolve(event.Pid)
 	if event.UserStackDepth > 0 {
 		if d.resolver == nil {
 			d.resolver = newProcessModuleResolver()

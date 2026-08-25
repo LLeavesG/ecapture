@@ -324,8 +324,33 @@ larger default unless equivalent loss evidence supports a reduction.
 Every perf/ringbuf reader emits a `capture_stats` event after each 4096 records
 and at shutdown. It contains `perfRecords`, `perfRawBytes`, `ringbufRecords`,
 `ringbufRawBytes`, `lostSamples`, `readErrors`, `decodeErrors`, and
-`dispatchErrors`. Absence of a warning is not a zero-loss claim; use the
-structured counters.
+`dispatchErrors`. When `--raw-event-file` is enabled, it also reports
+`rawArchiveErrors`. Stateful packet and stream decoders additionally report
+`incompleteEvents` at shutdown. Absence of a warning is not a zero-loss claim;
+use the final structured counters and require all error/incomplete fields to be
+zero for a complete-capture claim.
+
+TC packet capture preserves GSO/BIG-TCP skbs without relying on the 16-bit perf
+record length for the whole packet. A packet prefix of at most 60 KiB is emitted
+with skb context, followed by bounded 30 KiB records loaded with
+`bpf_skb_load_bytes`; all records carry the same packet identity, total captured
+length, chunk offset, exact chunk length, and chunk count. Userspace accepts
+out-of-order and exact duplicate chunks, but rejects conflicting duplicates,
+overlap, gaps, missing chunks, and packets over the 256 KiB capture ceiling.
+Only a contiguous complete packet reaches PCAPNG. The PCAPNG interface snaplen
+is 256 KiB, and completeness validation must parse every EPB and require
+`captured_len == original_len`; `incompleteEvents: 0` is the independent
+shutdown gate for fragments that never completed.
+
+`--raw-event-file <path>` preserves each perf/ringbuf sample before decoding.
+The file begins with the eight-byte ASCII magic `ECAPRAW1`. Each little-endian
+frame contains: record length (`u32`, excluding itself), format version (`u16`,
+currently 1), source (`u8`: perf=1, ringbuf=2), flags (`u8`, bit 0 means a lost
+sample record), global archive sequence (`u64`), lost-sample count (`u64`), map
+name length (`u16`), reserved (`u16`), raw length (`u32`), then the map name and
+raw bytes. This archive is evidence/replay input; `events.jsonl` remains the
+canonical decoded analysis stream. Concurrent-reader archive sequence records
+userspace write order and must not be presented as kernel trigger order.
 
 `context_arg` and `stream_arg` optionally copy two scalar arguments into every
 event and preserve them across a uretprobe. They are intended for a connection,
@@ -353,6 +378,14 @@ that owns an explicit QUIC STREAM byte offset;
 `stream_byte_offset_offset` and `stream_byte_offset_size` describe the scalar
 inside that object. `fin_arg`, `fin_offset`, and `fin_size` do the same for
 the final flag. Scalar sizes must be 1, 2, 4, or 8 bytes.
+
+On AArch64, the boundary runtime canonicalizes the address used for every
+user-memory read by clearing the top byte. Android allocators and Chromium may
+pass TBI-tagged pointers such as `0xb4...`; passing those values unchanged to
+`bpf_probe_read_user()` can make a live hook silently emit no bytes. This
+normalization applies only to memory addresses. Direct scalar lengths, flags,
+stream IDs, byte offsets, and identity values retain all bits, and profile
+offsets are applied to the canonical object address.
 
 For example, a verified `QuicStream::OnStreamFrame`-shaped private ABI can be
 represented as:
@@ -550,6 +583,16 @@ time, so static, literal, dynamic, wrapped, and initially blocked references
 can be resolved. If capture began after the required SETTINGS or insertion,
 the exact block is retained with an explicit error. None of these decoders
 reverses application-layer encryption.
+
+Unknown extension and GREASE frames before a bidirectional stream's HEADERS are
+preserved and skipped. A later valid HEADERS/DATA frame is still required to
+classify that stream as HTTP/3, so arbitrary QUIC payloads are not guessed.
+
+Standard HTTP `Content-Encoding` is a presentation layer, not application
+encryption. `gzip`, `x-gzip`, `deflate`, Brotli, and Zstandard are decoded in
+reverse coding order into `decodedBody`/`bodyText`, while the exact encoded
+body remains in `body` as base64. Unknown/custom codings remain opaque and are
+never treated as decryptable application data.
 
 `stream transactions` automatically combines HTTP/1.x, HTTP/2, legacy gQUIC,
 and IETF HTTP/3 transactions in capture-time order. Its JSONL output is the exact artifact;

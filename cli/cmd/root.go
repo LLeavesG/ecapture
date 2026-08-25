@@ -171,6 +171,7 @@ func init() {
 	rootCmd.PersistentFlags().Uint64VarP(&globalConf.Uid, "uid", "u", defaultUid, "if uid is 0 then we target all users")
 	rootCmd.PersistentFlags().StringVarP(&globalConf.LoggerAddr, "logaddr", "l", "", "send logs to this server. -l /tmp/ecapture.log or -l ws://127.0.0.1:8090/ecapture or -l tcp://127.0.0.1:8080")
 	rootCmd.PersistentFlags().StringVar(&globalConf.EventCollectorAddr, "eventaddr", "", "the server address that receives the captured event. --eventaddr ws://127.0.0.1:8090/ecapture or tcp://127.0.0.1:8090, default: same as logaddr")
+	rootCmd.PersistentFlags().StringVar(&globalConf.RawEventFile, "raw-event-file", "", "preserve framed perf/ringbuf samples before decoding")
 	rootCmd.PersistentFlags().StringVar(&globalConf.EventFormat, "event-format", config.EventFormatPlain, "captured event encoding: plain, json, or json-pretty")
 	rootCmd.PersistentFlags().StringVar(&globalConf.EcaptureQ, "ecaptureq", "", "listening server, waiting for clients to connect before sending events and logs; false: send directly to the remote server.")
 	rootCmd.PersistentFlags().StringVar(&globalConf.Listen, "listen", configUpdateAddr, "Listens on a port, receives HTTP requests, and is used to update the runtime configuration. default: disabled. e.g. --listen 127.0.0.1:28256")
@@ -259,6 +260,7 @@ func runProbe(probeType factory.ProbeType, probeConfig domain.Configuration) err
 	// output work consistently across commands.
 	probeConfig.SetLoggerAddr(globalConf.LoggerAddr)
 	probeConfig.SetEventCollectorAddr(globalConf.EventCollectorAddr)
+	probeConfig.SetRawEventFile(globalConf.RawEventFile)
 	if setter, ok := probeConfig.(interface{ SetEventFormat(string) }); ok {
 		setter.SetEventFormat(globalConf.EventFormat)
 	}
