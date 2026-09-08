@@ -16,91 +16,66 @@ package upgrade
 
 import (
 	"context"
-	"fmt"
-	"regexp"
-	"strings"
+	"net/http"
+	"net/http/httptest"
 	"testing"
-
-	"golang.org/x/sys/unix"
+	"time"
 )
 
-const urlReleases = "https://api.github.com/repos/gojue"
-const urlReleasesCN = "https://image.cnxct.com"
-const apiReleases string = "/ecapture/releases/latest"
-
 func TestCheckLatest(t *testing.T) {
-	var uname unix.Utsname
-
-	// 调用 uname 系统调用
-	err := unix.Uname(&uname)
-	if err != nil {
-		t.Logf("Upgrader: Error getting uname: %s", err.Error())
-		return
-	}
-
-	var useragent = fmt.Sprintf("eCapture Cli %s %s %s",
-		byteToString(uname.Sysname[:]), // 系统名称
-		byteToString(uname.Release[:]), // 版本号
-		byteToString(uname.Machine[:]), // 机器类型
-	)
-	t.Logf("User-Agent:%d, %s", len(useragent), useragent)
-	//var ver = "linux_arm64:v0.8.8:5.15.0-125-generic"
-	var ver = "ecap_android:v0.8.8:5.15.0-125-generic"
-	ver = "linux_arm64:v0.8.10-20241116-fcddaeb:5.15.0-125-generic"
-	ver = "linux_arm64:v0.9.1:6.5.0-1025-azure"
-	var arch = "amd64"
-	if byteToString(uname.Machine[:]) == "aarch64" {
-		arch = "arm64"
-	}
-
-	rex := regexp.MustCompile(`([^:]*):v?(\d+\.\d+\.\d+)[^:]*:[^:]*`)
-
-	verMatch := rex.FindStringSubmatch(ver)
-	if len(verMatch) <= 2 {
-		t.Fatalf("Error matching version: %s", ver)
-		return
-	}
-	t.Logf("match Version: %v", verMatch)
-	var os = "linux"
-	if strings.Contains(verMatch[1], "ecap_android") {
-		os = "android"
-	}
-
-	githubResp, err := GetLatestVersion(useragent, fmt.Sprintf("%s%s?ver=%s", urlReleases, apiReleases, ver), context.Background())
-	if err != nil {
-		t.Fatalf("Error getting latest version: %s", err.Error())
-	}
-
-	t.Logf("Latest version: %v", githubResp.TagName)
-	comp, err := CheckVersion(verMatch[2], githubResp.TagName)
-	if err != nil {
-		t.Fatalf("Error checking version: %s", err.Error())
-	}
-	t.Logf("Version comparison: %v", comp)
-
-	if comp >= 0 {
-		t.Logf("Local version is ahead of latest version")
-		return
-	}
-
-	t.Logf("Local version is behind latest version")
-
-	//       "name": "ecapture-v0.8.12-android-amd64.tar.gz",
-	var targetAsset = fmt.Sprintf("ecapture-%s-%s-%s.tar.gz", githubResp.TagName, os, arch)
-	t.Logf("Target asset: %s", targetAsset)
-	for _, asset := range githubResp.Assets {
-		if asset.Name == targetAsset {
-			t.Logf("Found target asset, downloadUrl:%s", asset.BrowserDownloadURL)
-			break
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("User-Agent") != "ecapture-test" || r.Header.Get("Accept") != "application/json" {
+			t.Error("release request is missing its API headers")
 		}
-		//t.Logf("Asset: %s", asset.Name)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"tag_name":"v0.9.2","assets":[{"name":"ecapture-v0.9.2-linux-amd64.tar.gz","browser_download_url":"https://example.test/release.tar.gz"}]}`))
+	}))
+	defer server.Close()
+	release, err := GetLatestVersion("ecapture-test", server.URL, context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if release.TagName != "v0.9.2" || len(release.Assets) != 1 || release.Assets[0].BrowserDownloadURL != "https://example.test/release.tar.gz" {
+		t.Fatalf("unexpected release: %+v", release)
+	}
+	if comparison, err := CheckVersion("v0.9.1", release.TagName); err != nil || comparison >= 0 {
+		t.Fatalf("expected an upgrade, comparison=%d error=%v", comparison, err)
 	}
 }
 
-func byteToString(b []byte) string {
-	n := 0
-	for n < len(b) && b[n] != 0 {
-		n++
+func TestInvalidReleaseURLReturnsError(t *testing.T) {
+	if _, err := GetLatestVersion("ecapture-test", "://invalid", context.Background()); err == nil {
+		t.Fatal("invalid URL was accepted")
 	}
-	return string(b[:n])
+}
+
+func TestReleaseErrorClosesResponseBody(t *testing.T) {
+	closed := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(closed)
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := GetLatestVersion("ecapture-test", server.URL, ctx); err == nil {
+		t.Fatal("HTTP error was accepted")
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("error response body was left open")
+	}
+}
+
+func TestInvalidReleaseJSONReturnsError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("not JSON"))
+	}))
+	defer server.Close()
+	if _, err := GetLatestVersion("ecapture-test", server.URL, context.Background()); err == nil {
+		t.Fatal("invalid JSON was accepted")
+	}
 }

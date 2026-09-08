@@ -23,6 +23,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	ecerrors "github.com/gojue/ecapture/internal/errors"
 )
 
 /*
@@ -72,13 +74,17 @@ func CheckVersion(localVer, remoteVer string) (int, error) {
 // makeGithubRequest 执行一个 HTTP GET 请求到 GitHub API
 func makeGithubRequest(ctx context.Context, ua, url string, output any) error {
 	transport := &http.Transport{Proxy: http.ProxyFromEnvironment}
+	defer transport.CloseIdleConnections()
 
 	client := &http.Client{
 		Timeout:   3 * time.Second,
 		Transport: transport,
 	}
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return ecerrors.Wrap(ecerrors.ErrCodeConfigValidation, "invalid release API request", err)
+	}
 
 	req.Header.Add("Accept", "application/json") // gh api recommendation , send header with api version
 	req.Header.Set("User-Agent", ua)             // eCapture Cli Linux 5.15.0-125-generic aarch64
@@ -88,12 +94,11 @@ func makeGithubRequest(ctx context.Context, ua, url string, output any) error {
 		return fmt.Errorf("API request failed: %w", err)
 	}
 
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusOK {
 		//lint:ignore ST1005 Github is a proper capitalized noun
-		return fmt.Errorf("API request failed, statusCOde: %s", response.Status)
+		return fmt.Errorf("API request failed, status code: %s", response.Status)
 	}
-
-	defer func() { _ = response.Body.Close() }()
 
 	data, err := io.ReadAll(response.Body)
 	if err != nil {

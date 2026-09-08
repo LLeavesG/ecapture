@@ -32,48 +32,50 @@ const (
 )
 
 type HTTP1Summary struct {
-	Reconstruction        Summary `json:"reconstruction"`
-	CallsProcessed        int     `json:"callsProcessed"`
-	Connections           int     `json:"connections"`
-	RecognizedConnections int     `json:"recognizedConnections"`
-	Requests              int     `json:"requests"`
-	Responses             int     `json:"responses"`
-	Transactions          int     `json:"transactions"`
-	CompleteTransactions  int     `json:"completeTransactions"`
-	OpenTransactions      int     `json:"openTransactions"`
-	OrphanTransactions    int     `json:"orphanTransactions"`
-	ErrorTransactions     int     `json:"errorTransactions"`
-	ParseErrors           int     `json:"parseErrors"`
+	InferredProtocolSegments int     `json:"inferredProtocolSegments"`
+	Reconstruction           Summary `json:"reconstruction"`
+	CallsProcessed           int     `json:"callsProcessed"`
+	Connections              int     `json:"connections"`
+	RecognizedConnections    int     `json:"recognizedConnections"`
+	Requests                 int     `json:"requests"`
+	Responses                int     `json:"responses"`
+	Transactions             int     `json:"transactions"`
+	CompleteTransactions     int     `json:"completeTransactions"`
+	OpenTransactions         int     `json:"openTransactions"`
+	OrphanTransactions       int     `json:"orphanTransactions"`
+	ErrorTransactions        int     `json:"errorTransactions"`
+	ParseErrors              int     `json:"parseErrors"`
 }
 
 type HTTP1Transaction struct {
-	EventType       string       `json:"eventType"`
-	Protocol        string       `json:"protocol"`
-	CaptureLayer    string       `json:"captureLayer"`
-	Transport       string       `json:"transport"`
-	ConnectionID    string       `json:"connectionId"`
-	StreamID        uint64       `json:"streamId"`
-	StreamIDSource  string       `json:"streamIdSource"`
-	Pid             uint32       `json:"pid"`
-	SSLAddr         uint64       `json:"sslAddr,omitempty"`
-	BIOAddr         uint64       `json:"bioAddr,omitempty"`
-	Fd              uint32       `json:"fd,omitempty"`
-	Timestamp       uint64       `json:"timestamp"`
-	LastSeen        uint64       `json:"lastSeen"`
-	WallTime        string       `json:"wallTime,omitempty"`
-	Method          string       `json:"method,omitempty"`
-	Scheme          string       `json:"scheme,omitempty"`
-	SchemeInferred  bool         `json:"schemeInferred,omitempty"`
-	Authority       string       `json:"authority,omitempty"`
-	Path            string       `json:"path,omitempty"`
-	Status          string       `json:"status,omitempty"`
-	RequestVersion  string       `json:"requestVersion,omitempty"`
-	ResponseVersion string       `json:"responseVersion,omitempty"`
-	Request         HTTP2Message `json:"request"`
-	Response        HTTP2Message `json:"response"`
-	Complete        bool         `json:"complete"`
-	State           string       `json:"state"`
-	Errors          []string     `json:"errors,omitempty"`
+	ConnectionGenerationSource string       `json:"connectionGenerationSource,omitempty"`
+	EventType                  string       `json:"eventType"`
+	Protocol                   string       `json:"protocol"`
+	CaptureLayer               string       `json:"captureLayer"`
+	Transport                  string       `json:"transport"`
+	ConnectionID               string       `json:"connectionId"`
+	StreamID                   uint64       `json:"streamId"`
+	StreamIDSource             string       `json:"streamIdSource"`
+	Pid                        uint32       `json:"pid"`
+	SSLAddr                    uint64       `json:"sslAddr,omitempty"`
+	BIOAddr                    uint64       `json:"bioAddr,omitempty"`
+	Fd                         uint32       `json:"fd,omitempty"`
+	Timestamp                  uint64       `json:"timestamp"`
+	LastSeen                   uint64       `json:"lastSeen"`
+	WallTime                   string       `json:"wallTime,omitempty"`
+	Method                     string       `json:"method,omitempty"`
+	Scheme                     string       `json:"scheme,omitempty"`
+	SchemeInferred             bool         `json:"schemeInferred,omitempty"`
+	Authority                  string       `json:"authority,omitempty"`
+	Path                       string       `json:"path,omitempty"`
+	Status                     string       `json:"status,omitempty"`
+	RequestVersion             string       `json:"requestVersion,omitempty"`
+	ResponseVersion            string       `json:"responseVersion,omitempty"`
+	Request                    HTTP2Message `json:"request"`
+	Response                   HTTP2Message `json:"response"`
+	Complete                   bool         `json:"complete"`
+	State                      string       `json:"state"`
+	Errors                     []string     `json:"errors,omitempty"`
 }
 
 type http1Span struct {
@@ -88,16 +90,17 @@ type http1DirectionCapture struct {
 }
 
 type http1ConnectionCapture struct {
-	id        string
-	pid       uint32
-	sslAddr   uint64
-	bioAddr   uint64
-	fd        uint32
-	wallTime  string
-	wallStamp uint64
-	write     http1DirectionCapture
-	read      http1DirectionCapture
-	tooLarge  bool
+	generationSource string
+	id               string
+	pid              uint32
+	sslAddr          uint64
+	bioAddr          uint64
+	fd               uint32
+	wallTime         string
+	wallStamp        uint64
+	write            http1DirectionCapture
+	read             http1DirectionCapture
+	tooLarge         bool
 }
 
 type parsedHTTP1Request struct {
@@ -140,31 +143,10 @@ func ReconstructHTTP1(
 	}
 	summary.Reconstruction = callSummary
 
-	connections := make(map[string]*http1ConnectionCapture)
-	for _, call := range calls {
-		key := http2ConnectionKey(call)
-		connection := connections[key]
-		if connection == nil {
-			connection = &http1ConnectionCapture{
-				id:        key,
-				pid:       call.Pid,
-				sslAddr:   call.SSLAddr,
-				bioAddr:   call.BIOAddr,
-				fd:        call.Fd,
-				wallTime:  call.WallTime,
-				wallStamp: call.Timestamp,
-			}
-			connections[key] = connection
-		}
-		direction := &connection.read
-		if strings.EqualFold(call.Direction, "WRITE") {
-			direction = &connection.write
-		}
-		if !direction.append(call) {
-			connection.tooLarge = true
-		}
-		summary.CallsProcessed++
-	}
+	connections, inferred := collectHTTP1ProtocolSegments(calls)
+	summary.InferredProtocolSegments = inferred
+	summary.CallsProcessed = len(calls)
+
 	summary.Connections = len(connections)
 
 	keys := make([]string, 0, len(connections))
@@ -203,17 +185,18 @@ func ReconstructHTTP1(
 		}
 		for index := 0; index < count; index++ {
 			transaction := HTTP1Transaction{
-				EventType:      "http_transaction",
-				Protocol:       "http1",
-				CaptureLayer:   captureLayerTransport,
-				Transport:      "tls",
-				ConnectionID:   connection.id,
-				StreamID:       uint64(index + 1),
-				StreamIDSource: "synthetic-http1-sequence",
-				Pid:            connection.pid,
-				SSLAddr:        connection.sslAddr,
-				BIOAddr:        connection.bioAddr,
-				Fd:             connection.fd,
+				ConnectionGenerationSource: connection.generationSource,
+				EventType:                  "http_transaction",
+				Protocol:                   "http1",
+				CaptureLayer:               captureLayerTransport,
+				Transport:                  "tls",
+				ConnectionID:               connection.id,
+				StreamID:                   uint64(index + 1),
+				StreamIDSource:             "synthetic-http1-sequence",
+				Pid:                        connection.pid,
+				SSLAddr:                    connection.sslAddr,
+				BIOAddr:                    connection.bioAddr,
+				Fd:                         connection.fd,
 			}
 			if index < len(requests) {
 				request := requests[index]

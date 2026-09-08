@@ -30,46 +30,48 @@ import (
 const maxWebSocketPayloadBytes = 64 * 1024 * 1024
 
 type WebSocketSummary struct {
-	Reconstruction     Summary `json:"reconstruction"`
-	CallsProcessed     int     `json:"callsProcessed"`
-	Connections        int     `json:"connections"`
-	UpgradeConnections int     `json:"upgradeConnections"`
-	Frames             int     `json:"frames"`
-	Messages           int     `json:"messages"`
-	CompleteRecords    int     `json:"completeRecords"`
-	ControlFrames      int     `json:"controlFrames"`
-	IncompleteRecords  int     `json:"incompleteRecords"`
-	ParseErrors        int     `json:"parseErrors"`
-	OpaqueBytes        int     `json:"opaqueBytes"`
+	InferredProtocolSegments int     `json:"inferredProtocolSegments"`
+	Reconstruction           Summary `json:"reconstruction"`
+	CallsProcessed           int     `json:"callsProcessed"`
+	Connections              int     `json:"connections"`
+	UpgradeConnections       int     `json:"upgradeConnections"`
+	Frames                   int     `json:"frames"`
+	Messages                 int     `json:"messages"`
+	CompleteRecords          int     `json:"completeRecords"`
+	ControlFrames            int     `json:"controlFrames"`
+	IncompleteRecords        int     `json:"incompleteRecords"`
+	ParseErrors              int     `json:"parseErrors"`
+	OpaqueBytes              int     `json:"opaqueBytes"`
 }
 
 type WebSocketMessage struct {
-	EventType       string   `json:"eventType"`
-	Protocol        string   `json:"protocol"`
-	CaptureLayer    string   `json:"captureLayer"`
-	Transport       string   `json:"transport"`
-	ConnectionID    string   `json:"connectionId"`
-	Sequence        uint64   `json:"sequence"`
-	Direction       string   `json:"direction"`
-	Pid             uint32   `json:"pid"`
-	SSLAddr         uint64   `json:"sslAddr,omitempty"`
-	BIOAddr         uint64   `json:"bioAddr,omitempty"`
-	Fd              uint32   `json:"fd,omitempty"`
-	Timestamp       uint64   `json:"timestamp"`
-	LastSeen        uint64   `json:"lastSeen"`
-	WallTime        string   `json:"wallTime,omitempty"`
-	Authority       string   `json:"authority,omitempty"`
-	Path            string   `json:"path,omitempty"`
-	Opcode          uint8    `json:"opcode"`
-	OpcodeName      string   `json:"opcodeName"`
-	FrameCount      int      `json:"frameCount"`
-	Masked          bool     `json:"masked"`
-	Compressed      bool     `json:"compressed,omitempty"`
-	PayloadEncoding string   `json:"payloadEncoding"`
-	Payload         []byte   `json:"payload"`
-	Complete        bool     `json:"complete"`
-	RawFrame        bool     `json:"rawFrame,omitempty"`
-	Errors          []string `json:"errors,omitempty"`
+	ConnectionGenerationSource string   `json:"connectionGenerationSource,omitempty"`
+	EventType                  string   `json:"eventType"`
+	Protocol                   string   `json:"protocol"`
+	CaptureLayer               string   `json:"captureLayer"`
+	Transport                  string   `json:"transport"`
+	ConnectionID               string   `json:"connectionId"`
+	Sequence                   uint64   `json:"sequence"`
+	Direction                  string   `json:"direction"`
+	Pid                        uint32   `json:"pid"`
+	SSLAddr                    uint64   `json:"sslAddr,omitempty"`
+	BIOAddr                    uint64   `json:"bioAddr,omitempty"`
+	Fd                         uint32   `json:"fd,omitempty"`
+	Timestamp                  uint64   `json:"timestamp"`
+	LastSeen                   uint64   `json:"lastSeen"`
+	WallTime                   string   `json:"wallTime,omitempty"`
+	Authority                  string   `json:"authority,omitempty"`
+	Path                       string   `json:"path,omitempty"`
+	Opcode                     uint8    `json:"opcode"`
+	OpcodeName                 string   `json:"opcodeName"`
+	FrameCount                 int      `json:"frameCount"`
+	Masked                     bool     `json:"masked"`
+	Compressed                 bool     `json:"compressed,omitempty"`
+	PayloadEncoding            string   `json:"payloadEncoding"`
+	Payload                    []byte   `json:"payload"`
+	Complete                   bool     `json:"complete"`
+	RawFrame                   bool     `json:"rawFrame,omitempty"`
+	Errors                     []string `json:"errors,omitempty"`
 }
 
 type webSocketUpgrade struct {
@@ -116,31 +118,10 @@ func ReconstructWebSocket(
 	}
 	summary.Reconstruction = callSummary
 
-	connections := make(map[string]*http1ConnectionCapture)
-	for _, call := range calls {
-		key := http2ConnectionKey(call)
-		connection := connections[key]
-		if connection == nil {
-			connection = &http1ConnectionCapture{
-				id:        key,
-				pid:       call.Pid,
-				sslAddr:   call.SSLAddr,
-				bioAddr:   call.BIOAddr,
-				fd:        call.Fd,
-				wallTime:  call.WallTime,
-				wallStamp: call.Timestamp,
-			}
-			connections[key] = connection
-		}
-		direction := &connection.read
-		if strings.EqualFold(call.Direction, "WRITE") {
-			direction = &connection.write
-		}
-		if !direction.append(call) {
-			connection.tooLarge = true
-		}
-		summary.CallsProcessed++
-	}
+	connections, inferred := collectHTTP1ProtocolSegments(calls)
+	summary.InferredProtocolSegments = inferred
+	summary.CallsProcessed = len(calls)
+
 	summary.Connections = len(connections)
 
 	keys := make([]string, 0, len(connections))
@@ -610,18 +591,19 @@ func newWebSocketRecord(
 		eventType = "websocket_opaque"
 	}
 	return WebSocketMessage{
-		EventType:    eventType,
-		Protocol:     "websocket",
-		CaptureLayer: captureLayerTransport,
-		Transport:    "tls",
-		ConnectionID: connection.id,
-		Direction:    direction,
-		Pid:          connection.pid,
-		SSLAddr:      connection.sslAddr,
-		BIOAddr:      connection.bioAddr,
-		Fd:           connection.fd,
-		Timestamp:    timestamp,
-		LastSeen:     lastSeen,
+		EventType:                  eventType,
+		Protocol:                   "websocket",
+		CaptureLayer:               captureLayerTransport,
+		Transport:                  "tls",
+		ConnectionID:               connection.id,
+		ConnectionGenerationSource: connection.generationSource,
+		Direction:                  direction,
+		Pid:                        connection.pid,
+		SSLAddr:                    connection.sslAddr,
+		BIOAddr:                    connection.bioAddr,
+		Fd:                         connection.fd,
+		Timestamp:                  timestamp,
+		LastSeen:                   lastSeen,
 		WallTime: wallTimeAt(
 			connection.wallTime,
 			connection.wallStamp,

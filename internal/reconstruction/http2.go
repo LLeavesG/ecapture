@@ -80,30 +80,31 @@ type HTTP2Message struct {
 }
 
 type HTTP2Transaction struct {
-	EventType    string       `json:"eventType"`
-	Protocol     string       `json:"protocol"`
-	CaptureLayer string       `json:"captureLayer"`
-	Transport    string       `json:"transport"`
-	ConnectionID string       `json:"connectionId"`
-	ContextID    uint64       `json:"contextId,omitempty"`
-	StreamID     uint32       `json:"streamId"`
-	Pid          uint32       `json:"pid"`
-	SSLAddr      uint64       `json:"sslAddr,omitempty"`
-	BIOAddr      uint64       `json:"bioAddr,omitempty"`
-	Fd           uint32       `json:"fd,omitempty"`
-	Timestamp    uint64       `json:"timestamp"`
-	LastSeen     uint64       `json:"lastSeen"`
-	WallTime     string       `json:"wallTime,omitempty"`
-	Method       string       `json:"method,omitempty"`
-	Scheme       string       `json:"scheme,omitempty"`
-	Authority    string       `json:"authority,omitempty"`
-	Path         string       `json:"path,omitempty"`
-	Status       string       `json:"status,omitempty"`
-	Request      HTTP2Message `json:"request"`
-	Response     HTTP2Message `json:"response"`
-	Complete     bool         `json:"complete"`
-	State        string       `json:"state"`
-	Errors       []string     `json:"errors,omitempty"`
+	ConnectionGenerationSource string       `json:"connectionGenerationSource,omitempty"`
+	EventType                  string       `json:"eventType"`
+	Protocol                   string       `json:"protocol"`
+	CaptureLayer               string       `json:"captureLayer"`
+	Transport                  string       `json:"transport"`
+	ConnectionID               string       `json:"connectionId"`
+	ContextID                  uint64       `json:"contextId,omitempty"`
+	StreamID                   uint32       `json:"streamId"`
+	Pid                        uint32       `json:"pid"`
+	SSLAddr                    uint64       `json:"sslAddr,omitempty"`
+	BIOAddr                    uint64       `json:"bioAddr,omitempty"`
+	Fd                         uint32       `json:"fd,omitempty"`
+	Timestamp                  uint64       `json:"timestamp"`
+	LastSeen                   uint64       `json:"lastSeen"`
+	WallTime                   string       `json:"wallTime,omitempty"`
+	Method                     string       `json:"method,omitempty"`
+	Scheme                     string       `json:"scheme,omitempty"`
+	Authority                  string       `json:"authority,omitempty"`
+	Path                       string       `json:"path,omitempty"`
+	Status                     string       `json:"status,omitempty"`
+	Request                    HTTP2Message `json:"request"`
+	Response                   HTTP2Message `json:"response"`
+	Complete                   bool         `json:"complete"`
+	State                      string       `json:"state"`
+	Errors                     []string     `json:"errors,omitempty"`
 }
 
 type http2Frame struct {
@@ -121,20 +122,21 @@ type http2StreamState struct {
 }
 
 type http2ConnectionState struct {
-	id        string
-	protocol  string
-	transport string
-	pid       uint32
-	contextID uint64
-	sslAddr   uint64
-	bioAddr   uint64
-	fd        uint32
-	wallTime  string
-	wallStamp uint64
-	streams   map[uint32]*http2StreamState
-	write     *http2DirectionState
-	read      *http2DirectionState
-	summary   *HTTP2Summary
+	clientPrefaceObserved bool
+	id                    string
+	protocol              string
+	transport             string
+	pid                   uint32
+	contextID             uint64
+	sslAddr               uint64
+	bioAddr               uint64
+	fd                    uint32
+	wallTime              string
+	wallStamp             uint64
+	streams               map[uint32]*http2StreamState
+	write                 *http2DirectionState
+	read                  *http2DirectionState
+	summary               *HTTP2Summary
 }
 
 type http2DirectionState struct {
@@ -172,10 +174,11 @@ func ReconstructHTTP2(
 	connections := make(map[string]*http2ConnectionState)
 	activeConnections := make(map[string]*http2ConnectionState)
 	connectionGenerations := make(map[string]int)
-	for _, call := range calls {
-		baseKey := http2ConnectionKey(call)
+	segmentKeys, inferredSegments := http2ProtocolSegmentKeys(calls)
+	for callIndex, call := range calls {
+		baseKey := segmentKeys[callIndex]
 		connection := activeConnections[baseKey]
-		if connection == nil || startsNewHTTP2Connection(call) {
+		if connection == nil || startsNewHTTP2Generation(connection, call) {
 			connectionGenerations[baseKey]++
 			key := http2GenerationKey(
 				baseKey,
@@ -184,6 +187,9 @@ func ReconstructHTTP2(
 			connection = newHTTP2Connection(key, call, &summary)
 			activeConnections[baseKey] = connection
 			connections[key] = connection
+			if inferredSegments[baseKey] {
+				inferredSegments[key] = true
+			}
 		}
 		connection.feed(call)
 		summary.CallsProcessed++
@@ -197,6 +203,9 @@ func ReconstructHTTP2(
 				continue
 			}
 			transaction := state.transaction
+			if inferredSegments[connection.id] {
+				transaction.ConnectionGenerationSource = "observed-protocol-boundary"
+			}
 			transaction.Complete = transaction.Request.EndStream &&
 				transaction.Response.EndStream &&
 				transaction.Request.HeadersDecoded &&
@@ -324,6 +333,24 @@ func http2GenerationKey(baseKey string, generation int) string {
 	return fmt.Sprintf("%s:generation:%d", baseKey, generation)
 }
 
+// A client preface inside a DATA payload is ordinary body data even when a TLS
+// read/write call happens to start there. Only an established frame boundary
+// permits a new generation once this connection has synchronized to HTTP/2.
+func startsNewHTTP2Generation(connection *http2ConnectionState, call Call) bool {
+	if !startsNewHTTP2Connection(call) {
+		return false
+	}
+	if !connection.clientPrefaceObserved {
+		return true
+	}
+	for _, direction := range []*http2DirectionState{connection.write, connection.read} {
+		if len(direction.buffer) != 0 || direction.pendingStream != 0 || len(direction.pendingBlock) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func startsNewHTTP2Connection(call Call) bool {
 	if !strings.EqualFold(call.Direction, "WRITE") || len(call.Data) == 0 {
 		return false
@@ -352,6 +379,7 @@ func (state *http2DirectionState) feed(data []byte, timestamp uint64) {
 		if len(state.buffer) >= len(http2ClientPreface) &&
 			bytes.HasPrefix(state.buffer, http2ClientPreface) {
 			state.buffer = state.buffer[len(http2ClientPreface):]
+			state.connection.clientPrefaceObserved = true
 			state.synchronized = true
 		}
 		state.prefaceProcessed = true
