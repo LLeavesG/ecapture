@@ -39,7 +39,7 @@ func TestApplicationDataHookOutputLength(t *testing.T) {
 	hook := profile.DataHooks[0]
 	config := hook.bpfConfig()
 	if config.Flags != appDataFlagLengthOutput|appDataFlagCaptureReturn ||
-		config.ReturnSuccessValue != 1 || config.LengthArg != 4 || config.LengthSize != 8 || binary.Size(config) != 136 {
+		config.ReturnSuccessValue != 1 || config.LengthArg != 4 || config.LengthSize != 8 || binary.Size(config) != 152 {
 		t.Fatalf("incorrect output-length config: %+v", config)
 	}
 	for _, change := range []func(*ApplicationDataHook){
@@ -54,6 +54,17 @@ func TestApplicationDataHookOutputLength(t *testing.T) {
 		if err := profile.Validate(); err == nil {
 			t.Fatalf("invalid output-length hook accepted: %+v", profile.DataHooks[0])
 		}
+	}
+}
+
+func TestApplicationDataHookConnectionIdentityConfig(t *testing.T) {
+	hook := ApplicationDataHook{ContextArg: 1, ContextSize: 8, ContextDerefOffset: 128,
+		ContextGenerationOffset: 72, StreamByteOffsetArg: 2, StreamByteOffsetSize: 8,
+		StreamByteOffsetDerefOffset: 16, FinArg: 3, FinMask: 4}
+	config := hook.bpfConfig()
+	if config.ContextDerefOffset != 128 || config.ContextGenerationOffset != 72 ||
+		config.StreamByteOffsetDerefOffset != 16 || config.FinMask != 4 {
+		t.Fatalf("connection identity fields were lost: %+v", config)
 	}
 }
 
@@ -95,8 +106,8 @@ func TestApplicationDataHookValidationAndBPFConfig(t *testing.T) {
 	}
 
 	got := hook.bpfConfig()
-	if size := binary.Size(got); size != 136 {
-		t.Fatalf("applicationDataBPFConfig size = %d, want 136", size)
+	if size := binary.Size(got); size != 152 {
+		t.Fatalf("applicationDataBPFConfig size = %d, want 152", size)
 	}
 	wantFlags := uint32(appDataFlagBufferIndirect |
 		appDataFlagLengthMemory |
@@ -180,8 +191,8 @@ func TestApplicationDataHookIOVecBPFConfig(t *testing.T) {
 		t.Fatalf("iovec hook was normalized incorrectly: %#v", hook)
 	}
 	got := hook.bpfConfig()
-	if size := binary.Size(got); size != 136 {
-		t.Fatalf("applicationDataBPFConfig size = %d, want 136", size)
+	if size := binary.Size(got); size != 152 {
+		t.Fatalf("applicationDataBPFConfig size = %d, want 152", size)
 	}
 	if got.Flags != appDataFlagBufferIOVec || got.BufferArg != 2 ||
 		got.VectorCountArg != 3 || got.ContextArg != 1 ||

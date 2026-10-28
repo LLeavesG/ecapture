@@ -34,34 +34,38 @@ const (
 // applicationDataBPFConfig must stay byte-for-byte compatible with
 // struct app_hook_config_t in kern/app_data.h.
 type applicationDataBPFConfig struct {
-	BufferArg              uint32
-	LengthArg              uint32
-	Direction              uint32
-	Flags                  uint32
-	BufferOffset           uint64
-	LengthOffset           uint64
-	LengthSize             uint32
-	MaxBytes               uint32
-	StateID                uint32
-	StateKeyArg            uint32
-	ContextArg             uint32
-	StreamArg              uint32
-	VectorCountArg         uint32
-	ReturnSuccessValue     uint32
-	ContextOffset          uint64
-	StreamOffset           uint64
-	ContextSize            uint32
-	StreamSize             uint32
-	VectorStride           uint32
-	VectorBaseOffset       uint32
-	VectorLengthOffset     uint32
-	VectorLengthSize       uint32
-	StreamByteOffsetArg    uint32
-	StreamByteOffsetSize   uint32
-	StreamByteOffsetOffset uint64
-	FinArg                 uint32
-	FinSize                uint32
-	FinOffset              uint64
+	BufferArg                   uint32
+	LengthArg                   uint32
+	Direction                   uint32
+	Flags                       uint32
+	BufferOffset                uint64
+	LengthOffset                uint64
+	LengthSize                  uint32
+	MaxBytes                    uint32
+	StateID                     uint32
+	StateKeyArg                 uint32
+	ContextArg                  uint32
+	StreamArg                   uint32
+	VectorCountArg              uint32
+	ContextDerefOffset          uint32
+	ContextOffset               uint64
+	StreamOffset                uint64
+	ContextSize                 uint32
+	StreamSize                  uint32
+	VectorStride                uint32
+	VectorBaseOffset            uint32
+	VectorLengthOffset          uint32
+	VectorLengthSize            uint32
+	StreamByteOffsetArg         uint32
+	StreamByteOffsetSize        uint32
+	StreamByteOffsetOffset      uint64
+	FinArg                      uint32
+	FinSize                     uint32
+	FinOffset                   uint64
+	ReturnSuccessValue          uint32
+	StreamByteOffsetDerefOffset uint32
+	FinMask                     uint32
+	ContextGenerationOffset     uint32
 }
 
 func (h ApplicationDataHook) bpfConfig() applicationDataBPFConfig {
@@ -122,34 +126,38 @@ func (h ApplicationDataHook) bpfConfig() applicationDataBPFConfig {
 		vectorLengthSize = 8
 	}
 	return applicationDataBPFConfig{
-		ReturnSuccessValue:     h.ReturnSuccessValue,
-		BufferArg:              h.BufferArg,
-		LengthArg:              h.bpfLengthArg(),
-		Direction:              direction,
-		Flags:                  flags,
-		BufferOffset:           uint64(h.BufferOffset),
-		LengthOffset:           uint64(h.LengthOffset),
-		LengthSize:             h.LengthSize,
-		MaxBytes:               h.MaxBytes,
-		StateID:                h.stateID,
-		StateKeyArg:            h.StateKeyArg,
-		ContextArg:             h.ContextArg,
-		StreamArg:              h.StreamArg,
-		VectorCountArg:         h.VectorCountArg,
-		ContextOffset:          uint64(h.ContextOffset),
-		StreamOffset:           uint64(h.StreamOffset),
-		ContextSize:            h.ContextSize,
-		StreamSize:             h.StreamSize,
-		VectorStride:           vectorStride,
-		VectorBaseOffset:       h.VectorBaseOffset,
-		VectorLengthOffset:     vectorLengthOffset,
-		VectorLengthSize:       vectorLengthSize,
-		StreamByteOffsetArg:    h.StreamByteOffsetArg,
-		StreamByteOffsetSize:   h.StreamByteOffsetSize,
-		StreamByteOffsetOffset: uint64(h.StreamByteOffsetOffset),
-		FinArg:                 h.FinArg,
-		FinSize:                h.FinSize,
-		FinOffset:              uint64(h.FinOffset),
+		ReturnSuccessValue:          h.ReturnSuccessValue,
+		StreamByteOffsetDerefOffset: h.StreamByteOffsetDerefOffset,
+		BufferArg:                   h.BufferArg,
+		LengthArg:                   h.bpfLengthArg(),
+		Direction:                   direction,
+		Flags:                       flags,
+		BufferOffset:                uint64(h.BufferOffset),
+		LengthOffset:                uint64(h.LengthOffset),
+		LengthSize:                  h.LengthSize,
+		MaxBytes:                    h.MaxBytes,
+		StateID:                     h.stateID,
+		StateKeyArg:                 h.StateKeyArg,
+		ContextArg:                  h.ContextArg,
+		StreamArg:                   h.StreamArg,
+		VectorCountArg:              h.VectorCountArg,
+		ContextOffset:               uint64(h.ContextOffset),
+		StreamOffset:                uint64(h.StreamOffset),
+		ContextSize:                 h.ContextSize,
+		ContextDerefOffset:          h.ContextDerefOffset,
+		ContextGenerationOffset:     h.ContextGenerationOffset,
+		StreamSize:                  h.StreamSize,
+		VectorStride:                vectorStride,
+		VectorBaseOffset:            h.VectorBaseOffset,
+		VectorLengthOffset:          vectorLengthOffset,
+		VectorLengthSize:            vectorLengthSize,
+		StreamByteOffsetArg:         h.StreamByteOffsetArg,
+		StreamByteOffsetSize:        h.StreamByteOffsetSize,
+		StreamByteOffsetOffset:      uint64(h.StreamByteOffsetOffset),
+		FinArg:                      h.FinArg,
+		FinSize:                     h.FinSize,
+		FinMask:                     h.FinMask,
+		FinOffset:                   uint64(h.FinOffset),
 	}
 }
 

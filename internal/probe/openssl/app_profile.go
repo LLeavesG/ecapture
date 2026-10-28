@@ -295,52 +295,57 @@ type HookProfile struct {
 // offsets, which is useful for socket APIs, custom BIOs, Cronet buffers, and
 // private networking SDKs.
 type ApplicationDataHook struct {
-	ReturnSuccessValue     uint32      `json:"return_success_value,omitempty"`
-	Name                   string      `json:"name"`
-	Library                string      `json:"library,omitempty"`
-	LibraryGlob            string      `json:"library_glob,omitempty"`
-	BuildID                string      `json:"build_id,omitempty"`
-	CaptureLayer           string      `json:"capture_layer,omitempty"`
-	Transport              string      `json:"transport,omitempty"`
-	BoundaryRole           string      `json:"boundary_role,omitempty"`
-	Symbol                 string      `json:"symbol,omitempty"`
-	Offset                 OffsetValue `json:"offset,omitempty"`
-	Direction              string      `json:"direction"`
-	CaptureOn              string      `json:"capture_on,omitempty"`
-	BufferArg              uint32      `json:"buffer_arg"`
-	BufferFormat           string      `json:"buffer_format,omitempty"`
-	BufferOffset           OffsetValue `json:"buffer_offset,omitempty"`
-	BufferIndirect         bool        `json:"buffer_indirect,omitempty"`
-	LengthSource           string      `json:"length_source,omitempty"`
-	LengthArg              uint32      `json:"length_arg,omitempty"`
-	FixedLength            uint32      `json:"fixed_length,omitempty"`
-	LengthOffset           OffsetValue `json:"length_offset,omitempty"`
-	LengthSize             uint32      `json:"length_size,omitempty"`
-	LengthIndirect         bool        `json:"length_indirect,omitempty"`
-	MaxBytes               uint32      `json:"max_bytes,omitempty"`
-	ContextArg             uint32      `json:"context_arg,omitempty"`
-	ContextOffset          OffsetValue `json:"context_offset,omitempty"`
-	ContextSize            uint32      `json:"context_size,omitempty"`
-	StreamArg              uint32      `json:"stream_arg,omitempty"`
-	StreamOffset           OffsetValue `json:"stream_offset,omitempty"`
-	StreamSize             uint32      `json:"stream_size,omitempty"`
-	StreamByteOffsetArg    uint32      `json:"stream_byte_offset_arg,omitempty"`
-	StreamByteOffsetOffset OffsetValue `json:"stream_byte_offset_offset,omitempty"`
-	StreamByteOffsetSize   uint32      `json:"stream_byte_offset_size,omitempty"`
-	FinArg                 uint32      `json:"fin_arg,omitempty"`
-	FinOffset              OffsetValue `json:"fin_offset,omitempty"`
-	FinSize                uint32      `json:"fin_size,omitempty"`
-	VectorCountArg         uint32      `json:"vector_count_arg,omitempty"`
-	VectorStride           uint32      `json:"vector_stride,omitempty"`
-	VectorBaseOffset       uint32      `json:"vector_base_offset,omitempty"`
-	VectorLengthOffset     uint32      `json:"vector_length_offset,omitempty"`
-	VectorLengthSize       uint32      `json:"vector_length_size,omitempty"`
-	StateGroup             string      `json:"state_group,omitempty"`
-	StateAction            string      `json:"state_action,omitempty"`
-	StateKeyArg            uint32      `json:"state_key_arg,omitempty"`
-	CollectUserStack       bool        `json:"collect_user_stack,omitempty"`
-	StackMode              string      `json:"stack_mode,omitempty"`
-	Disabled               bool        `json:"disabled,omitempty"`
+	ReturnSuccessValue          uint32      `json:"return_success_value,omitempty"`
+	Name                        string      `json:"name"`
+	Library                     string      `json:"library,omitempty"`
+	LibraryGlob                 string      `json:"library_glob,omitempty"`
+	BuildID                     string      `json:"build_id,omitempty"`
+	BinarySHA256                string      `json:"binary_sha256,omitempty"`
+	CaptureLayer                string      `json:"capture_layer,omitempty"`
+	Transport                   string      `json:"transport,omitempty"`
+	BoundaryRole                string      `json:"boundary_role,omitempty"`
+	Symbol                      string      `json:"symbol,omitempty"`
+	Offset                      OffsetValue `json:"offset,omitempty"`
+	Direction                   string      `json:"direction"`
+	CaptureOn                   string      `json:"capture_on,omitempty"`
+	BufferArg                   uint32      `json:"buffer_arg"`
+	BufferFormat                string      `json:"buffer_format,omitempty"`
+	BufferOffset                OffsetValue `json:"buffer_offset,omitempty"`
+	BufferIndirect              bool        `json:"buffer_indirect,omitempty"`
+	LengthSource                string      `json:"length_source,omitempty"`
+	LengthArg                   uint32      `json:"length_arg,omitempty"`
+	FixedLength                 uint32      `json:"fixed_length,omitempty"`
+	LengthOffset                OffsetValue `json:"length_offset,omitempty"`
+	LengthSize                  uint32      `json:"length_size,omitempty"`
+	LengthIndirect              bool        `json:"length_indirect,omitempty"`
+	MaxBytes                    uint32      `json:"max_bytes,omitempty"`
+	ContextArg                  uint32      `json:"context_arg,omitempty"`
+	ContextOffset               OffsetValue `json:"context_offset,omitempty"`
+	ContextSize                 uint32      `json:"context_size,omitempty"`
+	ContextDerefOffset          uint32      `json:"context_deref_offset,omitempty"`
+	ContextGenerationOffset     uint32      `json:"context_generation_offset,omitempty"`
+	StreamArg                   uint32      `json:"stream_arg,omitempty"`
+	StreamOffset                OffsetValue `json:"stream_offset,omitempty"`
+	StreamSize                  uint32      `json:"stream_size,omitempty"`
+	StreamByteOffsetArg         uint32      `json:"stream_byte_offset_arg,omitempty"`
+	StreamByteOffsetOffset      OffsetValue `json:"stream_byte_offset_offset,omitempty"`
+	StreamByteOffsetSize        uint32      `json:"stream_byte_offset_size,omitempty"`
+	StreamByteOffsetDerefOffset uint32      `json:"stream_byte_offset_deref_offset,omitempty"`
+	FinArg                      uint32      `json:"fin_arg,omitempty"`
+	FinOffset                   OffsetValue `json:"fin_offset,omitempty"`
+	FinSize                     uint32      `json:"fin_size,omitempty"`
+	FinMask                     uint32      `json:"fin_mask,omitempty"`
+	VectorCountArg              uint32      `json:"vector_count_arg,omitempty"`
+	VectorStride                uint32      `json:"vector_stride,omitempty"`
+	VectorBaseOffset            uint32      `json:"vector_base_offset,omitempty"`
+	VectorLengthOffset          uint32      `json:"vector_length_offset,omitempty"`
+	VectorLengthSize            uint32      `json:"vector_length_size,omitempty"`
+	StateGroup                  string      `json:"state_group,omitempty"`
+	StateAction                 string      `json:"state_action,omitempty"`
+	StateKeyArg                 uint32      `json:"state_key_arg,omitempty"`
+	CollectUserStack            bool        `json:"collect_user_stack,omitempty"`
+	StackMode                   string      `json:"stack_mode,omitempty"`
+	Disabled                    bool        `json:"disabled,omitempty"`
 
 	resolvedLibrary string
 	resolvedTarget  libraryTarget
@@ -666,6 +671,10 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 		if err != nil {
 			return fmt.Errorf("application data hook %q build_id: %w", hook.Name, err)
 		}
+		hook.BinarySHA256, err = normalizeBuildID(hook.BinarySHA256)
+		if err != nil || (hook.BinarySHA256 != "" && len(hook.BinarySHA256) != 64) {
+			return fmt.Errorf("application data hook %q has invalid binary_sha256", hook.Name)
+		}
 		hook.CaptureLayer = strings.ToLower(strings.TrimSpace(hook.CaptureLayer))
 		hook.Transport = strings.ToLower(strings.TrimSpace(hook.Transport))
 		hook.BoundaryRole = strings.ToLower(strings.TrimSpace(hook.BoundaryRole))
@@ -800,6 +809,12 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 			return fmt.Errorf("application data hook %q buffer_arg must be between 1 and %d",
 				hook.Name, MaxApplicationArguments)
 		}
+		if hook.ContextGenerationOffset != 0 && (hook.ContextGenerationOffset > 1<<20 || hook.ContextArg == 0) {
+			return fmt.Errorf("application data hook %q context_generation_offset requires context_arg and bounded offset", hook.Name)
+		}
+		if hook.FinMask != 0 && hook.FinArg == 0 {
+			return fmt.Errorf("application data hook %q fin_mask requires fin_arg", hook.Name)
+		}
 		if hook.ContextArg > MaxApplicationArguments {
 			return fmt.Errorf("application data hook %q context_arg must be between 0 and %d",
 				hook.Name, MaxApplicationArguments)
@@ -810,6 +825,12 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 		}
 		if hook.ContextOffset != 0 && hook.ContextSize == 0 {
 			hook.ContextSize = 8
+		}
+		if hook.ContextDerefOffset != 0 && (hook.ContextDerefOffset > 1<<20 || hook.ContextArg == 0 || hook.ContextSize != 8) {
+			return fmt.Errorf("application data hook %q context_deref_offset requires a bounded offset and pointer-sized context", hook.Name)
+		}
+		if hook.StreamByteOffsetDerefOffset != 0 && (hook.StreamByteOffsetDerefOffset > 1<<20 || hook.StreamByteOffsetArg == 0 || hook.StreamByteOffsetSize != 8) {
+			return fmt.Errorf("application data hook %q stream_byte_offset_deref_offset requires a bounded offset and pointer-sized source", hook.Name)
 		}
 		if hook.ContextSize != 0 {
 			if hook.ContextArg == 0 {
@@ -981,6 +1002,7 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 		} else if hook.ReturnSuccessValue != 0 {
 			return fmt.Errorf("application data hook %q return_success_value requires length_source=output", hook.Name)
 		}
+
 		isArgumentVector := hook.BufferFormat == AppDataBufferIOVec ||
 			hook.BufferFormat == AppDataBufferVector
 		if isArgumentVector {

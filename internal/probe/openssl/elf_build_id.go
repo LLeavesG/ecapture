@@ -16,9 +16,12 @@ package openssl
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"debug/elf"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 )
 
@@ -114,4 +117,46 @@ func verifyLibraryTargetBuildID(
 
 func alignNote(value int) int {
 	return (value + 3) &^ 3
+}
+
+func verifyLibraryTargetSHA256(target libraryTarget, expected string) error {
+	actual, err := readLibraryTargetSHA256(target)
+	if err != nil {
+		return err
+	}
+	if actual != expected {
+		return fmt.Errorf("ELF SHA-256 mismatch for %q: got %s, want %s", target.String(), actual, expected)
+	}
+	return nil
+}
+
+// ReadLibrarySHA256 returns the ELF member digest, excluding an APK container.
+// It also identifies libraries whose linker omitted a GNU Build ID.
+func ReadLibrarySHA256(spec string) (string, error) {
+	target, err := resolveLibraryTarget(spec)
+	if err != nil {
+		return "", err
+	}
+	return readLibraryTargetSHA256(target)
+}
+
+func readLibraryTargetSHA256(target libraryTarget) (string, error) {
+	file, err := os.Open(target.RuntimePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	var reader io.Reader = file
+	if target.IsArchive() {
+		reader = io.NewSectionReader(file, int64(target.ContainerOffset), int64(target.ELFSize))
+	}
+	hash := sha256.New()
+	n, err := io.Copy(hash, reader)
+	if err != nil {
+		return "", err
+	}
+	if uint64(n) != target.ELFSize {
+		return "", fmt.Errorf("ELF size changed while hashing %q", target.String())
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }

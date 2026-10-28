@@ -16,7 +16,9 @@ package openssl
 
 import (
 	"archive/zip"
+	"crypto/sha256"
 	"debug/elf"
+	"encoding/hex"
 	"io"
 	"os"
 	"path/filepath"
@@ -62,6 +64,23 @@ func TestResolveArchiveLibraryTarget(t *testing.T) {
 	target, err := resolveLibraryTarget(spec)
 	if err != nil {
 		t.Fatalf("resolveLibraryTarget() error = %v", err)
+	}
+	image, err := os.ReadFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(image)
+	for _, path := range []string{executable, spec} {
+		actual, err := ReadLibrarySHA256(path)
+		if err != nil || actual != hex.EncodeToString(digest[:]) {
+			t.Fatalf("ELF digest for %s: %s, %v", path, actual, err)
+		}
+	}
+	if err := verifyLibraryTargetSHA256(target, hex.EncodeToString(digest[:])); err != nil {
+		t.Fatalf("member SHA-256 must exclude APK container: %v", err)
+	}
+	if err := verifyLibraryTargetSHA256(target, string(make([]byte, 64))); err == nil {
+		t.Fatal("wrong member SHA-256 accepted")
 	}
 	if !target.IsArchive() ||
 		target.RuntimePath != archivePath ||

@@ -80,7 +80,7 @@ struct app_hook_config_t {
     u32 context_arg;
     u32 stream_arg;
     u32 vector_count_arg;
-    u32 return_success_value;
+    u32 context_deref_offset;
     u64 context_offset;
     u64 stream_offset;
     u32 context_size;
@@ -95,6 +95,10 @@ struct app_hook_config_t {
     u32 fin_arg;
     u32 fin_size;
     u64 fin_offset;
+    u32 return_success_value;
+    u32 stream_byte_offset_deref_offset;
+    u32 fin_mask;
+    u32 context_generation_offset;
 };
 
 struct active_app_hook_t {
@@ -1359,37 +1363,48 @@ static __always_inline int app_hook_entry(struct pt_regs *ctx, u32 slot) {
         return 0;
     u64 buffer = 0;
     u64 length = 0;
-    u64 context_id = app_hook_identity(
-        ctx, config->context_arg, config->context_offset, config->context_size);
-    u64 stream_id = app_hook_identity(
-        ctx, config->stream_arg, config->stream_offset, config->stream_size);
+    u64 context_id = app_hook_identity(ctx, config->context_arg, config->context_offset, config->context_size);
+    if (config->context_deref_offset != 0 && context_id != 0)
+        context_id = app_hook_read_length(app_hook_user_address(context_id) + config->context_deref_offset, 8);
+    if (config->context_generation_offset != 0) {
+        u64 generation = 0;
+        if (context_id == 0 ||
+            bpf_probe_read_user(&generation, sizeof(generation),
+                                (void*)(app_hook_user_address(context_id) + config->context_generation_offset)) != 0 ||
+            generation == 0)
+            return 0;
+        context_id ^= generation * 0x9e3779b97f4a7c15ULL;
+        if (context_id == 0) return 0;
+    }
+    u64 stream_id = app_hook_identity(ctx, config->stream_arg, config->stream_offset, config->stream_size);
     u64 stream_byte_offset = 0;
     u32 stream_flags = 0;
     if (config->stream_byte_offset_arg != 0 &&
-        app_hook_scalar(ctx, config->stream_byte_offset_arg,
-                        config->stream_byte_offset_offset,
-                        config->stream_byte_offset_size,
-                        &stream_byte_offset) == 0)
-        stream_flags |= APP_DATA_STREAM_OFFSET_VALID;
-    if (config->fin_arg != 0) {
-        u64 fin = 0;
-        if (app_hook_scalar(ctx, config->fin_arg, config->fin_offset,
-                            config->fin_size, &fin) == 0) {
-            stream_flags |= APP_DATA_STREAM_FIN_VALID;
-            if (fin != 0)
-                stream_flags |= APP_DATA_STREAM_FIN;
+        app_hook_scalar(ctx, config->stream_byte_offset_arg, config->stream_byte_offset_offset,
+                        config->stream_byte_offset_size, &stream_byte_offset) == 0) {
+        if (config->stream_byte_offset_deref_offset == 0) {
+            stream_flags |= APP_DATA_STREAM_OFFSET_VALID;
+        } else if (stream_byte_offset != 0 &&
+                   bpf_probe_read_user(&stream_byte_offset, sizeof(stream_byte_offset),
+                                       (void*)(app_hook_user_address(stream_byte_offset) +
+                                               config->stream_byte_offset_deref_offset)) == 0) {
+            stream_flags |= APP_DATA_STREAM_OFFSET_VALID;
         }
     }
-    if ((config->flags &
-         (APP_DATA_FLAG_BUFFER_IOVEC | APP_DATA_FLAG_BUFFER_MSGHDR)) != 0) {
-        u64 iovec_address = app_hook_user_address(
-            app_hook_argument(ctx, config->buffer_arg));
+    if (config->fin_arg != 0) {
+        u64 fin = 0;
+        if (app_hook_scalar(ctx, config->fin_arg, config->fin_offset, config->fin_size, &fin) == 0) {
+            stream_flags |= APP_DATA_STREAM_FIN_VALID;
+            if ((config->fin_mask ? (fin & config->fin_mask) : fin) != 0) stream_flags |= APP_DATA_STREAM_FIN;
+        }
+    }
+    if ((config->flags & (APP_DATA_FLAG_BUFFER_IOVEC | APP_DATA_FLAG_BUFFER_MSGHDR)) != 0) {
+        u64 iovec_address = app_hook_user_address(app_hook_argument(ctx, config->buffer_arg));
         u64 vector_count = app_hook_argument(ctx, config->vector_count_arg);
         if ((config->flags & APP_DATA_FLAG_BUFFER_MSGHDR) != 0) {
             u64 message_header = app_hook_user_address(iovec_address);
-            if (message_header == 0 ||
-                bpf_probe_read_user(&iovec_address, sizeof(iovec_address),
-                                    (void *)(message_header + config->buffer_offset)) != 0)
+            if (message_header == 0 || bpf_probe_read_user(&iovec_address, sizeof(iovec_address),
+                                                           (void*)(message_header + config->buffer_offset)) != 0)
                 return 0;
             iovec_address = app_hook_user_address(iovec_address);
             vector_count = app_hook_read_length(

@@ -477,6 +477,11 @@ func (c *Config) resolveApplicationDataLibraries() error {
 				)
 			}
 		}
+		if hook.BinarySHA256 != "" {
+			if err := verifyLibraryTargetSHA256(target, hook.BinarySHA256); err != nil {
+				return err
+			}
+		}
 		if hook.BuildID != "" {
 			if err := verifyLibraryTargetBuildID(target, hook.BuildID); err != nil {
 				return fmt.Errorf("verify application data hook %q library: %w",
