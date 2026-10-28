@@ -568,7 +568,8 @@ static __always_inline int app_dwarf_unwind_one(
     return 0;
 }
 
-static __always_inline int app_collect_dwarf_stack(
+/* Reuse the unwinder instead of duplicating it at every capture site. */
+static __noinline int app_collect_dwarf_stack(
     struct pt_regs *ctx, struct app_data_event_t *event) {
 #if defined(bpf_target_arm64)
     struct app_dwarf_unwind_state_t state = {
@@ -601,7 +602,7 @@ static __always_inline int app_collect_dwarf_stack(
 #endif
 }
 
-static __always_inline u64 app_hook_argument(struct pt_regs *ctx, u32 index) {
+static __noinline u64 app_hook_argument(struct pt_regs *ctx, u32 index) {
     /*
      * Keep every pt_regs access at a compile-time constant offset. Without
      * volatile temporaries, LLVM can fold this switch into ctx + index * 8,
@@ -756,7 +757,7 @@ static __always_inline s64 app_hook_read_signed_length(u64 address, u32 size) {
     return 0;
 }
 
-static __always_inline u64 app_hook_read_length(u64 address, u32 size) {
+static __noinline u64 app_hook_read_length(u64 address, u32 size) {
     address = app_hook_user_address(address);
     u64 length = 0;
     switch (size) {
