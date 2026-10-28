@@ -230,6 +230,11 @@ object, so all `length_*` fields must be omitted. For the default
 - `return`: the positive function return value; this requires
   `capture_on: "return"`. `length_size` selects the signed return ABI width:
   `4` for callbacks returning C `int`, or `8` (the default) for `ssize_t`.
+- `output`: a byte count written through `length_arg`, read after the call
+  returns the configured positive `return_success_value` (a C `int`). This
+  requires scalar `capture_on: "return"`; `length_size` defaults to 8. For
+  `SSL_write_ex`, use `buffer_arg: 2`, `length_arg: 4`, and
+  `return_success_value: 1`. Failed calls never reuse the previous output count.
 
 `capture_on: "return"` stores entry arguments per thread and emits after the
 function returns. Each call is emitted in bounded 16 KiB chunks, up to

@@ -30,6 +30,7 @@
 #define APP_DATA_FLAG_BUFFER_MSGHDR 0x400
 #define APP_DATA_FLAG_USER_STACK 0x800
 #define APP_DATA_FLAG_DWARF_STACK 0x1000
+#define APP_DATA_FLAG_LENGTH_OUTPUT 0x2000
 #define APP_DATA_EVENT_TRUNCATED 0x01
 #define APP_DATA_STREAM_OFFSET_VALID 0x01
 #define APP_DATA_STREAM_FIN_VALID 0x02
@@ -79,7 +80,7 @@ struct app_hook_config_t {
     u32 context_arg;
     u32 stream_arg;
     u32 vector_count_arg;
-    u32 reserved;
+    u32 return_success_value;
     u64 context_offset;
     u64 stream_offset;
     u32 context_size;
@@ -882,7 +883,7 @@ static __always_inline int app_hook_resolve(struct pt_regs *ctx, struct app_hook
         *length = config->length_arg;
         return *length == 0 ? -1 : 0;
     }
-    if ((config->flags & APP_DATA_FLAG_LENGTH_RETURN) != 0) {
+    if ((config->flags & (APP_DATA_FLAG_LENGTH_RETURN | APP_DATA_FLAG_LENGTH_OUTPUT)) != 0) {
         *length = 0;
         return 0;
     }
@@ -1472,6 +1473,8 @@ static __always_inline int app_hook_entry(struct pt_regs *ctx, u32 slot) {
         .stream_id = stream_id,
         .stream_byte_offset = stream_byte_offset,
         .stream_flags = stream_flags,
+        .result_length_address =
+            (config->flags & APP_DATA_FLAG_LENGTH_OUTPUT) != 0 ? app_hook_deferred_length_address(ctx, config) : 0,
     };
     bpf_map_update_elem(&active_app_hooks, &key, &active, BPF_ANY);
     return 0;
@@ -1517,6 +1520,13 @@ static __always_inline int app_hook_return(struct pt_regs *ctx, u32 slot) {
             return 0;
         }
         u64 length = active->length;
+        if ((config->flags & APP_DATA_FLAG_LENGTH_OUTPUT) != 0) {
+            // SSL_*_ex returns a status, not a byte count. Its output pointer
+            // is valid only on success; a failed call can leave stale bytes.
+            length = (u32)PT_REGS_RC(ctx) == config->return_success_value && active->result_length_address != 0
+                         ? app_hook_read_length(active->result_length_address, config->length_size)
+                         : 0;
+        }
         if ((config->flags & APP_DATA_FLAG_LENGTH_RETURN) != 0) {
             s64 result = app_hook_signed_return(ctx, config);
             length = result > 0 ? (u64)result : 0;

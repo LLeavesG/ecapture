@@ -69,6 +69,7 @@ const (
 	AppDataCaptureReturn  = "return"
 	AppDataLengthArgument = "argument"
 	AppDataLengthMemory   = "memory"
+	AppDataLengthOutput   = "output"
 	AppDataLengthFixed    = "fixed"
 	AppDataLengthReturn   = "return"
 	AppDataBufferRaw      = "raw"
@@ -294,6 +295,7 @@ type HookProfile struct {
 // offsets, which is useful for socket APIs, custom BIOs, Cronet buffers, and
 // private networking SDKs.
 type ApplicationDataHook struct {
+	ReturnSuccessValue     uint32      `json:"return_success_value,omitempty"`
 	Name                   string      `json:"name"`
 	Library                string      `json:"library,omitempty"`
 	LibraryGlob            string      `json:"library_glob,omitempty"`
@@ -970,6 +972,15 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 		}
 
 		hook.LengthSource = strings.ToLower(strings.TrimSpace(hook.LengthSource))
+		if hook.LengthSource == AppDataLengthOutput {
+			if hook.CaptureOn != AppDataCaptureReturn || hook.ReturnSuccessValue == 0 ||
+				hook.LengthArg < 1 || hook.LengthArg > MaxApplicationArguments ||
+				(hook.BufferFormat != "" && hook.BufferFormat != AppDataBufferRaw) || hook.StateAction != "" {
+				return fmt.Errorf("application data hook %q output length requires scalar return capture, explicit length_arg and positive return_success_value", hook.Name)
+			}
+		} else if hook.ReturnSuccessValue != 0 {
+			return fmt.Errorf("application data hook %q return_success_value requires length_source=output", hook.Name)
+		}
 		isArgumentVector := hook.BufferFormat == AppDataBufferIOVec ||
 			hook.BufferFormat == AppDataBufferVector
 		if isArgumentVector {
@@ -1153,7 +1164,7 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 				return fmt.Errorf("application data hook %q length_arg must be between 1 and %d",
 					hook.Name, MaxApplicationArguments)
 			}
-		case AppDataLengthMemory:
+		case AppDataLengthMemory, AppDataLengthOutput:
 			if hook.FixedLength != 0 {
 				return fmt.Errorf("application data hook %q fixed_length requires length_source=fixed",
 					hook.Name)
@@ -1209,7 +1220,7 @@ func validateApplicationDataHooks(hooks []ApplicationDataHook) error {
 			return fmt.Errorf("application data hook %q has unsupported length_source %q",
 				hook.Name, hook.LengthSource)
 		}
-		if hook.LengthIndirect && hook.LengthSource != AppDataLengthMemory {
+		if hook.LengthIndirect && hook.LengthSource != AppDataLengthMemory && hook.LengthSource != AppDataLengthOutput {
 			return fmt.Errorf("application data hook %q length_indirect requires length_source=memory",
 				hook.Name)
 		}

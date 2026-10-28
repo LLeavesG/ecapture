@@ -28,6 +28,7 @@ const (
 	appDataFlagBufferMsgHdr
 	appDataFlagUserStack
 	appDataFlagDwarfStack
+	appDataFlagLengthOutput
 )
 
 // applicationDataBPFConfig must stay byte-for-byte compatible with
@@ -46,7 +47,7 @@ type applicationDataBPFConfig struct {
 	ContextArg             uint32
 	StreamArg              uint32
 	VectorCountArg         uint32
-	Reserved               uint32
+	ReturnSuccessValue     uint32
 	ContextOffset          uint64
 	StreamOffset           uint64
 	ContextSize            uint32
@@ -85,6 +86,8 @@ func (h ApplicationDataHook) bpfConfig() applicationDataBPFConfig {
 		flags |= appDataFlagStateLoad
 	}
 	switch h.LengthSource {
+	case AppDataLengthOutput:
+		flags |= appDataFlagLengthOutput
 	case AppDataLengthMemory:
 		flags |= appDataFlagLengthMemory
 	case AppDataLengthReturn:
@@ -119,6 +122,7 @@ func (h ApplicationDataHook) bpfConfig() applicationDataBPFConfig {
 		vectorLengthSize = 8
 	}
 	return applicationDataBPFConfig{
+		ReturnSuccessValue:     h.ReturnSuccessValue,
 		BufferArg:              h.BufferArg,
 		LengthArg:              h.bpfLengthArg(),
 		Direction:              direction,

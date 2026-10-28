@@ -25,6 +25,38 @@ import (
 	manager "github.com/gojue/ebpfmanager"
 )
 
+func TestApplicationDataHookOutputLength(t *testing.T) {
+	profile := &ApplicationProfile{
+		Version: ApplicationProfileVersion, Name: "ssl-write-ex", Match: ApplicationMatch{UID: 10001},
+		Capture: ApplicationCapture{Strategies: []string{StrategyBoundaryData}},
+		DataHooks: []ApplicationDataHook{{Name: "write-ex", Library: "/data/app/libssl.so",
+			Symbol: "SSL_write_ex", Direction: AppDataDirectionWrite, CaptureOn: AppDataCaptureReturn,
+			BufferArg: 2, LengthSource: AppDataLengthOutput, LengthArg: 4, ReturnSuccessValue: 1}},
+	}
+	if err := profile.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	hook := profile.DataHooks[0]
+	config := hook.bpfConfig()
+	if config.Flags != appDataFlagLengthOutput|appDataFlagCaptureReturn ||
+		config.ReturnSuccessValue != 1 || config.LengthArg != 4 || config.LengthSize != 8 || binary.Size(config) != 136 {
+		t.Fatalf("incorrect output-length config: %+v", config)
+	}
+	for _, change := range []func(*ApplicationDataHook){
+		func(h *ApplicationDataHook) { h.CaptureOn = AppDataCaptureEntry },
+		func(h *ApplicationDataHook) { h.ReturnSuccessValue = 0 },
+		func(h *ApplicationDataHook) { h.LengthArg = 0 },
+		func(h *ApplicationDataHook) { h.LengthSource = AppDataLengthMemory },
+		func(h *ApplicationDataHook) { h.BufferFormat = AppDataBufferIOVec },
+	} {
+		profile.DataHooks[0] = hook
+		change(&profile.DataHooks[0])
+		if err := profile.Validate(); err == nil {
+			t.Fatalf("invalid output-length hook accepted: %+v", profile.DataHooks[0])
+		}
+	}
+}
+
 func TestApplicationDataHookValidationAndBPFConfig(t *testing.T) {
 	profile := &ApplicationProfile{
 		Version: ApplicationProfileVersion,
